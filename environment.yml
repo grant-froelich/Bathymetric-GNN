@@ -1,0 +1,65 @@
+name: bathymetric-gnn
+channels:
+  - pytorch
+  - pyg
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.11
+  
+  # PyTorch ecosystem
+  - pytorch>=2.0
+  - pytorch-cuda=12.1
+  - torchvision
+  - torchaudio
+  
+  # PyTorch Geometric
+  - pyg>=2.4
+  - torch-scatter
+  - torch-sparse
+  - torch-cluster
+  - torch-spline-conv
+  
+  # Geospatial
+  - gdal>=3.6
+  - rasterio
+  - shapely
+  - pyproj
+  - h5py
+  
+  # Scientific computing
+  - numpy>=1.24
+  - scipy>=1.10
+  - scikit-learn>=1.2
+  - pandas>=2.0
+  
+  # Visualization
+  - matplotlib>=3.7
+  - seaborn
+  - plotly
+  
+  # Development
+  - jupyter
+  - ipywidgets
+  - tqdm
+  - pyyaml
+  - python-dotenv
+  
+  # Testing
+  - pytest>=7.0
+  - pytest-cov
+  
+  # Utilities
+  - pip
+  
+  - pip:
+    # Additional PyG utilities if needed
+    - torch-geometric-temporal
+    # Experiment tracking
+    - wandb
+    - tensorboard
+    # Type hints
+    - typing-extensions
