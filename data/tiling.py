@@ -247,15 +247,16 @@ class TileManager:
             # Handle NaN in tile_data
             valid_mask = np.isfinite(tile_data)
             
+            # Initialize NaN values to 0 before accumulating
+            # (NaN + anything = NaN, so we need to set first values)
+            first_write = np.isnan(region) & valid_mask
+            region[first_write] = 0.0
+            
             # Update weights
             weight_region[valid_mask] += weights[valid_mask]
             
             # Update values (accumulate weighted sum)
-            np.add.at(
-                region,
-                np.where(valid_mask),
-                (tile_data * weights)[valid_mask]
-            )
+            region[valid_mask] += (tile_data * weights)[valid_mask]
         else:
             # Simple overwrite with blending
             valid_mask = np.isfinite(tile_data)
