@@ -6,6 +6,13 @@ Usage:
     python scripts/train.py --clean-surveys /path/to/clean/data --output-dir ./outputs
 """
 
+import os
+# Fix OpenMP conflict on Windows - must be before any other imports
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+# Import torch BEFORE numpy to avoid DLL conflicts on Windows
+import torch
+
 import argparse
 import logging
 import sys
@@ -75,6 +82,14 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--tile-size", type=int, default=1024)
     parser.add_argument("--overlap", type=int, default=128)
+    
+    # Data loading arguments
+    parser.add_argument(
+        "--vr-bag-mode",
+        choices=["refinements", "resampled", "base"],
+        default="resampled",
+        help="How to handle Variable Resolution BAGs (default: resampled)",
+    )
     
     # Model arguments
     parser.add_argument("--gnn-type", choices=["GCN", "GAT", "GraphSAGE", "GIN"], default="GAT")
@@ -182,6 +197,7 @@ def main():
         graph_builder=graph_builder,
         noise_generator=noise_generator,
         augment=True,
+        vr_bag_mode=args.vr_bag_mode,
     )
     
     val_dataset = None
@@ -193,6 +209,7 @@ def main():
             graph_builder=graph_builder,
             noise_generator=noise_generator,
             augment=False,  # No augmentation for validation
+            vr_bag_mode=args.vr_bag_mode,
         )
     
     # Determine input dimensions from first sample

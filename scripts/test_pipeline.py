@@ -13,6 +13,13 @@ Usage:
     python scripts/test_pipeline.py --survey /path/to/survey.bag
 """
 
+import os
+# Fix OpenMP conflict on Windows - must be before any other imports
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+# Import torch BEFORE numpy to avoid DLL conflicts on Windows
+import torch
+
 import argparse
 import logging
 import sys
@@ -77,7 +84,7 @@ def check_imports():
     return True
 
 
-def test_data_loading(survey_path: Path):
+def test_data_loading(survey_path: Path, vr_bag_mode: str = 'resampled'):
     """Test loading a BAG/GeoTIFF file."""
     print("\n" + "=" * 60)
     print("TESTING DATA LOADING")
@@ -85,9 +92,10 @@ def test_data_loading(survey_path: Path):
     
     from data import BathymetricLoader
     
-    loader = BathymetricLoader()
+    loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
     
     print(f"Loading: {survey_path}")
+    print(f"  VR BAG mode: {vr_bag_mode}")
     start = time.time()
     
     try:
@@ -173,6 +181,7 @@ def test_graph_construction(tile, resolution):
     print("TESTING GRAPH CONSTRUCTION")
     print("=" * 60)
     
+    import torch
     from data import GraphBuilder
     
     graph_builder = GraphBuilder(
@@ -262,7 +271,7 @@ def test_synthetic_noise(tile):
         return None
 
 
-def test_model_forward(graph):
+def test_model_forward(graph, device_override=None):
     """Test model forward pass."""
     print("\n" + "=" * 60)
     print("TESTING MODEL FORWARD PASS")
@@ -271,7 +280,25 @@ def test_model_forward(graph):
     import torch
     from models import BathymetricGNN
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device selection with Blackwell compatibility check
+    if device_override:
+        device = torch.device(device_override)
+    elif torch.cuda.is_available():
+        # Check if GPU is actually usable by running a simple operation
+        try:
+            test_tensor = torch.zeros(1).cuda()
+            _ = test_tensor + 1
+            device = torch.device("cuda")
+        except RuntimeError as e:
+            if "no kernel image" in str(e):
+                print("⚠ GPU detected but not supported by PyTorch (likely Blackwell/RTX 50 series)")
+                print("  Falling back to CPU")
+                device = torch.device("cpu")
+            else:
+                raise
+    else:
+        device = torch.device("cpu")
+    
     print(f"Using device: {device}")
     
     in_channels = graph.x.shape[1]
@@ -377,6 +404,18 @@ def main():
         required=True,
         help="Path to a test survey file (BAG or GeoTIFF)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Force device (cpu or cuda). Auto-detects if not specified.",
+    )
+    parser.add_argument(
+        "--vr-bag-mode",
+        choices=["refinements", "resampled", "base"],
+        default="resampled",
+        help="How to handle Variable Resolution BAGs (default: resampled)",
+    )
     args = parser.parse_args()
     
     print("BATHYMETRIC GNN PIPELINE TEST")
@@ -390,7 +429,7 @@ def main():
     import torch
     
     # Test each component
-    grid = test_data_loading(args.survey)
+    grid = test_data_loading(args.survey, vr_bag_mode=args.vr_bag_mode)
     if grid is None:
         print("\n✗ Cannot continue without data loading")
         sys.exit(1)
@@ -409,7 +448,7 @@ def main():
     if noise_result is None:
         print("\n⚠ Noise generation failed, but can continue")
     
-    model_ok = test_model_forward(graph)
+    model_ok = test_model_forward(graph, device_override=args.device)
     if not model_ok:
         print("\n✗ Model forward pass failed")
         sys.exit(1)

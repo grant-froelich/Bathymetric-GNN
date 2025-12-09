@@ -6,6 +6,13 @@ Usage:
     python scripts/inference.py --input survey.bag --model model.pt --output cleaned.bag
 """
 
+import os
+# Fix OpenMP conflict on Windows - must be before any other imports
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+# Import torch BEFORE numpy to avoid DLL conflicts on Windows
+import torch
+
 import argparse
 import logging
 import sys
@@ -79,6 +86,12 @@ def parse_args():
         default=None,
         help="Confidence threshold for flagging review (default: 0.6)",
     )
+    parser.add_argument(
+        "--min-valid-ratio",
+        type=float,
+        default=None,
+        help="Minimum ratio of valid data to process a tile (default: 0.1). Lower to process sparser data.",
+    )
     
     # Output options
     parser.add_argument(
@@ -100,6 +113,15 @@ def parse_args():
         type=str,
         default="cuda",
         help="Device to use (cuda, cpu)",
+    )
+    
+    # VR BAG handling
+    parser.add_argument(
+        "--vr-bag-mode",
+        type=str,
+        choices=["refinements", "resampled", "base"],
+        default="resampled",
+        help="How to handle Variable Resolution BAGs (default: resampled)",
     )
     
     # Misc
@@ -145,6 +167,9 @@ def main():
     if args.tile_size:
         config.tile.tile_size = args.tile_size
     
+    if args.min_valid_ratio is not None:
+        config.tile.min_valid_ratio = args.min_valid_ratio
+    
     if args.auto_correct_threshold:
         config.inference.auto_correct_threshold = args.auto_correct_threshold
     
@@ -152,7 +177,7 @@ def main():
         config.inference.review_threshold = args.review_threshold
     
     # Create pipeline
-    pipeline = BathymetricPipeline(config)
+    pipeline = BathymetricPipeline(config, vr_bag_mode=args.vr_bag_mode)
     
     # Load model
     logger.info(f"Loading model from {args.model}")
