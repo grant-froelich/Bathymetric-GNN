@@ -144,15 +144,54 @@ class Config:
     def save(self, path: Path):
         """Save configuration to YAML file."""
         path = Path(path)
+        
+        def convert_tuples(obj):
+            """Convert tuples to lists for YAML serialization."""
+            if isinstance(obj, dict):
+                return {k: convert_tuples(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_tuples(item) for item in obj]
+            else:
+                return obj
+        
+        data = convert_tuples(asdict(self))
         with open(path, 'w') as f:
-            yaml.dump(asdict(self), f, default_flow_style=False)
+            yaml.dump(data, f, default_flow_style=False)
     
     @classmethod
     def load(cls, path: Path) -> "Config":
         """Load configuration from YAML file."""
         path = Path(path)
         with open(path, 'r') as f:
-            data = yaml.safe_load(f)
+            # Use FullLoader to handle Python types, or fall back to safe_load
+            try:
+                data = yaml.load(f, Loader=yaml.FullLoader)
+            except Exception:
+                f.seek(0)
+                data = yaml.safe_load(f)
+        
+        def convert_to_tuples(obj, template):
+            """Convert lists back to tuples where the template uses tuples."""
+            if isinstance(template, tuple) and isinstance(obj, list):
+                return tuple(obj)
+            elif isinstance(obj, dict) and isinstance(template, dict):
+                return {k: convert_to_tuples(obj.get(k), v) for k, v in template.items()}
+            else:
+                return obj
+        
+        # Convert lists back to tuples for specific fields
+        if 'noise' in data:
+            noise = data['noise']
+            for key in ['gaussian_std_range', 'spike_magnitude_range', 'spike_density_range',
+                       'blob_size_range', 'blob_count_range', 'blob_magnitude_range',
+                       'systematic_amplitude_range']:
+                if key in noise and isinstance(noise[key], list):
+                    noise[key] = tuple(noise[key])
+        
+        if 'training' in data and 'class_weights' in data['training']:
+            if isinstance(data['training']['class_weights'], list):
+                # Keep as list, that's fine for class_weights
+                pass
         
         # Reconstruct nested dataclasses
         return cls(
