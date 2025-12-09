@@ -14,8 +14,9 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-import numpy as np
+# Import torch BEFORE numpy to avoid DLL conflicts on Windows
 import torch
+import numpy as np
 
 from config import Config
 from data import (
@@ -41,17 +42,18 @@ class BathymetricPipeline:
         results = pipeline.process("input.bag", "output.bag")
     """
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, vr_bag_mode: str = 'resampled'):
         """
         Initialize pipeline.
         
         Args:
             config: Configuration object
+            vr_bag_mode: How to handle VR BAGs ('refinements', 'resampled', 'base')
         """
         self.config = config
         
         # Initialize components
-        self.loader = BathymetricLoader()
+        self.loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
         self.writer = BathymetricWriter()
         self.tile_manager = TileManager(
             tile_size=config.tile.tile_size,
@@ -65,7 +67,24 @@ class BathymetricPipeline:
         
         # Model (loaded later)
         self.model: Optional[BathymetricGNN] = None
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        
+        # Device selection with Blackwell compatibility check
+        if config.device == "cuda" and torch.cuda.is_available():
+            try:
+                test_tensor = torch.zeros(1).cuda()
+                _ = test_tensor + 1
+                self.device = torch.device("cuda")
+            except RuntimeError as e:
+                if "no kernel image" in str(e):
+                    logger.warning(
+                        "GPU detected but not supported by PyTorch (likely Blackwell/RTX 50 series). "
+                        "Falling back to CPU."
+                    )
+                    self.device = torch.device("cpu")
+                else:
+                    raise
+        else:
+            self.device = torch.device("cpu")
         
         logger.info(f"Pipeline initialized, device: {self.device}")
     
@@ -81,8 +100,8 @@ class BathymetricPipeline:
         if not model_path.exists():
             raise FileNotFoundError(f"Model not found: {model_path}")
         
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location=self.device)
+        # Load checkpoint (weights_only=False needed for checkpoints with config objects)
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         
         # Get model config from checkpoint or use current config
         model_config = checkpoint.get('model_config', self.config.model)
@@ -149,6 +168,7 @@ class BathymetricPipeline:
         
         # Process tiles
         num_tiles = 0
+        num_skipped = 0
         _, _, specs = self.tile_manager.compute_tile_grid(grid.shape)
         
         for tile in self.tile_manager.iterate_tiles(grid, skip_empty=True):
@@ -168,6 +188,25 @@ class BathymetricPipeline:
         
         # Finalize results
         results = merger.finalize()
+        
+        # Create valid mask for output
+        valid_mask = np.isfinite(grid.depth)
+        if grid.nodata_value is not None and not np.isnan(grid.nodata_value):
+            valid_mask &= (grid.depth != grid.nodata_value)
+        results['valid_mask'] = valid_mask.astype(np.float32)
+        
+        # Fill in unprocessed areas with original data
+        # These are valid cells that were in tiles below min_valid_ratio threshold
+        unprocessed_valid = valid_mask & np.isnan(results['classification'])
+        num_unprocessed = np.sum(unprocessed_valid)
+        if num_unprocessed > 0:
+            logger.info(f"Preserving {num_unprocessed:,} valid cells from unprocessed tiles")
+            # Keep original depth for unprocessed valid cells
+            results['cleaned_depth'][unprocessed_valid] = grid.depth[unprocessed_valid]
+            # Mark as seafloor (class 0) with zero confidence (not analyzed)
+            results['classification'][unprocessed_valid] = 0.0
+            results['confidence'][unprocessed_valid] = 0.0
+            results['correction'][unprocessed_valid] = 0.0
         
         # Apply corrections to get cleaned depth
         cleaned_depth = self._apply_corrections(grid, results)
@@ -191,6 +230,8 @@ class BathymetricPipeline:
             additional_bands = {
                 'classification': results['classification'],
                 'confidence': results['confidence'],
+                'correction': results['correction'],
+                'valid_mask': results['valid_mask'],
             }
         
         self.writer.save(output_grid, output_path, additional_bands=additional_bands)
