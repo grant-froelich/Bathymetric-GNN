@@ -12,12 +12,13 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
+
+import numpy as np
 from tqdm import tqdm
 
 try:
@@ -60,6 +61,7 @@ class BathymetricGraphDataset(Dataset):
         noise_generator: SyntheticNoiseGenerator,
         augment: bool = True,
         cache_tiles: bool = True,
+        vr_bag_mode: str = 'resampled',
     ):
         """
         Initialize dataset.
@@ -71,6 +73,7 @@ class BathymetricGraphDataset(Dataset):
             noise_generator: SyntheticNoiseGenerator for adding noise
             augment: Whether to apply augmentation
             cache_tiles: Whether to cache extracted tiles
+            vr_bag_mode: How to handle VR BAGs ('refinements', 'resampled', 'base')
         """
         self.survey_paths = survey_paths
         self.tile_manager = tile_manager
@@ -78,7 +81,7 @@ class BathymetricGraphDataset(Dataset):
         self.noise_augmentor = NoiseAugmentor(noise_generator) if augment else None
         self.noise_generator = noise_generator
         
-        self.loader = BathymetricLoader()
+        self.loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
         
         # Extract all tiles from all surveys
         self.tiles = []
@@ -199,10 +202,25 @@ class Trainer:
         self.output_dir = Path(output_dir) if output_dir else Path("./outputs")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup device
-        self.device = torch.device(
-            config.device if torch.cuda.is_available() else "cpu"
-        )
+        # Setup device with Blackwell compatibility check
+        if config.device == "cuda" and torch.cuda.is_available():
+            # Check if GPU is actually usable by running a simple operation
+            try:
+                test_tensor = torch.zeros(1).cuda()
+                _ = test_tensor + 1
+                self.device = torch.device("cuda")
+            except RuntimeError as e:
+                if "no kernel image" in str(e):
+                    logger.warning(
+                        "GPU detected but not supported by PyTorch (likely Blackwell/RTX 50 series). "
+                        "Falling back to CPU."
+                    )
+                    self.device = torch.device("cpu")
+                else:
+                    raise
+        else:
+            self.device = torch.device("cpu")
+        
         self.model.to(self.device)
         
         # Setup data loaders
