@@ -13,6 +13,12 @@
 - Processes each refinement grid (3x3 to 50x50 cells) individually through the GNN
 - Much higher confidence scores (73.5% vs 4%) compared to resampled approach
 
+#### Training Plan & Scripts
+- Added `docs/TRAINING_PLAN.md` with comprehensive training methodology
+- New `scripts/prepare_ground_truth.py` for creating labels from clean/noisy pairs
+- New `scripts/evaluate_model.py` for measuring model performance against ground truth
+- New `scripts/analyze_noise_patterns.py` for understanding real noise characteristics
+
 #### VR BAG Loading Improvements
 - Added `--vr-bag-mode` argument to control VR BAG loading:
   - `resampled` (default): Uses GDAL's MODE=RESAMPLED_GRID for uniform output
