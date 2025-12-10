@@ -412,6 +412,9 @@ class SidecarBuilder:
     
     Accumulates classification, confidence, and correction results
     at the finest resolution and saves as a GeoTIFF.
+    
+    Uses GDAL's resampled view to get exact georeferencing that
+    matches how the VR BAG appears when opened normally.
     """
     
     def __init__(self, handler: VRBagHandler):
@@ -422,11 +425,9 @@ class SidecarBuilder:
             handler: VRBagHandler for the source VR BAG
         """
         self.handler = handler
-        self.shape = handler.resampled_shape
-        self.bounds = handler.bounds
-        self.resolution = handler.finest_resolution
-        self.geotransform = handler.geotransform
-        self.crs = handler.crs
+        
+        # Get exact georeferencing from GDAL's resampled view
+        self._init_from_gdal_resampled()
         
         # Initialize output arrays
         self.classification = np.full(self.shape, np.nan, dtype=np.float32)
@@ -435,6 +436,61 @@ class SidecarBuilder:
         self.valid_mask = np.zeros(self.shape, dtype=np.float32)
         
         logger.info(f"SidecarBuilder initialized: {self.shape} at {self.resolution}m")
+    
+    def _init_from_gdal_resampled(self):
+        """Get georeferencing from GDAL's resampled view of VR BAG."""
+        try:
+            from osgeo import gdal
+            gdal.UseExceptions()
+        except ImportError:
+            raise ImportError("GDAL required for SidecarBuilder")
+        
+        path_str = str(self.handler.path)
+        
+        # Use GDAL's open options to get resampled VR BAG view
+        # This is how loaders.py does it
+        open_options = ['MODE=RESAMPLED_GRID']
+        ds = gdal.OpenEx(path_str, gdal.OF_RASTER | gdal.OF_READONLY, open_options=open_options)
+        
+        if ds is None:
+            # Fallback: open directly
+            ds = gdal.Open(path_str)
+        
+        if ds is None:
+            raise RuntimeError(f"Could not open VR BAG for georeferencing: {self.handler.path}")
+        
+        # Check if we got the resampled view by comparing dimensions
+        # Resampled view should be much larger than base grid (512x512)
+        if ds.RasterXSize == self.handler.base_shape[1] and ds.RasterYSize == self.handler.base_shape[0]:
+            # We got the base grid, not the resampled view
+            # Try to get subdatasets
+            subdatasets = ds.GetSubDatasets()
+            ds = None
+            
+            for sd_path, sd_desc in subdatasets:
+                if 'resampled' in sd_desc.lower() or 'supergrids' in sd_desc.lower():
+                    ds = gdal.Open(sd_path)
+                    if ds is not None:
+                        break
+        
+        if ds is None:
+            raise RuntimeError(f"Could not open resampled view of VR BAG: {self.handler.path}")
+        
+        self.shape = (ds.RasterYSize, ds.RasterXSize)
+        self.geotransform = ds.GetGeoTransform()
+        self.crs = ds.GetProjection()
+        
+        # Resolution from geotransform
+        self.resolution = abs(self.geotransform[1])
+        
+        # Calculate bounds from geotransform
+        min_x = self.geotransform[0]
+        max_y = self.geotransform[3]
+        max_x = min_x + self.shape[1] * self.geotransform[1]
+        min_y = max_y + self.shape[0] * self.geotransform[5]
+        self.bounds = (min_x, min_y, max_x, max_y)
+        
+        ds = None
     
     def add_refinement_results(
         self,
@@ -452,56 +508,74 @@ class SidecarBuilder:
             confidence: Confidence array
             correction: Correction array
         """
-        # Calculate position in output grid
-        # Base cell position in geographic coordinates
-        base_row, base_col = grid.base_row, grid.base_col
+        # Compute base cell size from resampled extent and base grid dimensions
+        # The resampled view covers the same extent as the base grid
+        base_shape = self.handler.base_shape  # (512, 512) typically
         
-        if self.geotransform:
-            # Geographic position of base cell SW corner
-            base_x = self.bounds[0] + base_col * self.handler.base_cell_size[0]
-            base_y = self.bounds[1] + base_row * self.handler.base_cell_size[1]
-            
-            # Add refinement offset (sw_corner is relative to base cell)
-            ref_x = base_x + grid.sw_corner[0]
-            ref_y = base_y + grid.sw_corner[1]
-            
-            # Convert to output grid indices
-            out_col_start = int((ref_x - self.bounds[0]) / self.resolution)
-            out_row_start = int((ref_y - self.bounds[1]) / self.resolution)
-        else:
-            # Fallback: assume simple grid layout
-            base_cell_size = self.handler.base_cell_size[0]
-            cells_per_base = int(base_cell_size / self.resolution)
-            out_row_start = base_row * cells_per_base
-            out_col_start = base_col * cells_per_base
+        # Base cell size in resampled grid pixels
+        pixels_per_base_row = self.shape[0] / base_shape[0]
+        pixels_per_base_col = self.shape[1] / base_shape[1]
         
-        # Compute size in output grid cells
+        # Base cell size in ground units
+        base_cell_width = (self.bounds[2] - self.bounds[0]) / base_shape[1]
+        base_cell_height = (self.bounds[3] - self.bounds[1]) / base_shape[0]
+        
+        # Geographic position of this base cell's SW corner
+        # Base grid row 0 is at the south (bottom), col 0 is at the west (left)
+        base_x = self.bounds[0] + grid.base_col * base_cell_width
+        base_y = self.bounds[1] + grid.base_row * base_cell_height
+        
+        # Add sw_corner offset (position of refinement grid within base cell)
+        ref_x = base_x + grid.sw_corner[0]
+        ref_y = base_y + grid.sw_corner[1]
+        
+        # Refinement grid size in ground units
+        ref_width = grid.dimensions[1] * grid.resolution[0]
+        ref_height = grid.dimensions[0] * grid.resolution[1]
+        
+        # Convert geographic coordinates to pixel coordinates
+        # Note: geotransform origin is at top-left (northwest)
+        # gt[0] = min_x, gt[3] = max_y
+        gt = self.geotransform
+        
+        # Pixel column = (x - origin_x) / pixel_width
+        out_col_start = int(round((ref_x - gt[0]) / gt[1]))
+        
+        # Pixel row = (y - origin_y) / pixel_height
+        # Since gt[5] is negative, this gives us: row = (max_y - y) / abs(pixel_height)
+        # For the TOP of the refinement (ref_y + ref_height):
+        ref_top_y = ref_y + ref_height
+        out_row_start = int(round((gt[3] - ref_top_y) / abs(gt[5])))
+        
+        # Refinement dimensions in output pixels
         ref_res = grid.resolution[0]
-        scale = int(ref_res / self.resolution)
+        scale = max(1, int(round(ref_res / self.resolution)))
         
         # Place each refinement cell into output grid
+        # Refinement grid: row 0 is at south (bottom)
+        # Output raster: row 0 is at north (top)
         for r in range(grid.dimensions[0]):
             for c in range(grid.dimensions[1]):
-                out_r = out_row_start + r * scale
-                out_c = out_col_start + c * scale
+                # In refinement grid, row 0 is at bottom
+                # In output, we need to flip: top of refinement goes to smaller row numbers
+                # refinement row 0 (bottom) -> output row (out_row_start + height - 1 - 0)
+                # refinement row (h-1) (top) -> output row out_row_start
+                out_r_base = out_row_start + (grid.dimensions[0] - 1 - r) * scale
+                out_c_base = out_col_start + c * scale
                 
-                # Bounds check
-                if out_r < 0 or out_r >= self.shape[0]:
-                    continue
-                if out_c < 0 or out_c >= self.shape[1]:
-                    continue
-                
-                # Fill scaled region (for coarser refinements)
+                # Fill scaled region
                 for dr in range(scale):
                     for dc in range(scale):
-                        rr = out_r + dr
-                        cc = out_c + dc
-                        if rr < self.shape[0] and cc < self.shape[1]:
-                            self.classification[rr, cc] = classification[r, c]
-                            self.confidence[rr, cc] = confidence[r, c]
-                            self.correction[rr, cc] = correction[r, c]
+                        out_r = out_r_base + dr
+                        out_c = out_c_base + dc
+                        
+                        # Bounds check
+                        if 0 <= out_r < self.shape[0] and 0 <= out_c < self.shape[1]:
+                            self.classification[out_r, out_c] = classification[r, c]
+                            self.confidence[out_r, out_c] = confidence[r, c]
+                            self.correction[out_r, out_c] = correction[r, c]
                             if grid.valid_mask[r, c]:
-                                self.valid_mask[rr, cc] = 1.0
+                                self.valid_mask[out_r, out_c] = 1.0
     
     def save(self, path: Path):
         """
@@ -532,18 +606,9 @@ class SidecarBuilder:
         )
         
         try:
-            # Set geotransform for resampled grid
+            # Use the geotransform we got from GDAL's resampled view
             if self.geotransform:
-                # Adjust geotransform for finest resolution
-                new_gt = (
-                    self.bounds[0],  # min_x
-                    self.resolution,  # pixel width
-                    0,
-                    self.bounds[3],  # max_y (note: origin is top-left)
-                    0,
-                    -self.resolution,  # negative pixel height
-                )
-                ds.SetGeoTransform(new_gt)
+                ds.SetGeoTransform(self.geotransform)
             
             if self.crs:
                 ds.SetProjection(self.crs)
