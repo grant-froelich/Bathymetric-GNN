@@ -1,7 +1,6 @@
 name: bathymetric-gnn
 channels:
   - pytorch
-  - pyg
   - nvidia
   - conda-forge
   - defaults
@@ -10,18 +9,11 @@ dependencies:
   # Python
   - python=3.11
   
-  # PyTorch ecosystem
+  # PyTorch ecosystem (conda)
   - pytorch>=2.0
   - pytorch-cuda=12.1
   - torchvision
   - torchaudio
-  
-  # PyTorch Geometric
-  - pyg>=2.4
-  - torch-scatter
-  - torch-sparse
-  - torch-cluster
-  - torch-spline-conv
   
   # Geospatial
   - gdal>=3.6
@@ -56,8 +48,8 @@ dependencies:
   - pip
   
   - pip:
-    # Additional PyG utilities if needed
-    - torch-geometric-temporal
+    # PyTorch Geometric - install via pip for better compatibility
+    - torch-geometric
     # Experiment tracking
     - wandb
     - tensorboard

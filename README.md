@@ -36,7 +36,15 @@ Stage 4: Selective Correction
     Flag low-confidence regions for human review
 ```
 
-## Key Design Decisions
+## Key Features
+
+### Variable Resolution (VR) BAG Support
+
+Native VR BAG processing preserves multi-resolution structure:
+- Processes each refinement grid (3x3 to 50x50 cells) individually
+- Maintains original VR BAG format in output
+- Generates sidecar GeoTIFF with classification/confidence layers
+- Much higher confidence scores than resampled approach
 
 ### Tile-Based Processing
 
@@ -54,7 +62,14 @@ The system processes overlapping tiles and stitches results.
 - Cleaned depth grid (same format as input)
 - Classification map (noise/feature/seafloor per point)
 - Confidence map (0-1 per point)
-- Review priority map (regions needing human attention)
+- Correction map (suggested depth adjustments)
+- Valid data mask
+
+### Uncertainty Scaling
+
+Corrected cells have uncertainty scaled by model confidence:
+- High confidence (0.9) → uncertainty × 1.1
+- Low confidence (0.5) → uncertainty × 1.5
 
 ## Installation
 
@@ -67,33 +82,37 @@ conda activate bathymetric-gnn
 python -c "import torch; import torch_geometric; print('Ready')"
 ```
 
+### Windows with GDAL HDF5 Support
+
+```bash
+conda activate bathymetric-gnn
+conda install -c conda-forge gdal libgdal-hdf5
+```
+
 ## Project Structure
 
 ```
 bathymetric-gnn/
 ├── config/
-│   └── config.py              # Configuration dataclass
+│   └── config.py                  # Configuration dataclass
 ├── data/
-│   ├── loaders.py             # BAG/GeoTIFF loading via GDAL
-│   ├── graph_construction.py  # Build graphs from grids
-│   ├── synthetic_noise.py     # Generate training data
-│   └── tiling.py              # Tile management for large grids
+│   ├── loaders.py                 # BAG/GeoTIFF loading via GDAL
+│   ├── graph_construction.py      # Build graphs from grids
+│   ├── synthetic_noise.py         # Generate training data
+│   ├── tiling.py                  # Tile management for large grids
+│   └── vr_bag.py                  # Native VR BAG handler
 ├── models/
-│   ├── feature_extractor.py   # Local feature extraction
-│   ├── gnn.py                 # Graph neural network
-│   └── pipeline.py            # Full inference pipeline
+│   ├── gnn.py                     # Graph neural network
+│   └── pipeline.py                # Full inference pipeline
 ├── training/
-│   ├── trainer.py             # Training loop
-│   └── losses.py              # Loss functions
-├── evaluation/
-│   ├── metrics.py             # Quality metrics
-│   └── visualization.py       # Result visualization
-├── review/
-│   └── human_feedback.py      # Human-in-the-loop integration
+│   ├── trainer.py                 # Training loop
+│   └── losses.py                  # Loss functions
 └── scripts/
-    ├── train.py               # Training entry point
-    ├── inference.py           # Inference entry point
-    └── export_review.py       # Export for human review
+    ├── train.py                   # Training entry point
+    ├── inference.py               # Inference (resampled mode)
+    ├── inference_vr_native.py     # Native VR BAG inference
+    ├── diagnose_tiles.py          # Tile validity diagnostics
+    └── explore_vr_bag.py          # VR BAG structure explorer
 ```
 
 ## Usage
@@ -104,37 +123,68 @@ bathymetric-gnn/
 python scripts/train.py \
     --clean-surveys /path/to/clean/surveys \
     --output-dir /path/to/model/output \
-    --epochs 100
+    --epochs 100 \
+    --vr-bag-mode resampled
 ```
 
-### Inference
+### Inference (Single Resolution or Resampled VR)
 
 ```bash
 python scripts/inference.py \
-    --input /path/to/noisy/survey.bag \
-    --model /path/to/trained/model.pt \
-    --output /path/to/output/
+    --input /path/to/survey.bag \
+    --model /path/to/model.pt \
+    --output /path/to/output.tif \
+    --vr-bag-mode resampled \
+    --min-valid-ratio 0.01
 ```
 
-### Export for Review
+### Native VR BAG Inference (Preserves VR Structure)
 
 ```bash
-python scripts/export_review.py \
-    --results /path/to/inference/output \
-    --format geotiff \
-    --confidence-threshold 0.7
+python scripts/inference_vr_native.py \
+    --input /path/to/vr_survey.bag \
+    --model /path/to/model.pt \
+    --output /path/to/output.bag \
+    --min-valid-ratio 0.01
+```
+
+This creates:
+- `output.bag` - VR BAG with corrections applied
+- `output_gnn_outputs.tif` - Sidecar GeoTIFF with classification/confidence
+
+### Diagnostic Tools
+
+```bash
+# Check tile validity and coverage
+python scripts/diagnose_tiles.py \
+    --survey /path/to/survey.bag \
+    --vr-bag-mode resampled
+
+# Explore VR BAG HDF5 structure
+python scripts/explore_vr_bag.py \
+    --survey /path/to/vr_survey.bag
 ```
 
 ## Data Format Support
 
-- **Input**: ONSWG BAG, GeoTIFF, ASC (via GDAL)
-- **Output**: Same as input format, plus confidence/classification layers
+- **Input**: ONSWG BAG (SR and VR), GeoTIFF, ASC (via GDAL)
+- **Output**: 
+  - BAG: Copy-and-modify for SR, new SR for resampled VR
+  - GeoTIFF: Multi-band with depth, uncertainty, classification, confidence, correction, valid_mask
+  - Native VR: Preserved VR structure + sidecar GeoTIFF
 
 ## Hardware Requirements
 
 - **Minimum**: 16 GB RAM, NVIDIA GPU with 8 GB VRAM
 - **Recommended**: 32 GB RAM, NVIDIA GPU with 16+ GB VRAM
 - **CPU-only**: Supported but significantly slower
+- **RTX 50 Series (Blackwell)**: Auto-detected and falls back to CPU until PyTorch adds support
+
+## Known Issues
+
+- RTX 50 series GPUs (sm_120) not yet supported by PyTorch; auto-falls back to CPU
+- VR BAG output from resampled input creates SR BAG (cannot recreate VR structure)
+- Full BAG XML metadata not preserved when creating new BAGs
 
 ## License
 
