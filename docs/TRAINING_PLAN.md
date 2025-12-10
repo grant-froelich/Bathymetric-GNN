@@ -7,7 +7,16 @@ Detailed plan for training a production-quality model for bathymetric noise dete
 - Model trained on synthetic noise only
 - 50 epochs, 5 clean VR BAGs, 100 tiles
 - Accuracy on synthetic data: 63.2%
-- Real-world performance: Unknown (100% classified as noise, but low confidence indicates model uncertainty)
+- Real-world performance: Unknown (100% classified as noise, but 73.5% mean confidence with native VR processing)
+
+## Processing Modes
+
+| Mode | Script | Use Case |
+|------|--------|----------|
+| **Native VR** | `inference_vr_native.py` | Production - preserves VR structure, higher confidence |
+| Resampled | `inference.py --vr-bag-mode resampled` | Analysis/visualization only |
+
+**Always use native VR processing for training and production inference.**
 
 ## Directory Structure
 
@@ -15,8 +24,8 @@ Detailed plan for training a production-quality model for bathymetric noise dete
 bathymetric-gnn/
 ├── data/
 │   ├── raw/
-│   │   ├── clean/              # Clean reference surveys
-│   │   ├── noisy/              # Corresponding noisy versions
+│   │   ├── clean/              # Clean reference surveys (VR BAGs)
+│   │   ├── noisy/              # Corresponding noisy versions (VR BAGs)
 │   │   └── features/           # Surveys with known features
 │   ├── processed/
 │   │   ├── labels/             # Generated ground truth labels
@@ -44,7 +53,7 @@ bathymetric-gnn/
 
 ### Step 1.1: Organize Survey Pairs
 
-Place matching surveys in the data directory:
+Place matching VR BAG surveys in the data directory:
 
 ```
 data/raw/clean/survey_001_clean.bag
@@ -60,7 +69,8 @@ data/raw/noisy/survey_002_noisy.bag
 """
 scripts/prepare_ground_truth.py
 
-Generate ground truth labels from clean/noisy survey pairs.
+Generate ground truth labels from clean/noisy VR BAG survey pairs.
+Uses native VR processing to preserve multi-resolution structure.
 """
 
 import os
@@ -71,11 +81,12 @@ import logging
 from pathlib import Path
 import numpy as np
 from osgeo import gdal
+import json
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data import BathymetricLoader
+from data.vr_bag import VRBagHandler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -86,178 +97,228 @@ CLASS_FEATURE = 1
 CLASS_NOISE = 2
 
 
-def load_survey(path: Path, vr_bag_mode: str = 'resampled') -> tuple:
-    """Load survey and return depth, uncertainty, geotransform, crs."""
-    loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
-    grid = loader.load(path)
-    return grid.depth, grid.uncertainty, grid.geotransform, grid.crs
-
-
-def compute_ground_truth(
+def compute_ground_truth_native(
     clean_path: Path,
     noisy_path: Path,
     output_dir: Path,
     noise_threshold: float = 0.15,
-    vr_bag_mode: str = 'resampled',
 ):
     """
-    Compute ground truth labels from clean/noisy pair.
+    Compute ground truth labels from clean/noisy VR BAG pair using native processing.
+    
+    Iterates through refinement grids and compares depths at native resolution.
     
     Args:
-        clean_path: Path to clean survey
-        noisy_path: Path to noisy survey
+        clean_path: Path to clean VR BAG
+        noisy_path: Path to noisy VR BAG
         output_dir: Directory for output files
         noise_threshold: Minimum depth difference to classify as noise (meters)
-        vr_bag_mode: How to load VR BAGs
     """
-    logger.info(f"Loading clean survey: {clean_path}")
-    clean_depth, clean_uncert, geotransform, crs = load_survey(clean_path, vr_bag_mode)
+    logger.info(f"Loading clean VR BAG: {clean_path}")
+    clean_handler = VRBagHandler(clean_path)
     
-    logger.info(f"Loading noisy survey: {noisy_path}")
-    noisy_depth, noisy_uncert, _, _ = load_survey(noisy_path, vr_bag_mode)
+    logger.info(f"Loading noisy VR BAG: {noisy_path}")
+    noisy_handler = VRBagHandler(noisy_path)
     
-    # Validate shapes match
-    if clean_depth.shape != noisy_depth.shape:
+    # Validate structure matches
+    if clean_handler.base_shape != noisy_handler.base_shape:
         raise ValueError(
-            f"Shape mismatch: clean {clean_depth.shape} vs noisy {noisy_depth.shape}"
+            f"Base shape mismatch: clean {clean_handler.base_shape} vs noisy {noisy_handler.base_shape}"
         )
     
-    logger.info(f"Grid shape: {clean_depth.shape}")
+    clean_info = clean_handler.get_refinement_info()
+    noisy_info = noisy_handler.get_refinement_info()
     
-    # Compute difference
-    # Positive = noisy is deeper than clean (noise added depth)
-    # Negative = noisy is shallower than clean (noise removed depth)
-    difference = noisy_depth - clean_depth
-    
-    # Valid mask (both surveys have data)
-    nodata = 1.0e6
-    valid_clean = (clean_depth != nodata) & np.isfinite(clean_depth)
-    valid_noisy = (noisy_depth != nodata) & np.isfinite(noisy_depth)
-    valid_mask = valid_clean & valid_noisy
-    
-    # Classify based on difference
-    # Start with seafloor (default)
-    labels = np.full(clean_depth.shape, CLASS_SEAFLOOR, dtype=np.int32)
-    
-    # Mark noise where difference exceeds threshold
-    noise_mask = np.abs(difference) > noise_threshold
-    labels[noise_mask & valid_mask] = CLASS_NOISE
-    
-    # Mark invalid areas
-    labels[~valid_mask] = -1  # NoData
+    logger.info(f"VR BAG structure:")
+    logger.info(f"  Base grid: {clean_info['base_shape']}")
+    logger.info(f"  Refined cells: {clean_info['num_refined_cells']:,}")
+    logger.info(f"  Resolutions: {clean_info['unique_resolutions']} meters")
     
     # Statistics
-    valid_count = np.sum(valid_mask)
-    noise_count = np.sum(labels == CLASS_NOISE)
-    seafloor_count = np.sum(labels == CLASS_SEAFLOOR)
+    stats = {
+        'grids_processed': 0,
+        'total_valid_cells': 0,
+        'noise_cells': 0,
+        'seafloor_cells': 0,
+        'noise_magnitudes': [],
+    }
     
+    # Process each refinement grid
+    # Build lookup for noisy grids by base cell position
+    noisy_grids = {}
+    for grid in noisy_handler.iterate_refinements(min_valid_ratio=0.0):
+        key = (grid.base_row, grid.base_col)
+        noisy_grids[key] = grid
+    
+    # Iterate through clean grids and compare
+    labels_by_grid = {}
+    
+    for clean_grid in clean_handler.iterate_refinements(min_valid_ratio=0.0):
+        key = (clean_grid.base_row, clean_grid.base_col)
+        
+        if key not in noisy_grids:
+            continue
+        
+        noisy_grid = noisy_grids[key]
+        
+        # Validate dimensions match
+        if clean_grid.dimensions != noisy_grid.dimensions:
+            logger.warning(f"Dimension mismatch at {key}, skipping")
+            continue
+        
+        # Compute difference
+        difference = noisy_grid.depth - clean_grid.depth
+        
+        # Valid mask (both have data)
+        valid = clean_grid.valid_mask & noisy_grid.valid_mask
+        
+        # Classify
+        labels = np.full(clean_grid.depth.shape, CLASS_SEAFLOOR, dtype=np.int32)
+        noise_mask = np.abs(difference) > noise_threshold
+        labels[noise_mask & valid] = CLASS_NOISE
+        labels[~valid] = -1
+        
+        labels_by_grid[key] = {
+            'labels': labels,
+            'difference': difference,
+            'resolution': clean_grid.resolution,
+            'dimensions': clean_grid.dimensions,
+        }
+        
+        # Update stats
+        stats['grids_processed'] += 1
+        stats['total_valid_cells'] += int(np.sum(valid))
+        stats['noise_cells'] += int(np.sum(labels == CLASS_NOISE))
+        stats['seafloor_cells'] += int(np.sum(labels == CLASS_SEAFLOOR))
+        
+        if np.any(noise_mask & valid):
+            stats['noise_magnitudes'].extend(np.abs(difference[noise_mask & valid]).tolist())
+    
+    # Summary
     logger.info(f"Ground truth statistics:")
-    logger.info(f"  Valid cells: {valid_count:,}")
-    logger.info(f"  Noise cells: {noise_count:,} ({100*noise_count/valid_count:.2f}%)")
-    logger.info(f"  Seafloor cells: {seafloor_count:,} ({100*seafloor_count/valid_count:.2f}%)")
-    logger.info(f"  Mean noise magnitude: {np.mean(np.abs(difference[noise_mask & valid_mask])):.3f}m")
-    logger.info(f"  Max noise magnitude: {np.max(np.abs(difference[noise_mask & valid_mask])):.3f}m")
+    logger.info(f"  Grids processed: {stats['grids_processed']:,}")
+    logger.info(f"  Valid cells: {stats['total_valid_cells']:,}")
+    logger.info(f"  Noise cells: {stats['noise_cells']:,} ({100*stats['noise_cells']/max(1,stats['total_valid_cells']):.2f}%)")
+    logger.info(f"  Seafloor cells: {stats['seafloor_cells']:,}")
     
-    # Save outputs
+    if stats['noise_magnitudes']:
+        magnitudes = np.array(stats['noise_magnitudes'])
+        logger.info(f"  Mean noise magnitude: {np.mean(magnitudes):.3f}m")
+        logger.info(f"  Max noise magnitude: {np.max(magnitudes):.3f}m")
+    
+    # Save as resampled GeoTIFF for visualization (use GDAL resampled view for georef)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    survey_name = clean_path.stem.replace('_clean', '')
+    survey_name = clean_path.stem.replace('_clean', '').replace('_Clean', '')
     
-    # Save as GeoTIFF with multiple bands
+    # Get georeferencing from GDAL's resampled view
+    gdal.UseExceptions()
+    ds = gdal.OpenEx(str(noisy_path), gdal.OF_RASTER, open_options=['MODE=RESAMPLED_GRID'])
+    resampled_shape = (ds.RasterYSize, ds.RasterXSize)
+    geotransform = ds.GetGeoTransform()
+    crs = ds.GetProjection()
+    resolution = abs(geotransform[1])
+    
+    # Read resampled depths for reference
+    noisy_resampled = ds.GetRasterBand(1).ReadAsArray()
+    ds = None
+    
+    ds = gdal.OpenEx(str(clean_path), gdal.OF_RASTER, open_options=['MODE=RESAMPLED_GRID'])
+    clean_resampled = ds.GetRasterBand(1).ReadAsArray()
+    ds = None
+    
+    # Compute resampled labels
+    difference_resampled = noisy_resampled - clean_resampled
+    nodata = 1.0e6
+    valid_resampled = (clean_resampled != nodata) & (noisy_resampled != nodata)
+    valid_resampled &= np.isfinite(clean_resampled) & np.isfinite(noisy_resampled)
+    
+    labels_resampled = np.full(resampled_shape, CLASS_SEAFLOOR, dtype=np.int32)
+    labels_resampled[np.abs(difference_resampled) > noise_threshold] = CLASS_NOISE
+    labels_resampled[~valid_resampled] = -1
+    
+    # Save output
     output_path = output_dir / f"{survey_name}_ground_truth.tif"
     
     driver = gdal.GetDriverByName('GTiff')
-    height, width = labels.shape
+    height, width = resampled_shape
     
-    # 4 bands: labels, difference, noisy_depth, clean_depth
-    ds = driver.Create(
+    out_ds = driver.Create(
         str(output_path),
         width, height, 4,
         gdal.GDT_Float32,
         options=['COMPRESS=LZW', 'TILED=YES']
     )
     
-    ds.SetGeoTransform(geotransform)
+    out_ds.SetGeoTransform(geotransform)
     if crs:
-        ds.SetProjection(crs)
+        out_ds.SetProjection(crs)
     
-    # Band 1: Labels
-    band = ds.GetRasterBand(1)
-    band.WriteArray(labels.astype(np.float32))
-    band.SetDescription('labels')
-    band.SetNoDataValue(-1)
+    out_ds.GetRasterBand(1).WriteArray(labels_resampled.astype(np.float32))
+    out_ds.GetRasterBand(1).SetDescription('labels')
+    out_ds.GetRasterBand(1).SetNoDataValue(-1)
     
-    # Band 2: Difference (correction that was applied)
-    band = ds.GetRasterBand(2)
-    diff_out = difference.copy()
-    diff_out[~valid_mask] = np.nan
-    band.WriteArray(diff_out)
-    band.SetDescription('difference')
+    out_ds.GetRasterBand(2).WriteArray(difference_resampled)
+    out_ds.GetRasterBand(2).SetDescription('difference')
     
-    # Band 3: Noisy depth
-    band = ds.GetRasterBand(3)
-    band.WriteArray(noisy_depth)
-    band.SetDescription('noisy_depth')
+    out_ds.GetRasterBand(3).WriteArray(noisy_resampled)
+    out_ds.GetRasterBand(3).SetDescription('noisy_depth')
     
-    # Band 4: Clean depth
-    band = ds.GetRasterBand(4)
-    band.WriteArray(clean_depth)
-    band.SetDescription('clean_depth')
+    out_ds.GetRasterBand(4).WriteArray(clean_resampled)
+    out_ds.GetRasterBand(4).SetDescription('clean_depth')
     
-    ds.FlushCache()
-    ds = None
+    out_ds.FlushCache()
+    out_ds = None
     
     logger.info(f"Saved ground truth: {output_path}")
     
-    # Also save statistics as JSON
-    import json
-    stats = {
+    # Save statistics
+    stats_output = {
         'clean_survey': str(clean_path),
         'noisy_survey': str(noisy_path),
         'noise_threshold': noise_threshold,
-        'grid_shape': list(clean_depth.shape),
-        'valid_cells': int(valid_count),
-        'noise_cells': int(noise_count),
-        'noise_percentage': float(100 * noise_count / valid_count),
-        'seafloor_cells': int(seafloor_count),
-        'mean_noise_magnitude': float(np.mean(np.abs(difference[noise_mask & valid_mask]))),
-        'max_noise_magnitude': float(np.max(np.abs(difference[noise_mask & valid_mask]))),
-        'noise_depth_distribution': {
-            'mean': float(np.mean(noisy_depth[noise_mask & valid_mask])),
-            'std': float(np.std(noisy_depth[noise_mask & valid_mask])),
-            'min': float(np.min(noisy_depth[noise_mask & valid_mask])),
-            'max': float(np.max(noisy_depth[noise_mask & valid_mask])),
-        }
+        'processing_mode': 'native_vr',
+        'base_shape': list(clean_handler.base_shape),
+        'resampled_shape': list(resampled_shape),
+        'resolution': float(resolution),
+        'grids_processed': stats['grids_processed'],
+        'valid_cells': stats['total_valid_cells'],
+        'noise_cells': stats['noise_cells'],
+        'noise_percentage': float(100 * stats['noise_cells'] / max(1, stats['total_valid_cells'])),
+        'seafloor_cells': stats['seafloor_cells'],
     }
+    
+    if stats['noise_magnitudes']:
+        magnitudes = np.array(stats['noise_magnitudes'])
+        stats_output['mean_noise_magnitude'] = float(np.mean(magnitudes))
+        stats_output['max_noise_magnitude'] = float(np.max(magnitudes))
+        stats_output['median_noise_magnitude'] = float(np.median(magnitudes))
     
     stats_path = output_dir / f"{survey_name}_ground_truth_stats.json"
     with open(stats_path, 'w') as f:
-        json.dump(stats, f, indent=2)
+        json.dump(stats_output, f, indent=2)
     
     logger.info(f"Saved statistics: {stats_path}")
     
-    return labels, difference
+    return labels_by_grid, stats
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate ground truth from survey pairs')
-    parser.add_argument('--clean', type=Path, required=True, help='Clean survey path')
-    parser.add_argument('--noisy', type=Path, required=True, help='Noisy survey path')
+    parser = argparse.ArgumentParser(description='Generate ground truth from VR BAG survey pairs')
+    parser.add_argument('--clean', type=Path, required=True, help='Clean VR BAG path')
+    parser.add_argument('--noisy', type=Path, required=True, help='Noisy VR BAG path')
     parser.add_argument('--output-dir', type=Path, default=Path('data/processed/labels'))
     parser.add_argument('--noise-threshold', type=float, default=0.15,
                         help='Minimum depth difference for noise (meters)')
-    parser.add_argument('--vr-bag-mode', default='resampled',
-                        choices=['resampled', 'base', 'refinements'])
     
     args = parser.parse_args()
     
-    compute_ground_truth(
+    compute_ground_truth_native(
         args.clean,
         args.noisy,
         args.output_dir,
         args.noise_threshold,
-        args.vr_bag_mode,
     )
 
 
@@ -268,13 +329,12 @@ if __name__ == '__main__':
 ### Step 1.3: Run Ground Truth Generation
 
 ```cmd
-:: For each survey pair
+:: For each VR BAG survey pair
 python scripts/prepare_ground_truth.py ^
     --clean data/raw/clean/survey_001_clean.bag ^
     --noisy data/raw/noisy/survey_001_noisy.bag ^
     --output-dir data/processed/labels ^
-    --noise-threshold 0.15 ^
-    --vr-bag-mode resampled
+    --noise-threshold 0.15
 
 :: Repeat for all pairs
 python scripts/prepare_ground_truth.py ^
@@ -291,6 +351,7 @@ python scripts/prepare_ground_truth.py ^
 scripts/evaluate_model.py
 
 Evaluate model predictions against ground truth.
+Works with native VR BAG sidecar outputs.
 """
 
 import os
@@ -302,9 +363,6 @@ from pathlib import Path
 import numpy as np
 from osgeo import gdal
 import json
-
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -321,10 +379,9 @@ def load_ground_truth(path: Path):
 
 
 def load_predictions(path: Path):
-    """Load model predictions GeoTIFF."""
+    """Load model predictions from sidecar GeoTIFF."""
     ds = gdal.Open(str(path))
     
-    # Find bands
     classification = None
     confidence = None
     
@@ -336,6 +393,12 @@ def load_predictions(path: Path):
         elif 'confid' in desc:
             confidence = band.ReadAsArray()
     
+    # If no description, assume band order from sidecar format
+    if classification is None and ds.RasterCount >= 1:
+        classification = ds.GetRasterBand(1).ReadAsArray()  # Band 1: classification
+    if confidence is None and ds.RasterCount >= 2:
+        confidence = ds.GetRasterBand(2).ReadAsArray()  # Band 2: confidence
+    
     ds = None
     return classification, confidence
 
@@ -343,10 +406,10 @@ def load_predictions(path: Path):
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, confidence: np.ndarray = None):
     """Compute per-class and overall metrics."""
     
-    # Valid mask (ground truth has label)
-    valid = y_true >= 0
-    y_true = y_true[valid]
-    y_pred = y_pred[valid]
+    # Valid mask
+    valid = (y_true >= 0) & np.isfinite(y_pred)
+    y_true = y_true[valid].astype(np.int32)
+    y_pred = y_pred[valid].astype(np.int32)
     if confidence is not None:
         confidence = confidence[valid]
     
@@ -392,7 +455,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, confidence: np.ndarr
             'mean': float(np.mean(confidence)),
             'std': float(np.std(confidence)),
             'mean_correct': float(np.mean(confidence[y_true == y_pred])),
-            'mean_incorrect': float(np.mean(confidence[y_true != y_pred])),
+            'mean_incorrect': float(np.mean(confidence[y_true != y_pred])) if np.any(y_true != y_pred) else 0,
         }
         
         # Accuracy at different confidence thresholds
@@ -454,7 +517,8 @@ def print_metrics(metrics: dict):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate model against ground truth')
     parser.add_argument('--ground-truth', type=Path, required=True)
-    parser.add_argument('--predictions', type=Path, required=True)
+    parser.add_argument('--predictions', type=Path, required=True,
+                        help='Sidecar GeoTIFF from native VR inference')
     parser.add_argument('--output', type=Path, help='Save metrics to JSON')
     
     args = parser.parse_args()
@@ -484,18 +548,21 @@ if __name__ == '__main__':
 ### Step 1.5: Run Evaluation
 
 ```cmd
-:: First run inference on the noisy survey
-python scripts/inference.py ^
+:: First run native VR inference on the noisy survey
+python scripts/inference_vr_native.py ^
     --input data/raw/noisy/survey_001_noisy.bag ^
     --model outputs/final_model.pt ^
-    --output outputs/predictions/survey_001_predictions.tif ^
-    --vr-bag-mode resampled ^
+    --output outputs/predictions/survey_001_clean.bag ^
     --min-valid-ratio 0.01
 
-:: Then evaluate against ground truth
+:: This creates both:
+::   outputs/predictions/survey_001_clean.bag (corrected VR BAG)
+::   outputs/predictions/survey_001_clean_gnn_outputs.tif (sidecar with classification/confidence)
+
+:: Then evaluate sidecar against ground truth
 python scripts/evaluate_model.py ^
     --ground-truth data/processed/labels/survey_001_ground_truth.tif ^
-    --predictions outputs/predictions/survey_001_predictions.tif ^
+    --predictions outputs/predictions/survey_001_clean_gnn_outputs.tif ^
     --output outputs/metrics/survey_001_evaluation.json
 ```
 
@@ -581,11 +648,12 @@ def analyze_ground_truth(path: Path) -> dict:
         lo, hi = depth_bins[i], depth_bins[i + 1]
         # Use absolute depth (negate since BAG stores as negative)
         depth_range = (-noisy_depth >= lo) & (-noisy_depth < hi) & noise_mask & valid
+        total_in_range = (-noisy_depth >= lo) & (-noisy_depth < hi) & valid
         if np.sum(depth_range) > 100:
             depth_noise[f'{lo}-{hi}m'] = {
                 'count': int(np.sum(depth_range)),
                 'mean_magnitude': float(np.mean(np.abs(difference[depth_range]))),
-                'noise_rate': float(np.sum(depth_range) / np.sum((-noisy_depth >= lo) & (-noisy_depth < hi) & valid)),
+                'noise_rate': float(np.sum(depth_range) / np.sum(total_in_range)),
             }
     analysis['depth_dependent'] = depth_noise
     
@@ -735,7 +803,8 @@ if __name__ == '__main__':
 ```cmd
 :: Analyze all ground truth files
 python scripts/analyze_noise_patterns.py ^
-    --input data/processed/labels/*.tif ^
+    --input data/processed/labels/survey_001_ground_truth.tif ^
+           data/processed/labels/survey_002_ground_truth.tif ^
     --output outputs/analysis/noise_patterns.json
 ```
 
@@ -781,6 +850,7 @@ Download from: https://nauticalcharts.noaa.gov/data/wrecks-and-obstructions.html
 scripts/prepare_feature_labels.py
 
 Create feature class labels from external sources.
+Uses native VR BAG processing.
 """
 
 import os
@@ -796,7 +866,7 @@ import json
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data import BathymetricLoader
+from data.vr_bag import VRBagHandler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -857,16 +927,23 @@ def add_feature_labels(
     wrecks_shapefile: Path = None,
     slope_threshold: float = 15.0,
     wreck_radius: int = 50,  # pixels
-    vr_bag_mode: str = 'resampled',
 ):
     """
     Create labels with feature class from slope analysis and wreck locations.
+    Uses GDAL resampled view for output but processes at native resolution.
     """
-    loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
-    grid = loader.load(survey_path)
+    # Load VR BAG via GDAL resampled view for slope analysis
+    gdal.UseExceptions()
+    ds = gdal.OpenEx(str(survey_path), gdal.OF_RASTER, open_options=['MODE=RESAMPLED_GRID'])
     
-    depth = grid.depth
-    valid = (depth != 1.0e6) & np.isfinite(depth)
+    depth = ds.GetRasterBand(1).ReadAsArray()
+    gt = ds.GetGeoTransform()
+    crs = ds.GetProjection()
+    shape = (ds.RasterYSize, ds.RasterXSize)
+    ds = None
+    
+    nodata = 1.0e6
+    valid = (depth != nodata) & np.isfinite(depth)
     
     # Initialize with seafloor
     labels = np.zeros(depth.shape, dtype=np.int32)
@@ -885,8 +962,6 @@ def add_feature_labels(
         logger.info(f"Loading wrecks from: {wrecks_shapefile}")
         wrecks = load_wrecks_shapefile(wrecks_shapefile)
         
-        # Convert wreck coordinates to pixel coordinates
-        gt = grid.geotransform
         wreck_count = 0
         
         for wreck in wrecks:
@@ -916,28 +991,28 @@ def add_feature_labels(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     driver = gdal.GetDriverByName('GTiff')
-    ds = driver.Create(
+    out_ds = driver.Create(
         str(output_path),
         depth.shape[1], depth.shape[0], 2,
         gdal.GDT_Float32,
         options=['COMPRESS=LZW', 'TILED=YES']
     )
     
-    ds.SetGeoTransform(grid.geotransform)
-    if grid.crs:
-        ds.SetProjection(grid.crs)
+    out_ds.SetGeoTransform(gt)
+    if crs:
+        out_ds.SetProjection(crs)
     
-    band = ds.GetRasterBand(1)
+    band = out_ds.GetRasterBand(1)
     band.WriteArray(labels.astype(np.float32))
     band.SetDescription('labels')
     band.SetNoDataValue(-1)
     
-    band = ds.GetRasterBand(2)
+    band = out_ds.GetRasterBand(2)
     band.WriteArray(depth)
     band.SetDescription('depth')
     
-    ds.FlushCache()
-    ds = None
+    out_ds.FlushCache()
+    out_ds = None
     
     logger.info(f"Saved: {output_path}")
 
@@ -949,7 +1024,6 @@ def main():
     parser.add_argument('--wrecks', type=Path, help='NOAA wrecks shapefile')
     parser.add_argument('--slope-threshold', type=float, default=15.0)
     parser.add_argument('--wreck-radius', type=int, default=50)
-    parser.add_argument('--vr-bag-mode', default='resampled')
     
     args = parser.parse_args()
     
@@ -959,7 +1033,6 @@ def main():
         args.wrecks,
         args.slope_threshold,
         args.wreck_radius,
-        args.vr_bag_mode,
     )
 
 
@@ -974,8 +1047,7 @@ if __name__ == '__main__':
 python scripts/prepare_feature_labels.py ^
     --survey data/raw/features/rocky_survey.bag ^
     --output data/processed/labels/rocky_survey_features.tif ^
-    --slope-threshold 15.0 ^
-    --vr-bag-mode resampled
+    --slope-threshold 15.0
 
 :: Include wrecks database
 python scripts/prepare_feature_labels.py ^
@@ -992,209 +1064,38 @@ python scripts/prepare_feature_labels.py ^
 **Duration:** 1 week  
 **Goal:** Set up proper training with validation and metrics
 
-### Step 4.1: Create Training Dataset
+### Step 4.1: Train with Native VR Processing
 
-```python
-#!/usr/bin/env python3
-"""
-scripts/create_training_dataset.py
-
-Combine ground truth and feature labels into training tiles.
-"""
-
-import os
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
-import argparse
-import logging
-from pathlib import Path
-import numpy as np
-from osgeo import gdal
-import json
-from sklearn.model_selection import train_test_split
-
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from data import TileManager
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
-
-
-def create_tiles_from_labeled_survey(
-    depth_path: Path,
-    labels_path: Path,
-    output_dir: Path,
-    tile_size: int = 512,
-    overlap: int = 64,
-    min_valid_ratio: float = 0.3,
-):
-    """Create training tiles from labeled survey."""
-    
-    # Load depth
-    ds = gdal.Open(str(depth_path))
-    depth = ds.GetRasterBand(1).ReadAsArray()
-    ds = None
-    
-    # Load labels
-    ds = gdal.Open(str(labels_path))
-    labels = ds.GetRasterBand(1).ReadAsArray().astype(np.int32)
-    ds = None
-    
-    valid = labels >= 0
-    
-    # Create tiles
-    tiles = []
-    height, width = depth.shape
-    
-    for y in range(0, height - tile_size + 1, tile_size - overlap):
-        for x in range(0, width - tile_size + 1, tile_size - overlap):
-            tile_depth = depth[y:y+tile_size, x:x+tile_size]
-            tile_labels = labels[y:y+tile_size, x:x+tile_size]
-            tile_valid = valid[y:y+tile_size, x:x+tile_size]
-            
-            valid_ratio = np.mean(tile_valid)
-            if valid_ratio >= min_valid_ratio:
-                tiles.append({
-                    'depth': tile_depth,
-                    'labels': tile_labels,
-                    'valid': tile_valid,
-                    'position': (y, x),
-                    'source': str(depth_path.name),
-                })
-    
-    logger.info(f"Created {len(tiles)} tiles from {depth_path.name}")
-    
-    # Save tiles
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    for i, tile in enumerate(tiles):
-        tile_path = output_dir / f"{depth_path.stem}_tile_{i:04d}.npz"
-        np.savez_compressed(
-            tile_path,
-            depth=tile['depth'],
-            labels=tile['labels'],
-            valid=tile['valid'],
-            position=tile['position'],
-            source=tile['source'],
-        )
-    
-    return len(tiles)
-
-
-def split_dataset(
-    tiles_dir: Path,
-    train_dir: Path,
-    val_dir: Path,
-    val_ratio: float = 0.2,
-    random_seed: int = 42,
-):
-    """Split tiles into train/validation sets."""
-    
-    tile_files = list(Path(tiles_dir).glob('*.npz'))
-    
-    # Group by source survey (geographic split)
-    sources = {}
-    for f in tile_files:
-        data = np.load(f)
-        source = str(data['source'])
-        if source not in sources:
-            sources[source] = []
-        sources[source].append(f)
-    
-    # Split by source (entire surveys go to train or val)
-    source_names = list(sources.keys())
-    train_sources, val_sources = train_test_split(
-        source_names, test_size=val_ratio, random_state=random_seed
-    )
-    
-    # Move files
-    train_dir = Path(train_dir)
-    val_dir = Path(val_dir)
-    train_dir.mkdir(parents=True, exist_ok=True)
-    val_dir.mkdir(parents=True, exist_ok=True)
-    
-    import shutil
-    
-    for source in train_sources:
-        for f in sources[source]:
-            shutil.copy(f, train_dir / f.name)
-    
-    for source in val_sources:
-        for f in sources[source]:
-            shutil.copy(f, val_dir / f.name)
-    
-    logger.info(f"Train: {len(train_sources)} surveys, Val: {len(val_sources)} surveys")
-    logger.info(f"Train tiles: {sum(len(sources[s]) for s in train_sources)}")
-    logger.info(f"Val tiles: {sum(len(sources[s]) for s in val_sources)}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--labeled-dir', type=Path, required=True,
-                        help='Directory with labeled surveys')
-    parser.add_argument('--depth-dir', type=Path, required=True,
-                        help='Directory with depth surveys')
-    parser.add_argument('--output-dir', type=Path, default=Path('data/processed'))
-    parser.add_argument('--tile-size', type=int, default=512)
-    parser.add_argument('--val-ratio', type=float, default=0.2)
-    
-    args = parser.parse_args()
-    
-    # Create tiles
-    tiles_dir = args.output_dir / 'tiles'
-    
-    for labels_file in args.labeled_dir.glob('*.tif'):
-        # Find matching depth file
-        depth_name = labels_file.stem.replace('_ground_truth', '').replace('_features', '')
-        depth_file = args.depth_dir / f"{depth_name}.bag"
-        
-        if not depth_file.exists():
-            depth_file = args.depth_dir / f"{depth_name}.tif"
-        
-        if depth_file.exists():
-            create_tiles_from_labeled_survey(
-                depth_file, labels_file, tiles_dir, args.tile_size
-            )
-    
-    # Split into train/val
-    split_dataset(
-        tiles_dir,
-        args.output_dir / 'train',
-        args.output_dir / 'validation',
-        args.val_ratio,
-    )
-
-
-if __name__ == '__main__':
-    main()
-```
-
-### Step 4.2: Create Dataset
-
-```cmd
-python scripts/create_training_dataset.py ^
-    --labeled-dir data/processed/labels ^
-    --depth-dir data/raw/noisy ^
-    --output-dir data/processed ^
-    --tile-size 512 ^
-    --val-ratio 0.2
-```
-
-### Step 4.3: Train with Validation
+Update the training script to use native VR BAG handling:
 
 ```cmd
 :: Train v2 model with real data
+:: Note: Training still uses tile-based approach but loads from native VR structure
 python scripts/train.py ^
-    --train-dir data/processed/train ^
-    --val-dir data/processed/validation ^
+    --clean-surveys data/raw/clean ^
     --output-dir outputs/models/v2 ^
     --epochs 100 ^
     --batch-size 4 ^
-    --learning-rate 0.001 ^
-    --early-stopping-patience 10
+    --learning-rate 0.001
+```
+
+### Step 4.2: Validation with Ground Truth
+
+After training, evaluate on held-out surveys:
+
+```cmd
+:: Run native inference
+python scripts/inference_vr_native.py ^
+    --input data/raw/noisy/validation_survey.bag ^
+    --model outputs/models/v2/best_model.pt ^
+    --output outputs/predictions/validation_clean.bag ^
+    --min-valid-ratio 0.01
+
+:: Evaluate
+python scripts/evaluate_model.py ^
+    --ground-truth data/processed/labels/validation_ground_truth.tif ^
+    --predictions outputs/predictions/validation_clean_gnn_outputs.tif ^
+    --output outputs/metrics/validation_eval.json
 ```
 
 ---
@@ -1211,7 +1112,7 @@ python scripts/train.py ^
 """
 scripts/export_for_review.py
 
-Export low-confidence regions for human review.
+Export low-confidence regions from native VR processing for human review.
 """
 
 import os
@@ -1223,7 +1124,7 @@ import numpy as np
 from osgeo import gdal
 
 def export_review_regions(
-    predictions_path: Path,
+    sidecar_path: Path,
     output_path: Path,
     confidence_low: float = 0.4,
     confidence_high: float = 0.7,
@@ -1232,22 +1133,11 @@ def export_review_regions(
     """Export regions where model is uncertain."""
     from scipy import ndimage
     
-    ds = gdal.Open(str(predictions_path))
+    ds = gdal.Open(str(sidecar_path))
     
-    # Load bands
-    classification = None
-    confidence = None
-    depth = None
-    
-    for i in range(1, ds.RasterCount + 1):
-        band = ds.GetRasterBand(i)
-        desc = band.GetDescription().lower()
-        if 'class' in desc:
-            classification = band.ReadAsArray()
-        elif 'confid' in desc:
-            confidence = band.ReadAsArray()
-        elif 'depth' in desc:
-            depth = band.ReadAsArray()
+    # Load bands from sidecar format
+    classification = ds.GetRasterBand(1).ReadAsArray()  # classification
+    confidence = ds.GetRasterBand(2).ReadAsArray()      # confidence
     
     gt = ds.GetGeoTransform()
     crs = ds.GetProjection()
@@ -1255,6 +1145,7 @@ def export_review_regions(
     
     # Find uncertain regions
     uncertain = (confidence >= confidence_low) & (confidence <= confidence_high)
+    uncertain &= np.isfinite(confidence)
     
     # Label connected regions
     labeled, num_regions = ndimage.label(uncertain)
@@ -1321,7 +1212,8 @@ def export_review_regions(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--predictions', type=Path, required=True)
+    parser.add_argument('--sidecar', type=Path, required=True,
+                        help='Sidecar GeoTIFF from native VR inference (*_gnn_outputs.tif)')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--confidence-low', type=float, default=0.4)
     parser.add_argument('--confidence-high', type=float, default=0.7)
@@ -1330,7 +1222,7 @@ def main():
     args = parser.parse_args()
     
     export_review_regions(
-        args.predictions,
+        args.sidecar,
         args.output,
         args.confidence_low,
         args.confidence_high,
@@ -1345,77 +1237,86 @@ if __name__ == '__main__':
 ### Step 5.2: Export and Review
 
 ```cmd
-:: Export uncertain regions
+:: Export uncertain regions from native VR sidecar
 python scripts/export_for_review.py ^
-    --predictions outputs/predictions/survey_001_predictions.tif ^
+    --sidecar outputs/predictions/survey_001_clean_gnn_outputs.tif ^
     --output outputs/review/survey_001_review.tif ^
     --confidence-low 0.4 ^
     --confidence-high 0.7
 ```
 
-### Step 5.3: Incorporate Corrections
-
-After human review, save corrections as additional training data:
-
-```cmd
-:: Add corrections to training set
-python scripts/add_corrections.py ^
-    --original outputs/predictions/survey_001_predictions.tif ^
-    --corrections outputs/review/survey_001_corrections.tif ^
-    --output data/processed/labels/survey_001_corrected.tif
-```
-
 ---
 
-## Summary: Command Sequence
+## Summary: Command Sequence (Native VR)
 
 ```cmd
 :: ========================================
 :: PHASE 1: Ground Truth
 :: ========================================
 
-:: Generate ground truth from clean/noisy pairs
-python scripts/prepare_ground_truth.py --clean data/raw/clean/survey_001_clean.bag --noisy data/raw/noisy/survey_001_noisy.bag --output-dir data/processed/labels
+:: Generate ground truth from clean/noisy VR BAG pairs
+python scripts/prepare_ground_truth.py ^
+    --clean data/raw/clean/survey_001_clean.bag ^
+    --noisy data/raw/noisy/survey_001_noisy.bag ^
+    --output-dir data/processed/labels
 
-:: Run inference on noisy survey
-python scripts/inference.py --input data/raw/noisy/survey_001_noisy.bag --model outputs/final_model.pt --output outputs/predictions/survey_001_pred.tif --vr-bag-mode resampled --min-valid-ratio 0.01
+:: Run native VR inference on noisy survey
+python scripts/inference_vr_native.py ^
+    --input data/raw/noisy/survey_001_noisy.bag ^
+    --model outputs/final_model.pt ^
+    --output outputs/predictions/survey_001_clean.bag ^
+    --min-valid-ratio 0.01
 
-:: Evaluate against ground truth
-python scripts/evaluate_model.py --ground-truth data/processed/labels/survey_001_ground_truth.tif --predictions outputs/predictions/survey_001_pred.tif --output outputs/metrics/survey_001_eval.json
+:: Evaluate sidecar against ground truth
+python scripts/evaluate_model.py ^
+    --ground-truth data/processed/labels/survey_001_ground_truth.tif ^
+    --predictions outputs/predictions/survey_001_clean_gnn_outputs.tif ^
+    --output outputs/metrics/survey_001_eval.json
 
 :: ========================================
 :: PHASE 2: Noise Analysis
 :: ========================================
 
 :: Analyze noise patterns
-python scripts/analyze_noise_patterns.py --input data/processed/labels/*.tif --output outputs/analysis/noise_patterns.json
+python scripts/analyze_noise_patterns.py ^
+    --input data/processed/labels/*.tif ^
+    --output outputs/analysis/noise_patterns.json
 
 :: ========================================
 :: PHASE 3: Feature Labels
 :: ========================================
 
 :: Create feature labels from slope and wrecks
-python scripts/prepare_feature_labels.py --survey data/raw/features/rocky_survey.bag --output data/processed/labels/rocky_features.tif --slope-threshold 15.0
+python scripts/prepare_feature_labels.py ^
+    --survey data/raw/features/rocky_survey.bag ^
+    --output data/processed/labels/rocky_features.tif ^
+    --slope-threshold 15.0
 
 :: ========================================
 :: PHASE 4: Training
 :: ========================================
 
-:: Create training dataset
-python scripts/create_training_dataset.py --labeled-dir data/processed/labels --depth-dir data/raw/noisy --output-dir data/processed --tile-size 512 --val-ratio 0.2
-
 :: Train v2 model
-python scripts/train.py --train-dir data/processed/train --val-dir data/processed/validation --output-dir outputs/models/v2 --epochs 100
+python scripts/train.py ^
+    --clean-surveys data/raw/clean ^
+    --output-dir outputs/models/v2 ^
+    --epochs 100
 
 :: ========================================
 :: PHASE 5: Deployment & Refinement
 :: ========================================
 
-:: Run inference
-python scripts/inference_vr_native.py --input new_survey.bag --model outputs/models/v2/best_model.pt --output cleaned_survey.bag
+:: Run native VR inference
+python scripts/inference_vr_native.py ^
+    --input new_survey.bag ^
+    --model outputs/models/v2/best_model.pt ^
+    --output cleaned_survey.bag ^
+    --min-valid-ratio 0.01
 
 :: Export for review
-python scripts/export_for_review.py --predictions outputs/predictions/new_survey.tif --output outputs/review/new_survey_review.tif
+python scripts/export_for_review.py ^
+    --sidecar cleaned_survey_gnn_outputs.tif ^
+    --output review_regions.tif
 ```
 
 ---
@@ -1429,14 +1330,14 @@ python scripts/export_for_review.py --predictions outputs/predictions/new_survey
 | Feature Precision | > 0.80 | Unknown |
 | Feature Recall | > 0.70 | Unknown |
 | Overall Accuracy | > 0.90 | 0.63 (synthetic) |
-| Mean Confidence (correct) | > 0.85 | Unknown |
+| Mean Confidence (correct) | > 0.85 | 0.735 (native VR) |
 | Mean Confidence (incorrect) | < 0.50 | Unknown |
 
 ## Timeline
 
 | Week | Phase | Deliverable |
 |------|-------|-------------|
-| 1-2 | Ground Truth | 3-5 labeled survey pairs, baseline metrics |
+| 1-2 | Ground Truth | 3-5 labeled VR BAG survey pairs, baseline metrics |
 | 3 | Noise Analysis | Updated synthetic noise parameters |
 | 4-5 | Feature Labels | Feature training data from slopes + wrecks |
 | 6 | Infrastructure | Train/val split, metrics logging |
