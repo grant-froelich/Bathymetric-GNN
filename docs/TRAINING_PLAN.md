@@ -840,7 +840,70 @@ def get_noise_magnitude(depth):
 
 ### Step 3.1: Collect Feature Locations
 
-**Source 1: NOAA Wrecks Database**
+The `extract_s57_features.py` script queries NOAA's REST APIs directly - **no download required**.
+
+**Data Sources (queried automatically):**
+
+| Source | URL | Features |
+|--------|-----|----------|
+| Wrecks & Obstructions | `wrecks.nauticalcharts.noaa.gov` | Wrecks, obstructions, AWOIS historical |
+| ENC Direct | `encdirect.noaa.gov` | Underwater rocks, seabed areas |
+
+**Feature Classes Extracted:**
+
+| S-57 Code | Description | Training Label | Default Radius |
+|-----------|-------------|----------------|----------------|
+| WRECKS | Shipwrecks | Feature (1) | 50m |
+| OBSTRN | Obstructions | Feature (1) | 30m |
+| UWTROC | Underwater rocks | Feature (1) | 25m |
+
+### Step 3.2: Extract Features via REST API (Recommended)
+
+```cmd
+:: Query NOAA REST API using survey bounds (no download needed)
+python scripts/extract_s57_features.py ^
+    --survey data/raw/clean/survey.bag ^
+    --labels data/processed/labels/survey_features.tif ^
+    --wreck-radius 50 ^
+    --rock-radius 25
+
+:: Export to GeoJSON for visualization in QGIS
+python scripts/extract_s57_features.py ^
+    --survey data/raw/clean/survey.bag ^
+    --output data/processed/labels/survey_features.geojson ^
+    --labels data/processed/labels/survey_features.tif
+
+:: Query with explicit bounds (WGS84)
+python scripts/extract_s57_features.py ^
+    --bounds -122.5 37.5 -122.0 38.0 ^
+    --output features.geojson
+```
+
+The script automatically:
+1. Extracts survey bounds from the BAG file
+2. Queries NOAA REST endpoints for wrecks, obstructions, and rocks
+3. Deduplicates features across scale bands
+4. Creates circular masks around each feature
+5. Outputs labeled GeoTIFF for training
+
+### Step 3.3: Alternative - Local S-57 ENC Files
+
+If you have downloaded ENC cells from https://encdirect.noaa.gov/:
+
+```cmd
+:: Use local ENC file
+python scripts/extract_s57_features.py ^
+    --enc US5AK1AM.000 ^
+    --survey data/raw/clean/survey.bag ^
+    --labels data/processed/labels/survey_features.tif
+
+:: Summarize ENC contents
+python scripts/extract_s57_features.py ^
+    --enc US5AK1AM.000 ^
+    --summarize
+```
+
+### Step 3.4: Legacy - NOAA Wrecks Shapefile
 
 Download from: https://nauticalcharts.noaa.gov/data/wrecks-and-obstructions.html
 
