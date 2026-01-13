@@ -5,12 +5,13 @@ scripts/extract_s57_features.py
 Extract feature locations from NOAA ENC data for training.
 
 Supports two modes:
-  1. Direct REST API queries to NOAA services (no download required)
+  1. Direct REST API queries to NOAA ENC Direct (no download required)
   2. Local S-57 ENC files (.000 format)
 
-REST API endpoints (no download required):
-  - Wrecks & Obstructions: https://wrecks.nauticalcharts.noaa.gov/arcgis/rest/services/public_wrecks/Wrecks_And_Obstructions/MapServer
+REST API endpoint (recommended, most up-to-date):
   - ENC Direct: https://encdirect.noaa.gov/arcgis/rest/services/encdirect/
+  - Queries wrecks, obstructions, and rocks from official ENC data
+  - Updated weekly
 
 S-57 ENCs can be downloaded from:
   https://encdirect.noaa.gov/
@@ -52,23 +53,7 @@ logger = logging.getLogger(__name__)
 # NOAA REST API Configuration
 # =============================================================================
 
-# Wrecks and Obstructions service (best for wrecks/obstructions)
-WRECKS_SERVICE_URL = "https://wrecks.nauticalcharts.noaa.gov/arcgis/rest/services/public_wrecks/Wrecks_And_Obstructions/MapServer"
-
-# Layer IDs in Wrecks service
-WRECKS_LAYERS = {
-    'enc_wrecks_harbour': 1,      # Harbour scale (largest)
-    'enc_wrecks_approach': 2,     # Approach scale
-    'enc_wrecks_coastal': 3,      # Coastal scale
-    'enc_wrecks_general': 4,      # General scale (smallest)
-    'awois_wrecks': 8,            # AWOIS historical wrecks
-    'enc_obstructions_harbour': 10,
-    'enc_obstructions_approach': 11,
-    'enc_obstructions_coastal': 12,
-    'awois_obstructions': 14,
-}
-
-# ENC Direct services (for rocks, seabed, etc.)
+# ENC Direct services (primary source - updated weekly)
 ENC_DIRECT_BASE = "https://encdirect.noaa.gov/arcgis/rest/services/encdirect"
 
 ENC_SCALE_SERVICES = {
@@ -87,6 +72,15 @@ ENC_LAYER_PATTERNS = {
     'obstruction_area': 'Obstruction_area',
     'rock_point': 'Underwater_Awash_Rock_point',
     'seabed_area': 'Seabed_Area',
+}
+
+# Legacy Wrecks and Obstructions service (less up-to-date, kept for AWOIS historical data)
+WRECKS_SERVICE_URL = "https://wrecks.nauticalcharts.noaa.gov/arcgis/rest/services/public_wrecks/Wrecks_And_Obstructions/MapServer"
+
+# Layer IDs in legacy Wrecks service (for AWOIS only)
+AWOIS_LAYERS = {
+    'awois_wrecks': 8,
+    'awois_obstructions': 14,
 }
 
 
@@ -175,35 +169,41 @@ def get_layer_id_by_name(service_url: str, name_pattern: str) -> Optional[int]:
 
 def query_wrecks_from_rest(
     bounds: Tuple[float, float, float, float],
-    include_awois: bool = True,
+    scales: List[str] = None,
+    include_awois: bool = False,
 ) -> List['S57Feature']:
     """
-    Query NOAA Wrecks and Obstructions REST service.
+    Query ENC Direct for wrecks within bounds.
     
     Args:
         bounds: (min_x, min_y, max_x, max_y) in WGS84
-        include_awois: Include historical AWOIS wrecks
+        scales: ENC scale bands to query (default: ['berthing', 'harbour', 'approach'])
+        include_awois: Include historical AWOIS wrecks (from legacy service)
         
     Returns:
         List of S57Feature objects
     """
+    if scales is None:
+        scales = ['berthing', 'harbour', 'approach']
+    
     features = []
-    
-    # Query ENC wrecks at different scales (finest to coarsest)
-    wreck_layers = [
-        ('enc_wrecks_harbour', WRECKS_LAYERS['enc_wrecks_harbour']),
-        ('enc_wrecks_approach', WRECKS_LAYERS['enc_wrecks_approach']),
-        ('enc_wrecks_coastal', WRECKS_LAYERS['enc_wrecks_coastal']),
-    ]
-    
-    if include_awois:
-        wreck_layers.append(('awois_wrecks', WRECKS_LAYERS['awois_wrecks']))
-    
     seen_positions = set()  # Deduplicate by position
     
-    for layer_name, layer_id in wreck_layers:
-        logger.info(f"Querying {layer_name}...")
-        raw_features = query_arcgis_rest(WRECKS_SERVICE_URL, layer_id, bounds)
+    # Query ENC Direct at each scale band
+    for scale in scales:
+        service_url = ENC_SCALE_SERVICES.get(scale)
+        if not service_url:
+            logger.warning(f"Unknown scale: {scale}")
+            continue
+        
+        # Find wreck layer ID
+        layer_id = get_layer_id_by_name(service_url, 'Wreck_point')
+        if layer_id is None:
+            logger.debug(f"Could not find wreck layer in {scale} service")
+            continue
+        
+        logger.info(f"Querying wrecks from ENC Direct {scale} scale (layer {layer_id})...")
+        raw_features = query_arcgis_rest(service_url, layer_id, bounds)
         
         for f in raw_features:
             geom = f.get('geometry', {})
@@ -222,7 +222,7 @@ def query_wrecks_from_rest(
             seen_positions.add(pos_key)
             
             # Extract depth if available
-            depth = attrs.get('depth') or attrs.get('valsou')
+            depth = attrs.get('valsou') or attrs.get('depth')
             if depth is not None:
                 try:
                     depth = float(depth)
@@ -236,39 +236,99 @@ def query_wrecks_from_rest(
                 y=y,
                 depth=depth,
                 attributes={
-                    'source': layer_name,
-                    'vesslterms': attrs.get('vesslterms'),
+                    'source': f'enc_direct_{scale}',
                     'catwrk': attrs.get('catwrk'),
                     'watlev': attrs.get('watlev'),
-                    'history': attrs.get('history'),
+                    'quasou': attrs.get('quasou'),
                 },
             ))
     
-    logger.info(f"Retrieved {len(features)} unique wrecks from REST API")
+    # Optionally add AWOIS historical wrecks
+    if include_awois:
+        logger.info("Querying AWOIS historical wrecks...")
+        try:
+            raw_features = query_arcgis_rest(
+                WRECKS_SERVICE_URL, AWOIS_LAYERS['awois_wrecks'], bounds
+            )
+            
+            for f in raw_features:
+                geom = f.get('geometry', {})
+                attrs = f.get('attributes', {})
+                
+                x = geom.get('x')
+                y = geom.get('y')
+                
+                if x is None or y is None:
+                    continue
+                
+                pos_key = (round(x, 4), round(y, 4))
+                if pos_key in seen_positions:
+                    continue
+                seen_positions.add(pos_key)
+                
+                depth = attrs.get('depth')
+                if depth is not None:
+                    try:
+                        depth = float(depth)
+                    except (ValueError, TypeError):
+                        depth = None
+                
+                features.append(S57Feature(
+                    object_class='WRECKS',
+                    geometry_type='POINT',
+                    x=x,
+                    y=y,
+                    depth=depth,
+                    attributes={
+                        'source': 'awois',
+                        'vesslterms': attrs.get('vesslterms'),
+                        'history': attrs.get('history'),
+                    },
+                ))
+        except Exception as e:
+            logger.warning(f"Failed to query AWOIS wrecks: {e}")
+    
+    logger.info(f"Retrieved {len(features)} unique wrecks")
     return features
 
 
 def query_obstructions_from_rest(
     bounds: Tuple[float, float, float, float],
-    include_awois: bool = True,
+    scales: List[str] = None,
+    include_awois: bool = False,
 ) -> List['S57Feature']:
-    """Query NOAA for obstructions within bounds."""
+    """
+    Query ENC Direct for obstructions within bounds.
+    
+    Args:
+        bounds: (min_x, min_y, max_x, max_y) in WGS84
+        scales: ENC scale bands to query (default: ['berthing', 'harbour', 'approach'])
+        include_awois: Include historical AWOIS obstructions (from legacy service)
+        
+    Returns:
+        List of S57Feature objects
+    """
+    if scales is None:
+        scales = ['berthing', 'harbour', 'approach']
+    
     features = []
-    
-    obstruction_layers = [
-        ('enc_obstructions_harbour', WRECKS_LAYERS['enc_obstructions_harbour']),
-        ('enc_obstructions_approach', WRECKS_LAYERS['enc_obstructions_approach']),
-        ('enc_obstructions_coastal', WRECKS_LAYERS['enc_obstructions_coastal']),
-    ]
-    
-    if include_awois:
-        obstruction_layers.append(('awois_obstructions', WRECKS_LAYERS['awois_obstructions']))
-    
     seen_positions = set()
     
-    for layer_name, layer_id in obstruction_layers:
-        logger.info(f"Querying {layer_name}...")
-        raw_features = query_arcgis_rest(WRECKS_SERVICE_URL, layer_id, bounds)
+    # Query ENC Direct at each scale band
+    for scale in scales:
+        service_url = ENC_SCALE_SERVICES.get(scale)
+        if not service_url:
+            logger.warning(f"Unknown scale: {scale}")
+            continue
+        
+        # Find obstruction layer ID
+        layer_id = get_layer_id_by_name(service_url, 'Obstruction_point')
+        if layer_id is None:
+            logger.debug(f"Could not find obstruction layer in {scale} service")
+            continue
+        
+        logger.info(f"Querying obstructions from ENC Direct {scale} scale (layer {layer_id})...")
+        raw_features = query_arcgis_rest(service_url, layer_id, bounds)
         
         for f in raw_features:
             geom = f.get('geometry', {})
@@ -285,7 +345,7 @@ def query_obstructions_from_rest(
                 continue
             seen_positions.add(pos_key)
             
-            depth = attrs.get('depth') or attrs.get('valsou')
+            depth = attrs.get('valsou') or attrs.get('depth')
             if depth is not None:
                 try:
                     depth = float(depth)
@@ -299,13 +359,58 @@ def query_obstructions_from_rest(
                 y=y,
                 depth=depth,
                 attributes={
-                    'source': layer_name,
+                    'source': f'enc_direct_{scale}',
                     'catobs': attrs.get('catobs'),
                     'watlev': attrs.get('watlev'),
+                    'quasou': attrs.get('quasou'),
                 },
             ))
     
-    logger.info(f"Retrieved {len(features)} unique obstructions from REST API")
+    # Optionally add AWOIS historical obstructions
+    if include_awois:
+        logger.info("Querying AWOIS historical obstructions...")
+        try:
+            raw_features = query_arcgis_rest(
+                WRECKS_SERVICE_URL, AWOIS_LAYERS['awois_obstructions'], bounds
+            )
+            
+            for f in raw_features:
+                geom = f.get('geometry', {})
+                attrs = f.get('attributes', {})
+                
+                x = geom.get('x')
+                y = geom.get('y')
+                
+                if x is None or y is None:
+                    continue
+                
+                pos_key = (round(x, 4), round(y, 4))
+                if pos_key in seen_positions:
+                    continue
+                seen_positions.add(pos_key)
+                
+                depth = attrs.get('depth')
+                if depth is not None:
+                    try:
+                        depth = float(depth)
+                    except (ValueError, TypeError):
+                        depth = None
+                
+                features.append(S57Feature(
+                    object_class='OBSTRN',
+                    geometry_type='POINT',
+                    x=x,
+                    y=y,
+                    depth=depth,
+                    attributes={
+                        'source': 'awois',
+                        'history': attrs.get('history'),
+                    },
+                ))
+        except Exception as e:
+            logger.warning(f"Failed to query AWOIS obstructions: {e}")
+    
+    logger.info(f"Retrieved {len(features)} unique obstructions")
     return features
 
 
@@ -372,36 +477,36 @@ def query_rocks_from_rest(
 
 def query_all_features_from_rest(
     bounds: Tuple[float, float, float, float],
-    include_awois: bool = True,
     scales: List[str] = None,
+    include_awois: bool = False,
 ) -> List['S57Feature']:
     """
-    Query all feature types from NOAA REST APIs.
+    Query all feature types from NOAA ENC Direct REST API.
     
     Args:
         bounds: (min_x, min_y, max_x, max_y) in WGS84
-        include_awois: Include historical AWOIS data
-        scales: ENC scale bands for rocks ('harbour', 'approach', etc.)
+        scales: ENC scale bands to query (default: ['berthing', 'harbour', 'approach'])
+        include_awois: Include historical AWOIS data (from legacy wrecks service)
         
     Returns:
         Combined list of all features
     """
     if scales is None:
-        scales = ['harbour', 'approach']
+        scales = ['berthing', 'harbour', 'approach']
     
     all_features = []
     
-    # Wrecks
-    all_features.extend(query_wrecks_from_rest(bounds, include_awois))
+    # Wrecks from ENC Direct
+    all_features.extend(query_wrecks_from_rest(bounds, scales, include_awois))
     
-    # Obstructions
-    all_features.extend(query_obstructions_from_rest(bounds, include_awois))
+    # Obstructions from ENC Direct
+    all_features.extend(query_obstructions_from_rest(bounds, scales, include_awois))
     
-    # Rocks (from each requested scale)
+    # Rocks from ENC Direct
     for scale in scales:
         all_features.extend(query_rocks_from_rest(bounds, scale))
     
-    logger.info(f"Total features from REST API: {len(all_features)}")
+    logger.info(f"Total features from ENC Direct: {len(all_features)}")
     return all_features
 
 
@@ -976,12 +1081,12 @@ Download local ENCs from: https://encdirect.noaa.gov/
                                help='Radius around rocks (meters)')
     feature_group.add_argument('--obstruction-radius', type=float, default=30, 
                                help='Radius around obstructions (meters)')
-    feature_group.add_argument('--no-awois', action='store_true',
-                               help='Exclude historical AWOIS data (REST API mode)')
+    feature_group.add_argument('--awois', action='store_true',
+                               help='Include historical AWOIS data (from legacy wrecks service)')
     feature_group.add_argument('--scales', nargs='+', 
-                               default=['harbour', 'approach'],
+                               default=['berthing', 'harbour', 'approach'],
                                choices=['berthing', 'harbour', 'approach', 'coastal', 'general'],
-                               help='ENC scale bands for rocks (REST API mode)')
+                               help='ENC scale bands to query (default: berthing, harbour, approach)')
     
     args = parser.parse_args()
     
@@ -1025,11 +1130,11 @@ Download local ENCs from: https://encdirect.noaa.gov/
     
     # Mode 2: REST API (if no local files and bounds available)
     elif bounds:
-        logger.info("Querying NOAA REST API...")
+        logger.info("Querying NOAA ENC Direct REST API...")
         all_features = query_all_features_from_rest(
             bounds,
-            include_awois=not args.no_awois,
             scales=args.scales,
+            include_awois=args.awois,
         )
     
     else:

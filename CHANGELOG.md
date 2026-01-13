@@ -1,19 +1,18 @@
 # Changelog
 
-## 2026-01-12 - S-57 ENC Feature Extraction via REST API
+## 2026-01-13 - S-57 ENC Feature Extraction via REST API
 
 ### New Features
 
-#### NOAA REST API Integration
+#### NOAA ENC Direct Integration
 - Added `scripts/extract_s57_features.py` for querying NOAA ENC data directly
-- **No download required** - queries REST endpoints automatically
+- **No download required** - queries ENC Direct REST API automatically
 - Extracts wrecks, obstructions, and underwater rocks within survey bounds
 - Supports both REST API mode (recommended) and local S-57 ENC files
 
-#### Feature Sources
-- Wrecks & Obstructions service: `wrecks.nauticalcharts.noaa.gov`
-- ENC Direct service: `encdirect.noaa.gov`
-- AWOIS historical wreck database (optional)
+#### Data Source
+- **ENC Direct** (`encdirect.noaa.gov`): Primary source for all features, updated weekly
+- AWOIS historical data available optionally via `--awois` flag
 
 #### Usage
 ```cmd
@@ -22,11 +21,14 @@ python scripts/extract_s57_features.py --survey survey.bag --labels features.tif
 
 :: Export to GeoJSON for QGIS
 python scripts/extract_s57_features.py --survey survey.bag --output features.geojson
+
+:: Include historical AWOIS data
+python scripts/extract_s57_features.py --survey survey.bag --labels features.tif --awois
 ```
 
 ### Documentation
-- Updated `docs/TRAINING_PLAN.md` Phase 3 with REST API workflow
-- REST API is now the recommended approach for feature extraction
+- Updated `docs/TRAINING_PLAN.md` Phase 3 with ENC Direct workflow
+- ENC Direct is now the sole source for wrecks, obstructions, and rocks
 
 ---
 

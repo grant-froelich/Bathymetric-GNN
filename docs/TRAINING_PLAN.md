@@ -840,14 +840,15 @@ def get_noise_magnitude(depth):
 
 ### Step 3.1: Collect Feature Locations
 
-The `extract_s57_features.py` script queries NOAA's REST APIs directly - **no download required**.
+The `extract_s57_features.py` script queries NOAA's ENC Direct REST API directly - **no download required**.
 
-**Data Sources (queried automatically):**
+**Data Source (queried automatically):**
 
-| Source | URL | Features |
-|--------|-----|----------|
-| Wrecks & Obstructions | `wrecks.nauticalcharts.noaa.gov` | Wrecks, obstructions, AWOIS historical |
-| ENC Direct | `encdirect.noaa.gov` | Underwater rocks, seabed areas |
+| Source | URL | Update Frequency |
+|--------|-----|------------------|
+| ENC Direct | `encdirect.noaa.gov` | Weekly |
+
+All features (wrecks, obstructions, rocks) come from the official ENC data which is updated weekly.
 
 **Feature Classes Extracted:**
 
@@ -860,7 +861,7 @@ The `extract_s57_features.py` script queries NOAA's REST APIs directly - **no do
 ### Step 3.2: Extract Features via REST API (Recommended)
 
 ```cmd
-:: Query NOAA REST API using survey bounds (no download needed)
+:: Query ENC Direct using survey bounds (no download needed)
 python scripts/extract_s57_features.py ^
     --survey data/raw/clean/survey.bag ^
     --labels data/processed/labels/survey_features.tif ^
@@ -877,11 +878,17 @@ python scripts/extract_s57_features.py ^
 python scripts/extract_s57_features.py ^
     --bounds -122.5 37.5 -122.0 38.0 ^
     --output features.geojson
+
+:: Include historical AWOIS data (optional, from legacy service)
+python scripts/extract_s57_features.py ^
+    --survey data/raw/clean/survey.bag ^
+    --labels data/processed/labels/survey_features.tif ^
+    --awois
 ```
 
 The script automatically:
 1. Extracts survey bounds from the BAG file
-2. Queries NOAA REST endpoints for wrecks, obstructions, and rocks
+2. Queries ENC Direct for wrecks, obstructions, and rocks at multiple scale bands
 3. Deduplicates features across scale bands
 4. Creates circular masks around each feature
 5. Outputs labeled GeoTIFF for training
