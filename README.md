@@ -188,6 +188,67 @@ python scripts/explore_vr_bag.py \
     --survey vr_survey.bag
 ```
 
+## Production Workflow
+
+Once training is complete, this is the day-to-day workflow for cleaning surveys.
+
+### 1. Run Inference
+
+```bash
+python scripts/inference_native.py \
+    --input new_survey.bag \
+    --model outputs/models/v2/best_model.pt \
+    --output cleaned_survey.bag
+```
+
+### 2. Review Outputs
+
+The sidecar GeoTIFF (`cleaned_survey_gnn_outputs.tif`) contains:
+
+| Band | Content | Review Action |
+|------|---------|---------------|
+| 1 | Classification | Verify noise (2) vs feature (1) assignments |
+| 2 | Confidence | Focus review on values 0.4-0.7 |
+| 3 | Correction | Check magnitude of applied changes |
+
+**Confidence interpretation:**
+- **> 0.85**: High confidence, auto-corrected
+- **0.5 - 0.85**: Medium confidence, spot-check recommended
+- **< 0.5**: Low confidence, manual review recommended
+
+### 3. Manual Review (Optional)
+
+For critical surveys, review low-confidence regions in GIS software:
+
+1. Load `cleaned_survey_gnn_outputs.tif` in QGIS
+2. Style confidence band with diverging colormap
+3. Identify clusters with confidence 0.4-0.7
+4. Compare against original survey and cleaned output
+5. Document any corrections needed
+
+### 4. Continuous Improvement
+
+The model improves over time by incorporating reviewer feedback:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  New Survey → Inference → Review → Corrections          │
+│       ↑                                    │            │
+│       │                                    ↓            │
+│       └──── Retrain ← Accumulate corrections ←─────────┘
+└─────────────────────────────────────────────────────────┘
+```
+
+**When to retrain:**
+- After accumulating 5-10 reviewed surveys with corrections
+- When encountering new seafloor types or noise patterns
+- Monthly during active production use
+
+**How to add feedback:**
+1. Save reviewer corrections as new ground truth pairs
+2. Add to `data/processed/train/`
+3. Retrain model with expanded dataset
+
 ## Output Products
 
 - **Cleaned depth grid** - Same format as input (VR or SR BAG)
@@ -220,7 +281,7 @@ Corrected cells have uncertainty scaled by model confidence:
 
 - RTX 50 series GPUs (sm_120) not yet supported by PyTorch; auto-falls back to CPU
 - Full BAG XML metadata not preserved when creating new BAGs
-- Current model trained on synthetic noise only - real-data training pending
+- `train.py` currently only supports synthetic noise; extension for real labels is pending
 
 ## License
 
