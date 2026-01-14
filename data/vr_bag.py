@@ -1,17 +1,16 @@
 """
-Native Variable Resolution BAG handler.
+Native BAG handler for both Variable Resolution (VR) and Single Resolution (SR) BAGs.
 
-Processes VR BAGs without resampling by:
-1. Iterating through each refinement grid
-2. Processing each grid through the GNN
-3. Writing corrections back to the original structure
+Processes BAG files without resampling:
+- VR BAGs: Iterates through refinement grids, preserving multi-resolution structure
+- SR BAGs: Processes the full elevation grid directly
 
-This preserves the multi-resolution structure of VR BAGs.
+Both modes support writing corrections back to the original BAG format.
 """
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Generator
+from typing import Dict, List, Optional, Tuple, Generator, Union
 from dataclasses import dataclass
 import shutil
 
@@ -24,6 +23,41 @@ except ImportError:
     H5PY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def detect_bag_type(path: Path) -> str:
+    """
+    Detect whether a BAG file is Variable Resolution (VR) or Single Resolution (SR).
+    
+    Args:
+        path: Path to BAG file
+        
+    Returns:
+        'VR' for Variable Resolution BAG
+        'SR' for Single Resolution BAG
+        
+    Raises:
+        ValueError if file is not a valid BAG
+    """
+    if not H5PY_AVAILABLE:
+        raise ImportError("h5py is required for BAG handling")
+    
+    with h5py.File(str(path), 'r') as f:
+        if 'BAG_root' not in f:
+            raise ValueError(f"Not a valid BAG file: {path}")
+        
+        root = f['BAG_root']
+        
+        # VR BAGs have varres_refinements dataset
+        if 'varres_refinements' in root and 'varres_metadata' in root:
+            # Check if there are actual refinements
+            varres_metadata = root['varres_metadata'][:]
+            dims_x = varres_metadata['dimensions_x']
+            if np.any(dims_x > 0):
+                return 'VR'
+        
+        # Otherwise it's an SR BAG
+        return 'SR'
 
 
 @dataclass
@@ -406,28 +440,301 @@ class VRBagWriter:
         return False
 
 
+# =============================================================================
+# Single Resolution (SR) BAG Support
+# =============================================================================
+
+@dataclass
+class SRGrid:
+    """Represents the full grid from an SR BAG (analogous to RefinementGrid)."""
+    depth: np.ndarray           # 2D depth array
+    uncertainty: np.ndarray     # 2D uncertainty array
+    resolution: Tuple[float, float]  # (x_res, y_res) in meters
+    
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self.depth.shape
+    
+    @property
+    def dimensions(self) -> Tuple[int, int]:
+        return self.depth.shape
+    
+    @property
+    def valid_mask(self) -> np.ndarray:
+        """Return mask of valid (non-nodata) cells."""
+        nodata = 1.0e6
+        return (self.depth != nodata) & np.isfinite(self.depth)
+    
+    @property
+    def num_valid(self) -> int:
+        return int(np.sum(self.valid_mask))
+
+
+class SRBagHandler:
+    """
+    Handler for Single Resolution BAG processing.
+    
+    Provides a similar interface to VRBagHandler for consistency,
+    but operates on the single elevation/uncertainty grid.
+    """
+    
+    NODATA = 1.0e6
+    
+    def __init__(self, path: Path):
+        """
+        Initialize SR BAG handler.
+        
+        Args:
+            path: Path to SR BAG file
+        """
+        if not H5PY_AVAILABLE:
+            raise ImportError("h5py is required for BAG handling")
+        
+        self.path = Path(path)
+        self._validate_sr_bag()
+        
+        # Cache metadata
+        with h5py.File(str(self.path), 'r') as f:
+            root = f['BAG_root']
+            self.shape = root['elevation'].shape
+            self.base_shape = self.shape  # For compatibility with VR interface
+            
+            # Read elevation attributes
+            elevation = root['elevation']
+            self.min_depth = elevation.attrs.get('Minimum Elevation Value', None)
+            self.max_depth = elevation.attrs.get('Maximum Elevation Value', None)
+        
+        # Get geospatial info using GDAL
+        self._load_geospatial_info()
+    
+    def _validate_sr_bag(self):
+        """Check that file is a valid SR BAG."""
+        with h5py.File(str(self.path), 'r') as f:
+            if 'BAG_root' not in f:
+                raise ValueError(f"Not a valid BAG file: {self.path}")
+            
+            root = f['BAG_root']
+            if 'elevation' not in root:
+                raise ValueError(f"Not a valid BAG (no elevation): {self.path}")
+    
+    def _load_geospatial_info(self):
+        """Load geospatial information using GDAL."""
+        try:
+            from osgeo import gdal
+            ds = gdal.Open(str(self.path))
+            if ds:
+                self.geotransform = ds.GetGeoTransform()
+                self.crs = ds.GetProjection()
+                ds = None
+            else:
+                self.geotransform = None
+                self.crs = None
+        except ImportError:
+            self.geotransform = None
+            self.crs = None
+    
+    @property
+    def resolution(self) -> Tuple[float, float]:
+        """Grid resolution in CRS units (x_res, y_res)."""
+        if self.geotransform:
+            return (abs(self.geotransform[1]), abs(self.geotransform[5]))
+        return (1.0, 1.0)  # Default fallback
+    
+    @property
+    def bounds(self) -> Tuple[float, float, float, float]:
+        """Geographic bounds (min_x, min_y, max_x, max_y)."""
+        if self.geotransform:
+            min_x = self.geotransform[0]
+            max_y = self.geotransform[3]
+            max_x = min_x + self.shape[1] * self.geotransform[1]
+            min_y = max_y + self.shape[0] * self.geotransform[5]
+            return (min_x, min_y, max_x, max_y)
+        return (0, 0, self.shape[1], self.shape[0])
+    
+    def get_refinement_info(self) -> Dict:
+        """Get summary information (compatible with VR interface)."""
+        return {
+            'base_shape': self.shape,
+            'num_refined_cells': 1,  # SR has single grid
+            'total_refinement_nodes': int(self.shape[0] * self.shape[1]),
+            'unique_dimensions': [self.shape],
+            'unique_resolutions': [self.resolution[0]],
+            'bag_type': 'SR',
+        }
+    
+    def iterate_refinements(
+        self,
+        min_valid_ratio: float = 0.0,
+    ) -> Generator[SRGrid, None, None]:
+        """
+        Yield the single SR grid (compatible with VR iteration interface).
+        
+        Args:
+            min_valid_ratio: Skip if less than this ratio of valid data
+            
+        Yields:
+            Single SRGrid object
+        """
+        with h5py.File(str(self.path), 'r') as f:
+            root = f['BAG_root']
+            
+            depth = root['elevation'][:]
+            
+            # Uncertainty may be in different locations
+            if 'uncertainty' in root:
+                uncertainty = root['uncertainty'][:]
+            elif 'Uncertainty' in root:
+                uncertainty = root['Uncertainty'][:]
+            else:
+                # Create default uncertainty
+                uncertainty = np.ones_like(depth) * 0.5
+            
+            grid = SRGrid(
+                depth=depth.copy(),
+                uncertainty=uncertainty.copy(),
+                resolution=self.resolution,
+            )
+            
+            # Check valid ratio
+            valid_ratio = grid.num_valid / max(1, grid.depth.size)
+            if valid_ratio >= min_valid_ratio:
+                yield grid
+    
+    def copy_and_open_for_writing(self, output_path: Path) -> 'SRBagWriter':
+        """
+        Copy BAG and open for writing corrections.
+        
+        Args:
+            output_path: Path for output BAG
+            
+        Returns:
+            SRBagWriter for the copied BAG
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Copy original file
+        shutil.copy2(self.path, output_path)
+        logger.info(f"Copied SR BAG to: {output_path}")
+        
+        return SRBagWriter(output_path)
+
+
+class SRBagWriter:
+    """
+    Writer for SR BAG corrections.
+    
+    Writes corrected depth values back to the elevation dataset.
+    """
+    
+    def __init__(self, path: Path):
+        """
+        Open SR BAG for writing.
+        
+        Args:
+            path: Path to SR BAG file (must exist)
+        """
+        self.path = Path(path)
+        self._file = h5py.File(str(self.path), 'r+')
+        self._elevation = self._file['BAG_root']['elevation']
+        
+        # Try to get uncertainty dataset
+        root = self._file['BAG_root']
+        if 'uncertainty' in root:
+            self._uncertainty = root['uncertainty']
+        elif 'Uncertainty' in root:
+            self._uncertainty = root['Uncertainty']
+        else:
+            self._uncertainty = None
+        
+        self._corrections_applied = 0
+        self._uncertainty_updates = 0
+        
+        logger.info(f"Opened SR BAG for writing: {self.path}")
+    
+    def update_grid(
+        self,
+        grid: SRGrid,
+        corrected_depth: np.ndarray,
+        corrected_uncertainty: Optional[np.ndarray] = None,
+    ):
+        """
+        Write corrected depth values to SR BAG.
+        
+        Args:
+            grid: Original SRGrid (for shape validation)
+            corrected_depth: New depth values
+            corrected_uncertainty: New uncertainty values (optional)
+        """
+        if corrected_depth.shape != grid.shape:
+            raise ValueError(
+                f"Shape mismatch: corrected {corrected_depth.shape} vs grid {grid.shape}"
+            )
+        
+        # Track changes before writing
+        changed = corrected_depth != grid.depth
+        self._corrections_applied += int(np.sum(changed & grid.valid_mask))
+        
+        # Write elevation
+        self._elevation[:] = corrected_depth
+        
+        # Write uncertainty if provided and dataset exists
+        if corrected_uncertainty is not None and self._uncertainty is not None:
+            self._uncertainty[:] = corrected_uncertainty
+            self._uncertainty_updates += int(np.sum(grid.valid_mask))
+    
+    # Alias for compatibility with VR interface
+    def update_refinement_batch(
+        self,
+        grid: SRGrid,
+        corrected_depth: np.ndarray,
+        corrected_uncertainty: Optional[np.ndarray] = None,
+    ):
+        """Alias for update_grid (compatible with VR writer interface)."""
+        self.update_grid(grid, corrected_depth, corrected_uncertainty)
+    
+    def close(self):
+        """Close file and log summary."""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+            
+        logger.info(f"SR BAG modifications complete:")
+        logger.info(f"  - Depth corrections applied: {self._corrections_applied:,}")
+        if self._uncertainty_updates > 0:
+            logger.info(f"  - Uncertainty updates: {self._uncertainty_updates:,}")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
 class SidecarBuilder:
     """
-    Builds a sidecar GeoTIFF from native VR processing results.
+    Builds a sidecar GeoTIFF from native BAG processing results.
     
-    Accumulates classification, confidence, and correction results
-    at the finest resolution and saves as a GeoTIFF.
+    Works with both VR and SR BAGs:
+    - VR: Accumulates results at finest resolution from refinement grids
+    - SR: Uses native grid resolution directly
     
-    Uses GDAL's resampled view to get exact georeferencing that
-    matches how the VR BAG appears when opened normally.
+    Uses GDAL to get exact georeferencing that matches how the BAG appears.
     """
     
-    def __init__(self, handler: VRBagHandler):
+    def __init__(self, handler: Union[VRBagHandler, SRBagHandler]):
         """
         Initialize sidecar builder.
         
         Args:
-            handler: VRBagHandler for the source VR BAG
+            handler: VRBagHandler or SRBagHandler for the source BAG
         """
         self.handler = handler
+        self.is_vr = isinstance(handler, VRBagHandler)
         
-        # Get exact georeferencing from GDAL's resampled view
-        self._init_from_gdal_resampled()
+        # Get georeferencing from GDAL
+        self._init_from_gdal()
         
         # Initialize output arrays
         self.classification = np.full(self.shape, np.nan, dtype=np.float32)
@@ -435,10 +742,11 @@ class SidecarBuilder:
         self.correction = np.full(self.shape, np.nan, dtype=np.float32)
         self.valid_mask = np.zeros(self.shape, dtype=np.float32)
         
-        logger.info(f"SidecarBuilder initialized: {self.shape} at {self.resolution}m")
+        bag_type = "VR" if self.is_vr else "SR"
+        logger.info(f"SidecarBuilder initialized ({bag_type}): {self.shape} at {self.resolution}m")
     
-    def _init_from_gdal_resampled(self):
-        """Get georeferencing from GDAL's resampled view of VR BAG."""
+    def _init_from_gdal(self):
+        """Get georeferencing from GDAL."""
         try:
             from osgeo import gdal
             gdal.UseExceptions()
@@ -447,34 +755,35 @@ class SidecarBuilder:
         
         path_str = str(self.handler.path)
         
-        # Use GDAL's open options to get resampled VR BAG view
-        # This is how loaders.py does it
-        open_options = ['MODE=RESAMPLED_GRID']
-        ds = gdal.OpenEx(path_str, gdal.OF_RASTER | gdal.OF_READONLY, open_options=open_options)
-        
-        if ds is None:
-            # Fallback: open directly
-            ds = gdal.Open(path_str)
-        
-        if ds is None:
-            raise RuntimeError(f"Could not open VR BAG for georeferencing: {self.handler.path}")
-        
-        # Check if we got the resampled view by comparing dimensions
-        # Resampled view should be much larger than base grid (512x512)
-        if ds.RasterXSize == self.handler.base_shape[1] and ds.RasterYSize == self.handler.base_shape[0]:
-            # We got the base grid, not the resampled view
-            # Try to get subdatasets
-            subdatasets = ds.GetSubDatasets()
-            ds = None
+        if self.is_vr:
+            # For VR BAGs, use GDAL's resampled view
+            open_options = ['MODE=RESAMPLED_GRID']
+            ds = gdal.OpenEx(path_str, gdal.OF_RASTER | gdal.OF_READONLY, open_options=open_options)
             
-            for sd_path, sd_desc in subdatasets:
-                if 'resampled' in sd_desc.lower() or 'supergrids' in sd_desc.lower():
-                    ds = gdal.Open(sd_path)
-                    if ds is not None:
-                        break
-        
-        if ds is None:
-            raise RuntimeError(f"Could not open resampled view of VR BAG: {self.handler.path}")
+            if ds is None:
+                ds = gdal.Open(path_str)
+            
+            if ds is None:
+                raise RuntimeError(f"Could not open BAG: {self.handler.path}")
+            
+            # Check if we got the resampled view by comparing dimensions
+            if ds.RasterXSize == self.handler.base_shape[1] and ds.RasterYSize == self.handler.base_shape[0]:
+                subdatasets = ds.GetSubDatasets()
+                ds = None
+                
+                for sd_path, sd_desc in subdatasets:
+                    if 'resampled' in sd_desc.lower() or 'supergrids' in sd_desc.lower():
+                        ds = gdal.Open(sd_path)
+                        if ds is not None:
+                            break
+            
+            if ds is None:
+                raise RuntimeError(f"Could not open resampled view: {self.handler.path}")
+        else:
+            # For SR BAGs, just open directly
+            ds = gdal.Open(path_str)
+            if ds is None:
+                raise RuntimeError(f"Could not open BAG: {self.handler.path}")
         
         self.shape = (ds.RasterYSize, ds.RasterXSize)
         self.geotransform = ds.GetGeoTransform()
@@ -494,27 +803,35 @@ class SidecarBuilder:
     
     def add_refinement_results(
         self,
-        grid: RefinementGrid,
+        grid: Union[RefinementGrid, SRGrid],
         classification: np.ndarray,
         confidence: np.ndarray,
         correction: np.ndarray,
     ):
         """
-        Add results from a processed refinement grid.
+        Add results from a processed grid.
         
         Args:
-            grid: The refinement grid (for location info)
+            grid: The grid (RefinementGrid for VR, SRGrid for SR)
             classification: Classification array
             confidence: Confidence array
             correction: Correction array
         """
-        # Compute base cell size from resampled extent and base grid dimensions
-        # The resampled view covers the same extent as the base grid
-        base_shape = self.handler.base_shape  # (512, 512) typically
+        if not self.is_vr:
+            # SR BAG: Direct copy (shapes should match)
+            if classification.shape != self.shape:
+                raise ValueError(
+                    f"SR grid shape {classification.shape} doesn't match sidecar {self.shape}"
+                )
+            self.classification[:] = classification
+            self.confidence[:] = confidence
+            self.correction[:] = correction
+            self.valid_mask[grid.valid_mask] = 1.0
+            return
         
-        # Base cell size in resampled grid pixels
-        pixels_per_base_row = self.shape[0] / base_shape[0]
-        pixels_per_base_col = self.shape[1] / base_shape[1]
+        # VR BAG: Map refinement grid to resampled output
+        # Compute base cell size from resampled extent and base grid dimensions
+        base_shape = self.handler.base_shape  # (512, 512) typically
         
         # Base cell size in ground units
         base_cell_width = (self.bounds[2] - self.bounds[0]) / base_shape[1]
@@ -535,15 +852,12 @@ class SidecarBuilder:
         
         # Convert geographic coordinates to pixel coordinates
         # Note: geotransform origin is at top-left (northwest)
-        # gt[0] = min_x, gt[3] = max_y
         gt = self.geotransform
         
         # Pixel column = (x - origin_x) / pixel_width
         out_col_start = int(round((ref_x - gt[0]) / gt[1]))
         
         # Pixel row = (y - origin_y) / pixel_height
-        # Since gt[5] is negative, this gives us: row = (max_y - y) / abs(pixel_height)
-        # For the TOP of the refinement (ref_y + ref_height):
         ref_top_y = ref_y + ref_height
         out_row_start = int(round((gt[3] - ref_top_y) / abs(gt[5])))
         
@@ -556,10 +870,7 @@ class SidecarBuilder:
         # Output raster: row 0 is at north (top)
         for r in range(grid.dimensions[0]):
             for c in range(grid.dimensions[1]):
-                # In refinement grid, row 0 is at bottom
-                # In output, we need to flip: top of refinement goes to smaller row numbers
-                # refinement row 0 (bottom) -> output row (out_row_start + height - 1 - 0)
-                # refinement row (h-1) (top) -> output row out_row_start
+                # Flip row index (refinement bottom -> output top)
                 out_r_base = out_row_start + (grid.dimensions[0] - 1 - r) * scale
                 out_c_base = out_col_start + c * scale
                 

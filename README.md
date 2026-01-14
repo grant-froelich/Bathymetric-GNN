@@ -110,7 +110,7 @@ bathymetric-gnn/
 └── scripts/
     ├── train.py                   # Training entry point
     ├── inference.py               # Inference (resampled mode)
-    ├── inference_vr_native.py     # Native VR BAG inference
+    ├── inference_native.py     # Native BAG inference (VR and SR)
     ├── diagnose_tiles.py          # Tile validity diagnostics
     └── explore_vr_bag.py          # VR BAG structure explorer
 ```
@@ -141,7 +141,7 @@ python scripts/inference.py \
 ### Native VR BAG Inference (Preserves VR Structure)
 
 ```bash
-python scripts/inference_vr_native.py \
+python scripts/inference_native.py \
     --input /path/to/vr_survey.bag \
     --model /path/to/model.pt \
     --output /path/to/output.bag \

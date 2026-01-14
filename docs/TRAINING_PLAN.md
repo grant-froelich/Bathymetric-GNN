@@ -24,9 +24,24 @@ A step-by-step guide for training a production-quality bathymetric noise detecti
 | 1 | Establish ground truth | 6-10 (3-5 clean/noisy pairs) | `prepare_ground_truth.py`, `evaluate_model.py` |
 | 2 | Add feature examples | 5-10 feature-area BAGs | `extract_s57_features.py` |
 | 3 | Train on real data | (uses Phase 1-2 labels) | `train.py` (needs extension) |
-| 4 | Deploy and refine | Unlimited | `inference_vr_native.py` |
+| 4 | Deploy and refine | Unlimited | `inference_native.py` |
 
-**Total data requirement:** 11-20 VR BAG files minimum
+**Total data requirement:** 11-20 BAG files minimum (VR or SR)
+
+---
+
+## Processing Mode
+
+| Mode | Script | BAG Types |
+|------|--------|-----------|
+| **Native BAG** | `inference_native.py` | VR and SR (auto-detected) |
+| Resampled | `inference.py` | Any (loses VR structure) |
+
+**Always use native BAG processing for training and production inference.**
+
+The native script automatically detects BAG type:
+- **VR BAGs:** Iterates through refinement grids, preserving multi-resolution structure
+- **SR BAGs:** Processes the full grid directly at native resolution
 
 ---
 
@@ -95,7 +110,7 @@ Run inference and evaluation for each of the 3-5 noisy surveys:
 
 ```cmd
 :: Run inference
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input data/raw/noisy/survey_001_noisy.bag ^
     --model outputs/final_model.pt ^
     --output outputs/predictions/survey_001_predicted.bag ^
@@ -248,7 +263,7 @@ python scripts/train.py ^
 Run inference and evaluation on each held-out validation survey:
 
 ```cmd
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input data/raw/noisy/survey_004_noisy.bag ^
     --model outputs/models/v2/best_model.pt ^
     --output outputs/predictions/survey_004_predicted.bag
@@ -269,7 +284,7 @@ python scripts/evaluate_model.py ^
 ### Step 4.1: Production Inference
 
 ```cmd
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input new_survey.bag ^
     --model outputs/models/v2/best_model.pt ^
     --output cleaned_survey.bag ^
@@ -277,7 +292,7 @@ python scripts/inference_vr_native.py ^
 ```
 
 **Outputs:**
-- `cleaned_survey.bag` - Corrected VR BAG
+- `cleaned_survey.bag` - Corrected BAG (same format as input: VR or SR)
 - `cleaned_survey_gnn_outputs.tif` - Sidecar with classification, confidence, corrections
 
 ### Step 4.2: Review Low-Confidence Regions
@@ -307,7 +322,7 @@ Use the sidecar GeoTIFF confidence band to identify areas needing review.
 | `evaluate_model.py` | Compare predictions to ground truth | Ready |
 | `extract_s57_features.py` | Extract features from ENC Direct | Ready |
 | `train.py` | Train model (synthetic noise) | Needs extension for real labels |
-| `inference_vr_native.py` | Run inference preserving VR structure | Ready |
+| `inference_native.py` | Run inference preserving VR structure | Ready |
 | `analyze_noise_patterns.py` | Characterize noise (optional, for research) | Ready |
 
 ### Command Sequence
@@ -315,7 +330,7 @@ Use the sidecar GeoTIFF confidence band to identify areas needing review.
 ```cmd
 :: PHASE 1: Ground Truth (run for each of 3-5 pairs)
 python scripts/prepare_ground_truth.py --clean X_clean.bag --noisy X_noisy.bag --output-dir data/processed/labels
-python scripts/inference_vr_native.py --input X_noisy.bag --model outputs/final_model.pt --output outputs/predictions/X.bag
+python scripts/inference_native.py --input X_noisy.bag --model outputs/final_model.pt --output outputs/predictions/X.bag
 python scripts/evaluate_model.py --ground-truth X_ground_truth.tif --predictions X_gnn_outputs.tif --output X_eval.json
 
 :: PHASE 2: Feature Labels (run for each of 5-10 feature surveys)
@@ -325,7 +340,7 @@ python scripts/extract_s57_features.py --survey X.bag --labels X_features.tif --
 python scripts/train.py --clean-surveys data/raw/clean --output-dir outputs/models/v2 --epochs 100
 
 :: PHASE 4: Production
-python scripts/inference_vr_native.py --input new_survey.bag --model outputs/models/v2/best_model.pt --output cleaned.bag
+python scripts/inference_native.py --input new_survey.bag --model outputs/models/v2/best_model.pt --output cleaned.bag
 ```
 
 ---
@@ -339,7 +354,7 @@ python scripts/inference_vr_native.py --input new_survey.bag --model outputs/mod
 | 3 | 0 | 11-20 | Uses Phase 1+2 labels |
 | 4 | Unlimited | - | Production surveys |
 
-**Minimum to start training:** 11-20 VR BAG files
+**Minimum to start training:** 11-20 BAG files (VR or SR)
 
 ---
 
