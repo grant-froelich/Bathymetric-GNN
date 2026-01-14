@@ -21,12 +21,13 @@ A step-by-step guide for training a production-quality bathymetric noise detecti
 
 | Phase | Goal | BAGs Needed | Scripts |
 |-------|------|-------------|---------|
-| 1 | Establish ground truth | 6-10 (3-5 clean/noisy pairs) | `prepare_ground_truth.py`, `evaluate_model.py` |
+| 1 | Establish ground truth | 6-10 min, 16-30 target (pairs) | `prepare_ground_truth.py`, `evaluate_model.py` |
 | 2 | Add feature examples | 5-10 feature-area BAGs | `extract_s57_features.py` |
 | 3 | Train on real data | (uses Phase 1-2 labels) | `train.py` (needs extension) |
 | 4 | Deploy and refine | Unlimited | `inference_native.py` |
 
-**Total data requirement:** 11-20 BAG files minimum (VR or SR)
+**Minimum to start:** 11-20 BAGs (3-5 ground truth pairs + 5-10 feature surveys)  
+**Target for v1 model:** 21-40 BAGs (8-15 ground truth pairs + 5-10 feature surveys)
 
 ---
 
@@ -47,21 +48,40 @@ The native script automatically detects BAG type:
 
 ## Phase 1: Establish Ground Truth
 
-**Duration:** 1-2 weeks  
-**Goal:** Create labeled validation data from real clean/noisy survey pairs
+**Duration:** 2-4 weeks (ongoing)  
+**Goal:** Create labeled data from real clean/noisy survey pairs
 
-### Data Required
+### Data Requirements
 
-| Type | Count | Description |
-|------|-------|-------------|
-| Clean VR BAGs | 3-5 | Manually cleaned reference surveys |
-| Noisy VR BAGs | 3-5 | Corresponding uncleaned versions |
-| **Total BAGs** | **6-10** | Matched pairs of the same survey area |
+Ground truth pairs are the highest-quality training data available. They directly show "this is noise, this is not" without assumptions. The limiting factor is availability - someone must manually clean a survey or you need repeat surveys of the same area.
 
-**Selection criteria for survey pairs:**
-- Include variety of depths (shallow, mid, deep)
-- Include variety of seafloor types (flat, sloped, rocky)
-- Include variety of noise levels (light, moderate, heavy)
+| Category | Pairs | BAGs | Assessment |
+|----------|-------|------|------------|
+| Too few | 1-2 | 2-4 | Metrics unreliable, high overfitting risk |
+| **Minimum to start** | 3-5 | 6-10 | Can establish baseline, limited diversity |
+| **Target for v1** | 8-15 | 16-30 | Good coverage, statistically meaningful |
+| Diminishing returns | 20+ | 40+ | Still useful, incremental gains decrease |
+
+**Start with 3-5 pairs to prove the workflow, then accumulate toward 8-15 for production training.**
+
+### Diversity Matters
+
+More important than raw count is coverage across conditions:
+
+| Dimension | Examples | Why It Matters |
+|-----------|----------|----------------|
+| Depth | Shallow (<20m), mid (20-100m), deep (>100m) | Noise characteristics vary with depth |
+| Seafloor | Flat mud, sand waves, rocky, slopes | Model must learn what's "normal" for each |
+| Noise severity | Light speckle, moderate clusters, heavy | Confidence calibration across conditions |
+| Equipment | Different sonars, configurations | Generalization to new surveys |
+| Geography | Different regions, water conditions | Avoid overfitting to one area |
+
+**Ideal mix for 8-15 pairs:**
+- 2-3 shallow coastal
+- 3-4 mid-depth continental shelf
+- 2-3 deep water
+- At least 2 with rocky/complex terrain
+- At least 2 with heavy noise contamination
 
 ### Step 1.1: Organize Survey Pairs
 
@@ -70,20 +90,18 @@ data/raw/clean/
 ├── survey_001_clean.bag
 ├── survey_002_clean.bag
 ├── survey_003_clean.bag
-├── survey_004_clean.bag
-└── survey_005_clean.bag
+...
 
 data/raw/noisy/
 ├── survey_001_noisy.bag
 ├── survey_002_noisy.bag
 ├── survey_003_noisy.bag
-├── survey_004_noisy.bag
-└── survey_005_noisy.bag
+...
 ```
 
 ### Step 1.2: Generate Ground Truth Labels
 
-Run for each of the 3-5 survey pairs:
+Run for each survey pair:
 
 ```cmd
 python scripts/prepare_ground_truth.py ^
@@ -92,12 +110,7 @@ python scripts/prepare_ground_truth.py ^
     --output-dir data/processed/labels ^
     --noise-threshold 0.15
 
-python scripts/prepare_ground_truth.py ^
-    --clean data/raw/clean/survey_002_clean.bag ^
-    --noisy data/raw/noisy/survey_002_noisy.bag ^
-    --output-dir data/processed/labels
-
-:: Repeat for surveys 003, 004, 005...
+:: Repeat for all pairs...
 ```
 
 **Output per survey:**
@@ -106,7 +119,7 @@ python scripts/prepare_ground_truth.py ^
 
 ### Step 1.3: Evaluate Current Model Against Ground Truth
 
-Run inference and evaluation for each of the 3-5 noisy surveys:
+Run inference and evaluation for each noisy survey:
 
 ```cmd
 :: Run inference
@@ -122,12 +135,12 @@ python scripts/evaluate_model.py ^
     --predictions outputs/predictions/survey_001_predicted_gnn_outputs.tif ^
     --output outputs/metrics/survey_001_eval.json
 
-:: Repeat for all survey pairs...
+:: Repeat for all pairs...
 ```
 
 ### Step 1.4: Review Baseline Metrics
 
-After processing all 3-5 pairs, collect metrics:
+After processing pairs, collect metrics:
 - Per-class precision/recall/F1 (seafloor, noise, feature)
 - Confusion matrices
 - Confidence calibration curves
@@ -347,14 +360,17 @@ python scripts/inference_native.py --input new_survey.bag --model outputs/models
 
 ## Data Requirements Summary
 
-| Phase | New BAGs Required | Running Total | Notes |
-|-------|-------------------|---------------|-------|
-| 1 | 6-10 (3-5 pairs) | 6-10 | Clean/noisy pairs required |
-| 2 | 5-10 | 11-20 | Standalone feature-area surveys |
-| 3 | 0 | 11-20 | Uses Phase 1+2 labels |
-| 4 | Unlimited | - | Production surveys |
+| Phase | Minimum | Target | Notes |
+|-------|---------|--------|-------|
+| 1 | 6-10 BAGs (3-5 pairs) | 16-30 BAGs (8-15 pairs) | Clean/noisy pairs, diverse conditions |
+| 2 | 5-10 BAGs | 5-10 BAGs | Standalone feature-area surveys |
+| 3 | 0 | 0 | Uses Phase 1+2 labels |
+| 4 | Unlimited | Unlimited | Production surveys, ongoing feedback |
 
-**Minimum to start training:** 11-20 BAG files (VR or SR)
+| Milestone | Ground Truth Pairs | Feature Surveys | Total BAGs |
+|-----------|-------------------|-----------------|------------|
+| **Minimum to start** | 3-5 | 5-10 | 11-20 |
+| **Target for v1** | 8-15 | 5-10 | 21-40 |
 
 ---
 
@@ -374,10 +390,11 @@ python scripts/inference_native.py --input new_survey.bag --model outputs/models
 
 ## Timeline
 
-| Week | Phase | Deliverable | BAGs Needed |
-|------|-------|-------------|-------------|
-| 1-2 | 1 | Baseline metrics | 6-10 (3-5 pairs) |
+| Week | Phase | Deliverable | Data |
+|------|-------|-------------|------|
+| 1-2 | 1 | Baseline metrics (proof of concept) | 3-5 ground truth pairs |
 | 3-4 | 2 | Feature labels | 5-10 feature surveys |
-| 5 | 3 | Train/val split, extend train.py | 0 (organize existing) |
-| 6-7 | 3 | Model v2 trained on real data | 0 |
-| 8+ | 4 | Production deployment | Unlimited |
+| 5 | 3 | Train/val split, extend train.py | Organize existing |
+| 6-7 | 3 | Model v2 (minimum viable) | Train on available data |
+| 8-12 | 1 | Accumulate more ground truth | Target 8-15 pairs total |
+| 13+ | 3-4 | Model v2 (production quality), deploy | Retrain with full dataset |

@@ -51,14 +51,14 @@ Extract known seafloor features from NOAA's ENC Direct REST API for training:
 
 ### Training Phases
 
-| Phase | Goal | Data Required | Scripts |
-|-------|------|---------------|---------|
-| 1 | Ground truth from clean/noisy pairs | 6-10 BAGs (3-5 pairs) | `prepare_ground_truth.py`, `evaluate_model.py` |
-| 2 | Feature labels from ENC Direct | 5-10 feature-area BAGs | `extract_s57_features.py` |
-| 3 | Train on real labels | (uses Phase 1-2 data) | `train.py` (needs extension) |
-| 4 | Deploy and refine | Unlimited | `inference_native.py` |
+| Phase | Goal | Minimum | Target | Scripts |
+|-------|------|---------|--------|---------|
+| 1 | Ground truth from clean/noisy pairs | 3-5 pairs (6-10 BAGs) | 8-15 pairs (16-30 BAGs) | `prepare_ground_truth.py`, `evaluate_model.py` |
+| 2 | Feature labels from ENC Direct | 5-10 BAGs | 5-10 BAGs | `extract_s57_features.py` |
+| 3 | Train on real labels | (uses Phase 1-2 data) | | `train.py` (needs extension) |
+| 4 | Deploy and refine | Unlimited | | `inference_native.py` |
 
-**Total minimum:** 11-20 BAG files to begin real-data training.
+**Minimum to start:** 11-20 BAGs | **Target for v1:** 21-40 BAGs
 
 ## Installation
 
