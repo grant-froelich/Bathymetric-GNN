@@ -21,13 +21,12 @@ A step-by-step guide for training a production-quality bathymetric noise detecti
 
 | Phase | Goal | BAGs Needed | Scripts |
 |-------|------|-------------|---------|
-| 1 | Establish ground truth | 3-5 clean/noisy pairs (6-10 BAGs) | `prepare_ground_truth.py`, `evaluate_model.py` |
-| 2 | Analyze noise patterns | (uses Phase 1 outputs) | `analyze_noise_patterns.py` |
-| 3 | Add feature examples | 5-10 feature-area BAGs | `extract_s57_features.py` |
-| 4 | Train on real data | 10-15 total BAGs | `train.py` (needs extension) |
-| 5 | Deploy and refine | Unlimited | `inference_vr_native.py` |
+| 1 | Establish ground truth | 6-10 (3-5 clean/noisy pairs) | `prepare_ground_truth.py`, `evaluate_model.py` |
+| 2 | Add feature examples | 5-10 feature-area BAGs | `extract_s57_features.py` |
+| 3 | Train on real data | (uses Phase 1-2 labels) | `train.py` (needs extension) |
+| 4 | Deploy and refine | Unlimited | `inference_vr_native.py` |
 
-**Total data requirement:** 15-20 VR BAG files minimum
+**Total data requirement:** 11-20 VR BAG files minimum
 
 ---
 
@@ -120,66 +119,7 @@ After processing all 3-5 pairs, collect metrics:
 
 ---
 
-## Phase 2: Analyze Noise Patterns
-
-**Duration:** 1 week  
-**Goal:** Characterize real noise to improve synthetic noise generation
-
-### Data Required
-
-| Type | Count | Source |
-|------|-------|--------|
-| Ground truth files | 3-5 | Phase 1 outputs |
-| **No additional BAGs needed** | | |
-
-### Step 2.1: Run Noise Analysis
-
-Analyze all ground truth files together:
-
-```cmd
-python scripts/analyze_noise_patterns.py ^
-    --input data/processed/labels/survey_001_ground_truth.tif ^
-           data/processed/labels/survey_002_ground_truth.tif ^
-           data/processed/labels/survey_003_ground_truth.tif ^
-           data/processed/labels/survey_004_ground_truth.tif ^
-           data/processed/labels/survey_005_ground_truth.tif ^
-    --output outputs/analysis/noise_patterns.json
-```
-
-**Analysis output includes:**
-- Noise magnitude distribution (mean, std, percentiles)
-- Noise direction bias (shoaling vs deepening)
-- Depth-dependent noise rates
-- Spatial clustering characteristics
-- Swath position effects (outer beam noise rates)
-- Roughness context (noise in smooth vs rough terrain)
-
-### Step 2.2: Update Synthetic Noise Generator
-
-Based on analysis, update `data/synthetic_noise.py`:
-
-```python
-# Example parameter updates based on real noise analysis:
-
-# Swath profile (if outer beams show 2x noise rate)
-swath_noise_profile = [2.0, 1.0, 1.0, 2.0]
-
-# Clustering (if 70% of noise is clustered vs isolated)
-cluster_probability = 0.70
-
-# Depth-dependent magnitude
-def get_noise_magnitude(depth):
-    if depth < 20:
-        return 0.15
-    elif depth < 100:
-        return 0.25
-    else:
-        return 0.40
-```
-
----
-
-## Phase 3: Feature Class Training
+## Phase 2: Feature Class Training
 
 **Duration:** 2-3 weeks  
 **Goal:** Add examples of real seafloor features (wrecks, rocks, obstructions)
@@ -198,7 +138,7 @@ def get_noise_magnitude(depth):
 - 2-3 in rocky coastal areas (underwater rocks)
 - 2-4 in areas with charted wrecks
 
-### Step 3.1: Extract Features from NOAA ENC Direct
+### Step 2.1: Extract Features from NOAA ENC Direct
 
 The script queries ENC Direct REST API automatically - no download required.
 
@@ -212,7 +152,7 @@ The script queries ENC Direct REST API automatically - no download required.
 | Obstructions | OBSTRN | 30m |
 | Underwater rocks | UWTROC | 25m |
 
-### Step 3.2: Generate Feature Labels
+### Step 2.2: Generate Feature Labels
 
 Run for each of the 5-10 feature-area surveys:
 
@@ -231,7 +171,7 @@ python scripts/extract_s57_features.py ^
 :: Repeat for all 5-10 feature-area surveys...
 ```
 
-### Step 3.3: Verify Feature Coverage
+### Step 2.3: Verify Feature Coverage
 
 Open the GeoJSON files in QGIS to verify:
 - Features are correctly located within survey bounds
@@ -240,7 +180,7 @@ Open the GeoJSON files in QGIS to verify:
 
 ---
 
-## Phase 4: Train on Real Data
+## Phase 3: Train on Real Data
 
 **Duration:** 2 weeks  
 **Goal:** Train model using real ground truth and feature labels
@@ -250,10 +190,10 @@ Open the GeoJSON files in QGIS to verify:
 | Type | Count | Source |
 |------|-------|--------|
 | Ground truth labels | 3-5 | Phase 1 |
-| Feature labels | 5-10 | Phase 3 |
+| Feature labels | 5-10 | Phase 2 |
 | **Total labeled surveys** | **8-15** | |
 
-### Step 4.1: Organize Train/Validation Split
+### Step 3.1: Organize Train/Validation Split
 
 ```
 data/processed/
@@ -277,7 +217,7 @@ data/processed/
 - Training: 6-12 surveys
 - Validation: 2-3 surveys (include both ground truth and feature types)
 
-### Step 4.2: Train Model
+### Step 3.2: Train Model
 
 > **Note:** The current `train.py` uses synthetic noise only. To train on real labels, the script needs to be extended to accept label files. This is a development task.
 
@@ -303,7 +243,7 @@ python scripts/train.py ^
     --epochs 100
 ```
 
-### Step 4.3: Evaluate on Validation Set
+### Step 3.3: Evaluate on Validation Set
 
 Run inference and evaluation on each held-out validation survey:
 
@@ -321,12 +261,12 @@ python scripts/evaluate_model.py ^
 
 ---
 
-## Phase 5: Deployment & Refinement
+## Phase 4: Deployment & Refinement
 
 **Duration:** Ongoing  
 **Goal:** Deploy model and continuously improve from feedback
 
-### Step 5.1: Production Inference
+### Step 4.1: Production Inference
 
 ```cmd
 python scripts/inference_vr_native.py ^
@@ -340,15 +280,15 @@ python scripts/inference_vr_native.py ^
 - `cleaned_survey.bag` - Corrected VR BAG
 - `cleaned_survey_gnn_outputs.tif` - Sidecar with classification, confidence, corrections
 
-### Step 5.2: Review Low-Confidence Regions
-
-> **Note:** `export_for_review.py` script needs to be created.
+### Step 4.2: Review Low-Confidence Regions
 
 Identify uncertain regions for human review:
 - Regions with confidence between 0.4-0.7
 - Cluster size > 100 cells
 
-### Step 5.3: Incorporate Feedback
+Use the sidecar GeoTIFF confidence band to identify areas needing review.
+
+### Step 4.3: Incorporate Feedback
 
 1. Human reviewers correct model outputs in uncertain regions
 2. Save corrections as new ground truth labels
@@ -359,17 +299,16 @@ Identify uncertain regions for human review:
 
 ## Quick Reference
 
-### Existing Scripts
+### Scripts
 
 | Script | Purpose | Status |
 |--------|---------|--------|
 | `prepare_ground_truth.py` | Generate labels from clean/noisy pairs | Ready |
 | `evaluate_model.py` | Compare predictions to ground truth | Ready |
-| `analyze_noise_patterns.py` | Characterize real noise | Ready |
 | `extract_s57_features.py` | Extract features from ENC Direct | Ready |
 | `train.py` | Train model (synthetic noise) | Needs extension for real labels |
 | `inference_vr_native.py` | Run inference preserving VR structure | Ready |
-| `export_for_review.py` | Export uncertain regions | Not yet created |
+| `analyze_noise_patterns.py` | Characterize noise (optional, for research) | Ready |
 
 ### Command Sequence
 
@@ -379,16 +318,13 @@ python scripts/prepare_ground_truth.py --clean X_clean.bag --noisy X_noisy.bag -
 python scripts/inference_vr_native.py --input X_noisy.bag --model outputs/final_model.pt --output outputs/predictions/X.bag
 python scripts/evaluate_model.py --ground-truth X_ground_truth.tif --predictions X_gnn_outputs.tif --output X_eval.json
 
-:: PHASE 2: Noise Analysis (run once with all ground truth files)
-python scripts/analyze_noise_patterns.py --input data/processed/labels/*_ground_truth.tif --output outputs/analysis/noise_patterns.json
-
-:: PHASE 3: Feature Labels (run for each of 5-10 feature surveys)
+:: PHASE 2: Feature Labels (run for each of 5-10 feature surveys)
 python scripts/extract_s57_features.py --survey X.bag --labels X_features.tif --output X_features.geojson
 
-:: PHASE 4: Training
+:: PHASE 3: Training
 python scripts/train.py --clean-surveys data/raw/clean --output-dir outputs/models/v2 --epochs 100
 
-:: PHASE 5: Production
+:: PHASE 4: Production
 python scripts/inference_vr_native.py --input new_survey.bag --model outputs/models/v2/best_model.pt --output cleaned.bag
 ```
 
@@ -399,10 +335,9 @@ python scripts/inference_vr_native.py --input new_survey.bag --model outputs/mod
 | Phase | New BAGs Required | Running Total | Notes |
 |-------|-------------------|---------------|-------|
 | 1 | 6-10 (3-5 pairs) | 6-10 | Clean/noisy pairs required |
-| 2 | 0 | 6-10 | Uses Phase 1 outputs |
-| 3 | 5-10 | 11-20 | Standalone feature-area surveys |
-| 4 | 0 | 11-20 | Uses Phases 1+3 labels |
-| 5 | Unlimited | - | Production surveys |
+| 2 | 5-10 | 11-20 | Standalone feature-area surveys |
+| 3 | 0 | 11-20 | Uses Phase 1+2 labels |
+| 4 | Unlimited | - | Production surveys |
 
 **Minimum to start training:** 11-20 VR BAG files
 
@@ -427,8 +362,7 @@ python scripts/inference_vr_native.py --input new_survey.bag --model outputs/mod
 | Week | Phase | Deliverable | BAGs Needed |
 |------|-------|-------------|-------------|
 | 1-2 | 1 | Baseline metrics | 6-10 (3-5 pairs) |
-| 3 | 2 | Noise analysis report | 0 (uses Phase 1) |
-| 4-5 | 3 | Feature labels | 5-10 feature surveys |
-| 6 | 4 | Train/val split, extend train.py | 0 (organize existing) |
-| 7-8 | 4 | Model v2 trained on real data | 0 |
-| 9+ | 5 | Production deployment | Unlimited |
+| 3-4 | 2 | Feature labels | 5-10 feature surveys |
+| 5 | 3 | Train/val split, extend train.py | 0 (organize existing) |
+| 6-7 | 3 | Model v2 trained on real data | 0 |
+| 8+ | 4 | Production deployment | Unlimited |
