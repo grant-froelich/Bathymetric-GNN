@@ -235,7 +235,7 @@ The model improves over time by incorporating reviewer feedback:
 │  New Survey → Inference → Review → Corrections          │
 │       ↑                                    │            │
 │       │                                    ↓            │
-│       └──── Retrain ← Accumulate corrections  ←─────────┘
+│       └──Retrain ← Accumulate corrections               │
 └─────────────────────────────────────────────────────────┘
 ```
 
