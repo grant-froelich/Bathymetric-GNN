@@ -249,6 +249,19 @@ data/processed/
 
 > **Note:** The current `train.py` uses synthetic noise only. To train on real labels, the script needs to be extended to accept label files. This is a development task.
 
+#### Development Tasks for `train.py` Extension
+
+When extending `train.py` for real labels, also refactor BAG handling:
+
+| Task | Description |
+|------|-------------|
+| Add `--labels` argument | Accept ground truth and feature label files |
+| Native BAG iteration | Replace GDAL resampling with native VR/SR iteration from `vr_bag.py` |
+| Consolidate BAG code | Move BAG-specific code from `loaders.py` to `bag.py` (rename `vr_bag.py`) |
+| Keep `loaders.py` | Retain for GeoTIFF/ASC formats only |
+
+This refactor improves training quality (native resolution) and simplifies the codebase.
+
 Current training (synthetic noise only):
 
 ```cmd
@@ -322,6 +335,63 @@ Use the sidecar GeoTIFF confidence band to identify areas needing review.
 2. Save corrections as new ground truth labels
 3. Add to training set
 4. Retrain model periodically (monthly or after accumulating corrections)
+
+---
+
+## Future: Architecture Evaluation
+
+**When to evaluate:** After establishing real-data baseline metrics in Phase 3.
+
+The current model uses GAT (Graph Attention Network). This is reasonable but may not be optimal for grid-based bathymetric data.
+
+### Current Architecture
+
+| Component | Implementation | Notes |
+|-----------|----------------|-------|
+| GNN type | GAT with 4 attention heads | Learns neighbor importance |
+| Edge features | Distance, depth difference, gradient | Used by attention mechanism |
+| Local features | MLP on node attributes | Processes each node independently first |
+
+### Why GAT May Not Be Optimal
+
+| Strength | Weakness |
+|----------|----------|
+| Learns to weight neighbors differently | Designed for irregular graphs, overkill for regular grids |
+| Supports edge features | Attention learned from features alone, not spatial position |
+| Can learn "ignore noisy neighbors" | More parameters than needed |
+
+### Alternatives to Evaluate
+
+| Architecture | Potential Benefit | When to Try |
+|--------------|-------------------|-------------|
+| **Hybrid CNN + GNN** | CNN excels at local patterns, GNN adds context | If GAT plateaus below target |
+| **EdgeConv** | Explicitly uses edge geometry | If attention weights show no meaningful patterns |
+| **Simpler GCN** | Faster, fewer parameters | If GAT is too slow for production |
+
+### Hybrid CNN + GNN Concept
+
+```
+Input Grid
+    ↓
+CNN layers (detect local noise patterns: spikes, texture)
+    ↓
+GNN layers (aggregate spatial context: isolated vs connected)
+    ↓
+Classification head
+```
+
+This separates two tasks:
+1. **Local pattern detection** (CNN strength): "Does this neighborhood look noisy?"
+2. **Contextual reasoning** (GNN strength): "Is this spike isolated or part of a formation?"
+
+### Decision Criteria
+
+Revisit architecture if:
+- Real-label training plateaus below 85% noise precision
+- Attention weights show no meaningful patterns (all neighbors weighted equally)
+- Inference is too slow for production (>1 min per survey)
+
+**Do not change architecture until real-data baseline is established.** The current 63% accuracy on synthetic data is not a reliable indicator of architecture performance.
 
 ---
 
