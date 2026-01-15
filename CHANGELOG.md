@@ -4,6 +4,8 @@
 
 ### New Documentation
 - Added `docs/HOW_IT_WORKS.md` - Comprehensive guide explaining GNN theory and practical application
+  - Sign convention (depths positive down)
+  - Shoal spike safety considerations
   - Graph construction from bathymetric grids
   - Message passing and attention mechanisms
   - Why spatial context matters for noise detection
@@ -14,6 +16,7 @@
 - Added diversity guidance for training data selection
 - Added `train.py` extension roadmap (native BAG iteration, code consolidation)
 - Added future architecture evaluation section (CNN+GNN hybrid consideration)
+- Added future asymmetric loss section for shoal spike safety
 - Updated timeline to reflect iterative data collection
 
 ---

@@ -24,6 +24,17 @@ Rocky area + spike = probably real feature
 
 **Context matters.** This is why we use Graph Neural Networks.
 
+### Shoal Spikes Are Critical
+
+While noise can create spikes in both directions (shoaler or deeper), **shoal spikes are the primary concern** for navigation safety:
+
+| Spike Direction | Depth Change | Safety Impact |
+|-----------------|--------------|---------------|
+| **Shoal** (shallower) | 10m → 5m | **Critical** - vessel could run aground on uncharted shallow |
+| Deep (deeper) | 10m → 15m | Lower risk - vessel has more clearance than expected |
+
+A false shoal spike that gets removed is a missed hazard. A real shoal feature that gets classified as noise is dangerous. This asymmetry means the model should be **conservative about removing shoal spikes** - when uncertain, preserve them for human review.
+
 ---
 
 ## Why Graphs?

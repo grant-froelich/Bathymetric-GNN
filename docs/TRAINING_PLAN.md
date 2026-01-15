@@ -395,6 +395,67 @@ Revisit architecture if:
 
 ---
 
+## Future: Asymmetric Loss for Shoal Safety
+
+**When to implement:** After establishing baseline metrics, if shoal spike errors are problematic.
+
+### The Problem
+
+Not all errors are equal. In navigation safety:
+
+| Error Type | Example | Safety Impact |
+|------------|---------|---------------|
+| **Miss shoal spike** | Real 5m feature removed as noise | **Critical** - vessel grounding risk |
+| Miss deep spike | Real 15m feature removed as noise | Lower risk - extra clearance |
+| False positive (shoal) | Noise at 5m preserved | Wastes review time, but safe |
+| False positive (deep) | Noise at 15m preserved | Wastes review time, but safe |
+
+### Current State
+
+The current loss function treats all misclassifications equally. This is suboptimal for navigation safety.
+
+### Proposed Improvement
+
+Implement **asymmetric loss weighting** that penalizes shoal-direction errors more heavily:
+
+```python
+# Conceptual - not actual implementation
+def asymmetric_loss(pred, target, depth, neighbor_depth):
+    base_loss = cross_entropy(pred, target)
+    
+    # Shoal spike = depth < mean(neighbor_depth)
+    is_shoal_spike = depth < neighbor_depth.mean()
+    
+    # Weight shoal errors more heavily
+    if target == NOISE and pred == FEATURE and is_shoal_spike:
+        # False negative on shoal spike - very bad
+        weight = 2.0
+    elif target == FEATURE and pred == NOISE and is_shoal_spike:
+        # Removing real shoal feature - critical error
+        weight = 3.0
+    else:
+        weight = 1.0
+    
+    return weight * base_loss
+```
+
+### Implementation Considerations
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Loss weighting | Simple to implement | Requires tuning weight values |
+| Separate shoal/deep heads | Explicit modeling | More complex architecture |
+| Post-processing threshold | No retraining needed | Less principled |
+
+### Decision Criteria
+
+Implement asymmetric loss if:
+- Evaluation shows disproportionate errors on shoal spikes
+- Reviewers report missed shoal features as a problem
+- Safety-critical deployments require extra conservatism
+
+---
+
 ## Quick Reference
 
 ### Scripts
