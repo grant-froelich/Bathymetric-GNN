@@ -78,19 +78,19 @@ Step 1: Each node has initial features
         │ A │ ─── │ B │ ─── │ C │
         └───┘     └───┘     └───┘
         depth     depth     depth
-        = -10m    = -10.5m  = -15m
+        = 10m    = 10.5m  = 15m
                   (spike!)
 
 Step 2: Node B collects "messages" from neighbors A and C
         
-        A says: "I'm at -10m, pretty flat here"
-        C says: "I'm at -15m, sloping down"
+        A says: "I'm at 10m, pretty flat here"
+        C says: "I'm at 15m, sloping down"
         
 Step 3: B updates its representation using neighbor info
         
-        B now knows: "My neighbors are -10m and -15m,
-                      I'm at -10.5m, which seems anomalous
-                      given the -5m drop to C"
+        B now knows: "My neighbors are 10m and 15m,
+                      I'm at 10.5m, which seems anomalous
+                      given the 5m drop to C"
 ```
 
 This happens for **all nodes simultaneously**, then repeats for multiple **layers**. Each layer expands the receptive field:
@@ -135,15 +135,15 @@ The bathymetric grid is converted to a graph:
 
 Grid (5x5):                    Graph:
 ┌────┬────┬────┬────┬────┐    
-│-10 │-10 │-11 │-10 │-10 │     Nodes: 25 (one per cell)
+│ 10 │ 10 │ 11 │ 10 │ 10 │     Nodes: 25 (one per cell)
 ├────┼────┼────┼────┼────┤     Edges: ~80 (8-connectivity)
-│-10 │-10 │-15 │-10 │-10 │     
+│ 10 │ 10 │ 15 │ 10 │ 10 │     
 ├────┼────┼────┼────┼────┤     Node at (2,2) has depth -15m
-│-11 │-15 │-25 │-14 │-11 │     (potential noise spike)
+│ 11 │ 15 │ 25 │ 14 │ 11 │     (potential noise spike)
 ├────┼────┼────┼────┼────┤     
-│-10 │-10 │-14 │-10 │-10 │     
+│ 10 │ 10 │ 14 │ 10 │ 10 │     
 ├────┼────┼────┼────┼────┤     
-│-10 │-10 │-11 │-10 │-10 │     
+│ 10 │ 10 │ 11 │ 10 │ 10 │     
 └────┴────┴────┴────┴────┘    
 ```
 
@@ -243,34 +243,34 @@ Consider this scenario:
 ```
 Scenario A: Spike on flat seafloor
 ┌────┬────┬────┬────┬────┐
-│-10 │-10 │-10 │-10 │-10 │
+│ 10 │ 10 │ 10 │ 10 │ 10 │
 ├────┼────┼────┼────┼────┤
-│-10 │-10 │-10 │-10 │-10 │
+│ 10 │ 10 │ 10 │ 10 │ 10 │
 ├────┼────┼────┼────┼────┤
-│-10 │-10 │-15 │-10 │-10 │  ← Spike is isolated
+│ 10 │ 10 │ 15 │ 10 │ 10 │  ← Spike is isolated
 ├────┼────┼────┼────┼────┤     Almost certainly NOISE
-│-10 │-10 │-10 │-10 │-10 │
+│ 10 │ 10 │ 10 │ 10 │ 10 │
 ├────┼────┼────┼────┼────┤
-│-10 │-10 │-10 │-10 │-10 │
+│ 10 │ 10 │ 10 │ 10 │ 10 │
 └────┴────┴────┴────┴────┘
 
 Scenario B: Spike in rocky area
 ┌────┬────┬────┬────┬────┐
-│-10 │-12 │-11 │-13 │-10 │
+│ 10 │ 12 │ 11 │ 13 │ 10 │
 ├────┼────┼────┼────┼────┤
-│-11 │-14 │-12 │-11 │-12 │
+│ 11 │ 14 │ 12 │ 11 │ 12 │
 ├────┼────┼────┼────┼────┤
-│-12 │-13 │-15 │-14 │-11 │  ← Spike fits the pattern
+│ 12 │ 13 │ 15 │ 14 │ 11 │  ← Spike fits the pattern
 ├────┼────┼────┼────┼────┤     Probably a real FEATURE
-│-10 │-11 │-13 │-12 │-10 │
+│ 10 │ 11 │ 13 │ 12 │ 10 │
 ├────┼────┼────┼────┼────┤
-│-10 │-10 │-11 │-10 │-10 │
+│ 10 │ 10 │ 11 │ 10 │ 10 │
 └────┴────┴────┴────┴────┘
 ```
 
-Looking at the center cell alone (-15m), both scenarios look identical. But the context is completely different:
-- Scenario A: Neighbors are all flat (-10m), spike is anomalous
-- Scenario B: Neighbors are variable (-10 to -14m), spike fits the pattern
+Looking at the center cell alone (15m), both scenarios look identical. But the context is completely different:
+- Scenario A: Neighbors are all flat (10m), spike is anomalous
+- Scenario B: Neighbors are variable (10 to 14m), spike fits the pattern
 
 **The GNN learns to use this context.**
 
