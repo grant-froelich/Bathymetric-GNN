@@ -368,6 +368,33 @@ The current model uses GAT (Graph Attention Network). This is reasonable but may
 | **EdgeConv** | Explicitly uses edge geometry | If attention weights show no meaningful patterns |
 | **Simpler GCN** | Faster, fewer parameters | If GAT is too slow for production |
 
+### Attention Head Tuning
+
+The current model uses 4 attention heads. Each head can learn different neighbor-weighting patterns.
+
+| Head Count | Tradeoff |
+|------------|----------|
+| Fewer (2) | Faster, less overfitting risk, may miss patterns |
+| Current (4) | Reasonable balance for regular grids |
+| More (8) | More specialization, but needs more training data |
+| Many (16+) | Likely redundant, overfitting risk |
+
+**Why more heads probably won't help yet:**
+
+1. **Regular grid limits complexity** - Each node has exactly 8 neighbors in fixed positions. Only so many meaningful ways to weight them (by depth, distance, direction, uncertainty). 4 heads likely covers these.
+
+2. **Training data is the bottleneck** - More parameters need more data. With limited training data, extra heads may learn noise rather than patterns.
+
+3. **Diminishing returns** - Research shows 1→4 heads often helps significantly, 4→8 sometimes helps modestly, 8→16 rarely helps.
+
+**When to test different head counts:**
+
+| Condition | Action |
+|-----------|--------|
+| After real-data baseline | Test 2, 4, 8 heads, compare metrics |
+| If attention weights look redundant | Try fewer heads |
+| If weights look meaningful but incomplete | Try more heads |
+
 ### Hybrid CNN + GNN Concept
 
 ```
