@@ -2,6 +2,8 @@
 
 This document explains the theory behind Graph Neural Networks and how this tool applies them to bathymetric data cleaning.
 
+> **Sign Convention:** This document uses the standard bathymetric convention where **depths are positive down**. A depth of 10m means 10 meters below the water surface. Larger values = deeper water.
+
 ## The Problem
 
 Bathymetric surveys measure seafloor depth using acoustic sonar. The raw data contains noise from various sources:
@@ -78,19 +80,19 @@ Step 1: Each node has initial features
         │ A │ ─── │ B │ ─── │ C │
         └───┘     └───┘     └───┘
         depth     depth     depth
-        = 10m    = 10.5m  = 15m
+        = 10m     = 15m     = 10m
                   (spike!)
 
 Step 2: Node B collects "messages" from neighbors A and C
         
-        A says: "I'm at 10m, pretty flat here"
-        C says: "I'm at 15m, sloping down"
+        A says: "I'm at 10m depth, pretty flat here"
+        C says: "I'm at 10m depth, same as A"
         
 Step 3: B updates its representation using neighbor info
         
-        B now knows: "My neighbors are 10m and 15m,
-                      I'm at 10.5m, which seems anomalous
-                      given the 5m drop to C"
+        B now knows: "My neighbors are both at 10m,
+                      but I'm at 15m - that's a 5m spike
+                      which looks anomalous"
 ```
 
 This happens for **all nodes simultaneously**, then repeats for multiple **layers**. Each layer expands the receptive field:
@@ -138,7 +140,7 @@ Grid (5x5):                    Graph:
 │ 10 │ 10 │ 11 │ 10 │ 10 │     Nodes: 25 (one per cell)
 ├────┼────┼────┼────┼────┤     Edges: ~80 (8-connectivity)
 │ 10 │ 10 │ 15 │ 10 │ 10 │     
-├────┼────┼────┼────┼────┤     Node at (2,2) has depth -15m
+├────┼────┼────┼────┼────┤     Node at (2,2) has depth 15m
 │ 11 │ 15 │ 25 │ 14 │ 11 │     (potential noise spike)
 ├────┼────┼────┼────┼────┤     
 │ 10 │ 10 │ 14 │ 10 │ 10 │     
