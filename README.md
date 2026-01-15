@@ -16,6 +16,8 @@ Local ambiguity + Spatial context = Better classification
 - An isolated spike breaking ridge continuity → probably noise
 ```
 
+For a detailed explanation of how Graph Neural Networks work and how this tool applies them, see [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md).
+
 ## Current State
 
 | Metric | Value |
@@ -107,6 +109,7 @@ bathymetric-gnn/
 │   ├── diagnose_tiles.py           # Tile validity diagnostics
 │   └── explore_vr_bag.py           # VR BAG structure explorer
 └── docs/
+    ├── HOW_IT_WORKS.md             # GNN theory and practical application
     └── TRAINING_PLAN.md            # Detailed training roadmap
 ```
 

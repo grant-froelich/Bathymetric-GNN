@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-01-15 - Documentation Updates
+
+### New Documentation
+- Added `docs/HOW_IT_WORKS.md` - Comprehensive guide explaining GNN theory and practical application
+  - Graph construction from bathymetric grids
+  - Message passing and attention mechanisms
+  - Why spatial context matters for noise detection
+  - Practical workflow for end users
+
+### Training Plan Updates
+- Added realistic ground truth data requirements (minimum vs target counts)
+- Added diversity guidance for training data selection
+- Added `train.py` extension roadmap (native BAG iteration, code consolidation)
+- Added future architecture evaluation section (CNN+GNN hybrid consideration)
+- Updated timeline to reflect iterative data collection
+
+---
+
 ## 2026-01-14 - SR BAG Support
 
 ### New Features
