@@ -134,6 +134,115 @@ The attention weights are learned during training. The network might learn:
 - "Ignore neighbors that also look noisy"
 - "Weight upslope neighbors differently than downslope"
 
+### How Attention Weights Are Learned
+
+Attention weights aren't hand-coded rules - they emerge from training on diverse examples. The network learns **which neighbors matter** by seeing many examples of noise vs. real features across different conditions.
+
+#### The Learning Process
+
+```
+For each training example:
+1. Network makes predictions using current attention weights
+2. Compare predictions to ground truth labels
+3. Calculate error (loss)
+4. Adjust attention weights to reduce error
+5. Repeat thousands of times across diverse surveys
+```
+
+The key insight: **attention weights that work across diverse conditions are the ones that capture real patterns**, not artifacts of a specific survey type.
+
+#### Why Training Diversity Matters
+
+Each dimension of diversity teaches the network different aspects of "what matters":
+
+| Training Diversity | What Attention Learns |
+|--------------------|----------------------|
+| **Depth ranges** | Shallow water has different noise characteristics than deep water. Attention learns depth-appropriate neighbor weighting. |
+| **Seafloor types** | On flat mud, any spike is suspicious. On rocky terrain, spikes are normal. Attention learns to assess spikes relative to local texture. |
+| **Noise severity** | Light noise looks different from heavy contamination. Attention learns to recognize noise patterns at different intensities. |
+| **Equipment types** | Different sonars produce different noise signatures. Attention learns equipment-invariant features. |
+| **Geographic regions** | Water column properties vary by region. Attention learns to generalize across oceanographic conditions. |
+
+#### Concrete Example: Learning from Depth Diversity
+
+Consider how depth diversity affects what attention learns:
+
+```
+Shallow survey (5-20m):
+┌────────────────────────────────────────────────────────────┐
+│ - Water column noise common (fish, bubbles, turbulence)    │
+│ - Spikes often isolated, clearly noise                     │
+│ - Network learns: "isolated shallow spikes = high noise    │
+│   probability, weight similar-depth neighbors heavily"     │
+└────────────────────────────────────────────────────────────┘
+
+Deep survey (100-500m):
+┌────────────────────────────────────────────────────────────┐
+│ - Less water column interference                           │
+│ - Multipath and refraction errors more common              │
+│ - Systematic patterns across swaths                        │
+│ - Network learns: "check across-track neighbors for        │
+│   systematic offsets, not just local spikes"               │
+└────────────────────────────────────────────────────────────┘
+```
+
+If trained only on shallow surveys, the network might learn attention patterns that fail on deep water (and vice versa). Training on both teaches **depth-invariant** attention.
+
+#### Concrete Example: Learning from Seafloor Diversity
+
+```
+Flat mud seafloor:
+┌────────────────────────────────────────────────────────────┐
+│ Depths: 50, 50, 50, 55, 50, 50, 50                         │
+│                      ↑                                     │
+│                   spike                                    │
+│                                                            │
+│ All neighbors are ~50m, spike stands out                   │
+│ Network learns: "when neighbors are uniform, even small    │
+│   deviations are suspicious - weight ALL neighbors"        │
+└────────────────────────────────────────────────────────────┘
+
+Rocky outcrop:
+┌────────────────────────────────────────────────────────────┐
+│ Depths: 48, 52, 47, 55, 53, 49, 51                         │
+│                      ↑                                     │
+│                   same value, but context differs          │
+│                                                            │
+│ Neighbors vary naturally, 55m fits the pattern             │
+│ Network learns: "when neighbors are variable, assess       │
+│   whether spike fits local texture - weight SIMILAR        │
+│   neighbors more than dissimilar ones"                     │
+└────────────────────────────────────────────────────────────┘
+```
+
+Training on both seafloor types teaches the network to **adapt attention based on local context**.
+
+#### What Happens Without Diversity
+
+| Missing Diversity | Failure Mode |
+|-------------------|--------------|
+| Only flat seafloors | Network flags all texture as noise, removes real rocky features |
+| Only shallow water | Network misses deep-water systematic errors |
+| Only light noise | Network under-confident on heavily contaminated surveys |
+| Only one sonar type | Network fails on different equipment |
+
+This is why the training plan emphasizes collecting **diverse** ground truth pairs, not just **many** pairs.
+
+#### Multi-Head Attention
+
+The GAT architecture uses **4 attention heads**, meaning it learns 4 different attention patterns simultaneously:
+
+```
+Head 1: Might learn "weight neighbors by depth similarity"
+Head 2: Might learn "weight neighbors by uncertainty"
+Head 3: Might learn "weight upslope vs downslope differently"
+Head 4: Might learn "weight by distance"
+
+Final output = combination of all 4 perspectives
+```
+
+Each head can specialize in different aspects of the problem. Diverse training data gives each head enough examples to learn meaningful patterns.
+
 ---
 
 ## How This Tool Works
