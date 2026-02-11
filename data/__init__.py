@@ -2,12 +2,7 @@ from .loaders import BathymetricGrid, BathymetricLoader, BathymetricWriter
 from .tiling import Tile, TileSpec, TileManager, TileMerger
 from .graph_construction import GraphBuilder, MultiScaleGraphBuilder
 from .synthetic_noise import SyntheticNoiseGenerator, NoiseAugmentor, NoiseLabel
-from .vr_bag import (
-    detect_bag_type,
-    VRBagHandler, VRBagWriter, RefinementGrid,
-    SRBagHandler, SRBagWriter, SRGrid,
-    SidecarBuilder, process_vr_bag_native,
-)
+from .vr_bag import VRBagHandler, VRBagWriter, RefinementGrid, SidecarBuilder, process_vr_bag_native
 
 __all__ = [
     # Loaders
@@ -26,14 +21,10 @@ __all__ = [
     "SyntheticNoiseGenerator",
     "NoiseAugmentor",
     "NoiseLabel",
-    # BAG native handling
-    "detect_bag_type",
+    # VR BAG native handling
     "VRBagHandler",
     "VRBagWriter",
     "RefinementGrid",
-    "SRBagHandler",
-    "SRBagWriter",
-    "SRGrid",
     "SidecarBuilder",
     "process_vr_bag_native",
 ]

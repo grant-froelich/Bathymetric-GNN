@@ -6,6 +6,23 @@ Context-aware bathymetric data denoising using Graph Neural Networks.
 
 This system addresses the challenge of distinguishing acoustic noise from real seafloor features in bathymetric data. Unlike traditional approaches that treat each point independently, this GNN-based approach leverages spatial context to make better decisions - particularly in dynamic seafloor environments where noise and features are difficult to distinguish locally.
 
+## Practical Usage
+
+This tool fits into the hydrographic workflow as a QC aid, similar to Flier Finder:
+
+| Use Case | When | Who |
+|----------|------|-----|
+| Field QC | After surface generation, before submission | Field hydrographers |
+| Office QC | Reviewing submitted ESD | Branch processors |
+| Batch processing | Screening multiple surveys | QC leads |
+
+**Workflow position:**
+```
+Point Cloud → Surface Generation → GNN Noise Detection → Human Review → Final Product
+```
+
+The tool does NOT replace human review - it focuses attention on areas that need it.
+
 ## Core Concept
 
 ```
@@ -16,51 +33,99 @@ Local ambiguity + Spatial context = Better classification
 - An isolated spike breaking ridge continuity → probably noise
 ```
 
-For a detailed explanation of how Graph Neural Networks work and how this tool applies them, see [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md).
+## Architecture
 
-## Current State
+```
+Stage 1: Local Feature Extraction
+    Extract per-point features (roughness, gradients, local statistics)
+    
+Stage 2: Graph Construction  
+    Build spatial graph connecting neighboring points
+    
+Stage 3: Graph Neural Network
+    Message passing to incorporate spatial context
+    Classify each point: seafloor / feature / noise
+    Estimate confidence
+    
+Stage 4: Selective Correction
+    Auto-correct high-confidence noise
+    Preserve high-confidence features
+    Flag low-confidence regions for human review
+```
 
-| Metric | Value |
-|--------|-------|
-| Training data | Synthetic noise only |
-| Training surveys | 5 clean VR BAGs |
-| Epochs completed | 50 |
-| Synthetic accuracy | 63.2% |
-| Real-world accuracy | Unknown |
-| Mean confidence | 73.5% (native processing) |
+### Classification Categories
 
-**Next milestone:** Establish baseline metrics with real ground truth data. See `docs/TRAINING_PLAN.md` for the complete training roadmap.
+The model classifies each depth node into one of three categories:
+
+| Class | Value | Meaning | Action |
+|-------|-------|---------|--------|
+| Seafloor | 0 | Depth is consistent with neighbors, represents true bottom | Preserve as-is |
+| Feature | 1 | Depth differs from neighbors BUT represents real object | Preserve and learn from |
+| Noise | 2 | Depth is inconsistent with context, likely artifact | Flag for correction |
+
+### How ENC Features Help
+
+ENC feature extraction (`scripts/extract_s57_features.py`) serves two purposes:
+
+1. **Preservation**: Known charted features (wrecks, rocks, obstructions) are labeled as class 1, protecting them from being flagged as noise even if they appear as isolated spikes.
+
+2. **Training**: The model learns what real features look like vs. noise by seeing examples where we KNOW the spike is real. This helps it recognize similar patterns in areas without ENC coverage.
+
+**Current status**: The ENC feature extraction pipeline is implemented but not yet integrated into training. See Phase 3 in TRAINING_PLAN.md.
 
 ## Key Features
 
-### Native BAG Processing (VR and SR)
+### Variable Resolution (VR) BAG Support
 
-The `inference_native.py` script automatically detects and handles both BAG types:
+Native VR BAG processing preserves multi-resolution structure:
+- Processes each refinement grid (3x3 to 50x50 cells) individually
+- Maintains original VR BAG format in output
+- Generates sidecar GeoTIFF with classification/confidence layers
+- Much higher confidence scores than resampled approach
 
-| BAG Type | Processing | Output |
-|----------|------------|--------|
-| VR (Variable Resolution) | Iterates refinement grids | Corrected VR BAG + sidecar GeoTIFF |
-| SR (Single Resolution) | Processes full grid | Corrected SR BAG + sidecar GeoTIFF |
+### Tile-Based Processing
 
-Native processing preserves original structure and achieves higher confidence than resampled approaches.
+Full surveys (e.g., 60,000 x 60,000 at 0.5m resolution) are too large for memory. 
+The system processes overlapping tiles and stitches results.
 
-### ENC Feature Extraction
+### Training Strategy
 
-Extract known seafloor features from NOAA's ENC Direct REST API for training:
-- Shipwrecks, obstructions, underwater rocks
-- No download required - queries API directly
-- Creates labeled GeoTIFFs for training
+1. **Primary**: Synthetic noise added to clean reference surveys
+2. **Validation**: Small set of real noisy/clean pairs
+3. **Refinement**: Human reviewer corrections fed back as training data
 
-### Training Phases
+**Synthetic noise types** (see `data/synthetic_noise.py`):
+- Gaussian: Environmental/sensor noise
+- Spikes: Double returns, multipath artifacts
+- Blobs: Fish, kelp, suspended sediment
+- Systematic: Sonar artifacts, refraction errors
 
-| Phase | Goal | Minimum | Target | Scripts |
-|-------|------|---------|--------|---------|
-| 1 | Ground truth from clean/noisy pairs | 3-5 pairs (6-10 BAGs) | 8-15 pairs (16-30 BAGs) | `prepare_ground_truth.py`, `evaluate_model.py` |
-| 2 | Feature labels from ENC Direct | 5-10 BAGs | 5-10 BAGs | `extract_s57_features.py` |
-| 3 | Train on real labels | (uses Phase 1-2 data) | | `train.py` (needs extension) |
-| 4 | Deploy and refine | Unlimited | | `inference_native.py` |
+These patterns are designed to mimic real acoustic artifacts while providing ground truth labels for training. Real noisy/clean survey pairs are preferred when available.
 
-**Minimum to start:** 11-20 BAGs | **Target for v1:** 21-40 BAGs
+### Output Products
+
+- Cleaned depth grid (same format as input)
+- Classification map (noise/feature/seafloor per point)
+- Confidence map (0-1 per point)
+- Correction map (suggested depth adjustments)
+- Valid data mask
+
+### Uncertainty Scaling
+
+When the model corrects a depth, it adjusts the uncertainty to reflect the AI intervention:
+
+```
+scale = 2.0 - confidence
+new_uncertainty = original_uncertainty × scale
+```
+
+| Confidence | Scale Factor | Effect |
+|------------|--------------|--------|
+| 0.9 (high) | 1.1 | Small uncertainty increase |
+| 0.7 | 1.3 | Moderate increase |
+| 0.5 (low) | 1.5 | Larger increase |
+
+**Rationale**: This provides traceability - downstream users can identify where AI modified the data and how confident the model was in those changes. The scaling factors can be adjusted based on operational risk tolerance.
 
 ## Installation
 
@@ -85,206 +150,109 @@ conda install -c conda-forge gdal libgdal-hdf5
 ```
 bathymetric-gnn/
 ├── config/
-│   └── config.py                   # Configuration dataclass
+│   └── config.py                  # Configuration dataclass
 ├── data/
-│   ├── loaders.py                  # BAG/GeoTIFF loading via GDAL
-│   ├── graph_construction.py       # Build graphs from grids
-│   ├── synthetic_noise.py          # Generate training data
-│   ├── tiling.py                   # Tile management for large grids
-│   └── vr_bag.py                   # Native BAG handler (VR and SR)
+│   ├── loaders.py                 # BAG/GeoTIFF loading via GDAL
+│   ├── graph_construction.py      # Build graphs from grids
+│   ├── synthetic_noise.py         # Generate training data
+│   ├── tiling.py                  # Tile management for large grids
+│   └── vr_bag.py                  # Native VR BAG handler
 ├── models/
-│   ├── gnn.py                      # Graph neural network
-│   └── pipeline.py                 # Full inference pipeline
+│   ├── gnn.py                     # Graph neural network
+│   └── pipeline.py                # Full inference pipeline
 ├── training/
-│   ├── trainer.py                  # Training loop
-│   └── losses.py                   # Loss functions
-├── scripts/
-│   ├── train.py                    # Training entry point
-│   ├── inference.py                # Inference (resampled mode)
-│   ├── inference_native.py         # Native BAG inference (VR and SR)
-│   ├── prepare_ground_truth.py     # Generate labels from clean/noisy pairs
-│   ├── evaluate_model.py           # Evaluate predictions against ground truth
-│   ├── extract_s57_features.py     # Extract features from NOAA ENC Direct
-│   ├── analyze_noise_patterns.py   # Characterize noise (optional)
-│   ├── diagnose_tiles.py           # Tile validity diagnostics
-│   └── explore_vr_bag.py           # VR BAG structure explorer
-└── docs/
-    ├── HOW_IT_WORKS.md             # GNN theory and practical application
-    └── TRAINING_PLAN.md            # Detailed training roadmap
+│   ├── trainer.py                 # Training loop
+│   └── losses.py                  # Loss functions
+└── scripts/
+    ├── train.py                   # Training entry point
+    ├── inference.py               # Inference (resampled mode)
+    ├── inference_vr_native.py     # Native VR BAG inference
+    ├── diagnose_tiles.py          # Tile validity diagnostics
+    └── explore_vr_bag.py          # VR BAG structure explorer
 ```
 
 ## Usage
 
-### Native BAG Inference (Recommended)
-
-Works with both VR and SR BAGs - type detected automatically:
-
-```bash
-python scripts/inference_native.py \
-    --input survey.bag \
-    --model outputs/final_model.pt \
-    --output cleaned_survey.bag \
-    --min-valid-ratio 0.01
-```
-
-**Outputs:**
-- `cleaned_survey.bag` - Corrected BAG (same format as input)
-- `cleaned_survey_gnn_outputs.tif` - Sidecar with classification/confidence
-
 ### Training
-
-Current training uses synthetic noise only:
 
 ```bash
 python scripts/train.py \
-    --clean-surveys data/raw/clean \
-    --output-dir outputs/models/v2 \
-    --epochs 100
+    --clean-surveys /path/to/clean/surveys \
+    --output-dir /path/to/model/output \
+    --epochs 100 \
+    --vr-bag-mode resampled
 ```
 
-> **Note:** To train on real labels from Phases 1-2, `train.py` needs to be extended to accept a `--labels` argument. This is a pending development task.
-
-### Ground Truth Generation
-
-Create labeled data from clean/noisy survey pairs:
+### Inference (Single Resolution or Resampled VR)
 
 ```bash
-python scripts/prepare_ground_truth.py \
-    --clean data/raw/clean/survey_clean.bag \
-    --noisy data/raw/noisy/survey_noisy.bag \
-    --output-dir data/processed/labels \
-    --noise-threshold 0.15
+python scripts/inference.py \
+    --input /path/to/survey.bag \
+    --model /path/to/model.pt \
+    --output /path/to/output.tif \
+    --vr-bag-mode resampled \
+    --min-valid-ratio 0.01
 ```
 
-### Feature Extraction from ENC Direct
-
-Extract known features (wrecks, rocks, obstructions) for training:
+### Native VR BAG Inference (Preserves VR Structure)
 
 ```bash
-# Query by survey bounds (no download required)
-python scripts/extract_s57_features.py \
-    --survey data/raw/features/harbor.bag \
-    --labels data/processed/labels/harbor_features.tif \
-    --output data/processed/labels/harbor_features.geojson
+python scripts/inference_vr_native.py \
+    --input /path/to/vr_survey.bag \
+    --model /path/to/model.pt \
+    --output /path/to/output.bag \
+    --min-valid-ratio 0.01
 ```
 
-### Model Evaluation
-
-Compare predictions against ground truth:
-
-```bash
-python scripts/evaluate_model.py \
-    --ground-truth data/processed/labels/survey_ground_truth.tif \
-    --predictions outputs/predictions/survey_gnn_outputs.tif \
-    --output outputs/metrics/survey_eval.json
-```
+This creates:
+- `output.bag` - VR BAG with corrections applied
+- `output_gnn_outputs.tif` - Sidecar GeoTIFF with classification/confidence
 
 ### Diagnostic Tools
 
 ```bash
 # Check tile validity and coverage
 python scripts/diagnose_tiles.py \
-    --survey survey.bag
+    --survey /path/to/survey.bag \
+    --vr-bag-mode resampled
 
 # Explore VR BAG HDF5 structure
 python scripts/explore_vr_bag.py \
-    --survey vr_survey.bag
+    --survey /path/to/vr_survey.bag
 ```
-
-## Production Workflow
-
-Once training is complete, this is the day-to-day workflow for cleaning surveys.
-
-### 1. Run Inference
-
-```bash
-python scripts/inference_native.py \
-    --input new_survey.bag \
-    --model outputs/models/v2/best_model.pt \
-    --output cleaned_survey.bag
-```
-
-### 2. Review Outputs
-
-The sidecar GeoTIFF (`cleaned_survey_gnn_outputs.tif`) contains:
-
-| Band | Content | Review Action |
-|------|---------|---------------|
-| 1 | Classification | Verify noise (2) vs feature (1) assignments |
-| 2 | Confidence | Focus review on values 0.4-0.7 |
-| 3 | Correction | Check magnitude of applied changes |
-
-**Confidence interpretation:**
-- **> 0.85**: High confidence, auto-corrected
-- **0.5 - 0.85**: Medium confidence, spot-check recommended
-- **< 0.5**: Low confidence, manual review recommended
-
-### 3. Manual Review (Optional)
-
-For critical surveys, review low-confidence regions in GIS software:
-
-1. Load `cleaned_survey_gnn_outputs.tif` in QGIS
-2. Style confidence band with diverging colormap
-3. Identify clusters with confidence 0.4-0.7
-4. Compare against original survey and cleaned output
-5. Document any corrections needed
-
-### 4. Continuous Improvement
-
-The model improves over time by incorporating reviewer feedback:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  New Survey → Inference → Review → Corrections          │
-│       ↑                                    │            │
-│       │                                    ↓            │
-│       └──── Retrain ← Accumulate corrections ←─────────┘
-└─────────────────────────────────────────────────────────┘
-```
-
-**When to retrain:**
-- After accumulating 5-10 reviewed surveys with corrections
-- When encountering new seafloor types or noise patterns
-- Monthly during active production use
-
-**How to add feedback:**
-1. Save reviewer corrections as new ground truth pairs
-2. Add to `data/processed/train/`
-3. Retrain model with expanded dataset
-
-## Output Products
-
-- **Cleaned depth grid** - Same format as input (VR or SR BAG)
-- **Classification map** - Per-cell: 0=seafloor, 1=feature, 2=noise
-- **Confidence map** - 0-1 per cell
-- **Correction map** - Suggested depth adjustments
-
-### Uncertainty Scaling
-
-Corrected cells have uncertainty scaled by model confidence:
-- High confidence (0.9) → uncertainty × 1.1
-- Low confidence (0.5) → uncertainty × 1.5
 
 ## Data Format Support
 
-| Format | Input | Output |
-|--------|-------|--------|
-| VR BAG | Yes | Yes (preserves structure) |
-| SR BAG | Yes | Yes |
-| GeoTIFF | Yes | Yes |
+- **Input**: ONSWG BAG (SR and VR), GeoTIFF, ASC (via GDAL)
+- **Output**: 
+  - BAG: Copy-and-modify for SR, new SR for resampled VR
+  - GeoTIFF: Multi-band with depth, uncertainty, classification, confidence, correction, valid_mask
+  - Native VR: Preserved VR structure + sidecar GeoTIFF
+
+### Why BAG Files?
+
+**Current implementation uses BAG files because:**
+- Open format with well-documented HDF5 structure
+- Easy to read/write with standard GDAL/Python tools
+- Available for both field units and archives
+
+**Future expansion to CSAR working formats is planned to enable:**
+- Pushing edits back to point cloud
+- Integration with standard CARIS workflows
+- Better traceability of changes
 
 ## Hardware Requirements
 
 - **Minimum**: 16 GB RAM, NVIDIA GPU with 8 GB VRAM
 - **Recommended**: 32 GB RAM, NVIDIA GPU with 16+ GB VRAM
 - **CPU-only**: Supported but significantly slower
-- **RTX 50 Series**: Auto-detected, falls back to CPU until PyTorch adds support
+- **RTX 50 Series (Blackwell)**: Auto-detected and falls back to CPU until PyTorch adds support
 
 ## Known Issues
 
 - RTX 50 series GPUs (sm_120) not yet supported by PyTorch; auto-falls back to CPU
+- VR BAG output from resampled input creates SR BAG (cannot recreate VR structure)
 - Full BAG XML metadata not preserved when creating new BAGs
-- `train.py` currently only supports synthetic noise; extension for real labels is pending
 
 ## License
 
