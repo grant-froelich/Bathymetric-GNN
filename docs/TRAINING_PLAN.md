@@ -71,10 +71,10 @@ The GNN uses attention heads to learn different seafloor types (flat mud, rocky,
 
 | Mode | Script | Use Case |
 |------|--------|----------|
-| **Native VR** | `inference_vr_native.py` | Production - preserves VR structure, higher confidence |
+| **Native** | `inference_native.py` | Production - auto-detects VR/SR, preserves structure |
 | Resampled | `inference.py --vr-bag-mode resampled` | Analysis/visualization only |
 
-**Always use native VR processing for training and production inference.**
+**Always use native processing for production inference.** The script automatically detects VR vs SR BAGs.
 
 ## Directory Structure
 
@@ -607,7 +607,7 @@ if __name__ == '__main__':
 
 ```cmd
 :: First run native VR inference on the noisy survey
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input data/raw/noisy/survey_001_noisy.bag ^
     --model outputs/final_model.pt ^
     --output outputs/predictions/survey_001_clean.bag ^
@@ -1143,7 +1143,7 @@ After training, evaluate on held-out surveys:
 
 ```cmd
 :: Run native inference
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input data/raw/noisy/validation_survey.bag ^
     --model outputs/models/v2/best_model.pt ^
     --output outputs/predictions/validation_clean.bag ^
@@ -1353,7 +1353,7 @@ python scripts/prepare_ground_truth.py ^
     --output-dir data/processed/labels
 
 :: Run native VR inference on noisy survey
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input data/raw/noisy/survey_001_noisy.bag ^
     --model outputs/final_model.pt ^
     --output outputs/predictions/survey_001_clean.bag ^
@@ -1399,7 +1399,7 @@ python scripts/train.py ^
 :: ========================================
 
 :: Run native VR inference
-python scripts/inference_vr_native.py ^
+python scripts/inference_native.py ^
     --input new_survey.bag ^
     --model outputs/models/v2/best_model.pt ^
     --output cleaned_survey.bag ^

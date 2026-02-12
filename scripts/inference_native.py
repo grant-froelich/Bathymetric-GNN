@@ -6,7 +6,7 @@ Processes BAG files without resampling:
 - VR BAGs: Iterates through refinement grids, preserving multi-resolution structure
 - SR BAGs: Processes the full elevation grid directly
 
-Both modes output a corrected BAG and optional sidecar GeoTIFF.
+Auto-detects BAG type and uses the appropriate handler.
 """
 
 import os
@@ -25,12 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import Config
 from models.gnn import BathymetricGNN
-from data import GraphBuilder
-from data.vr_bag import (
-    detect_bag_type,
-    VRBagHandler, SRBagHandler,
-    SidecarBuilder,
-)
+from data import GraphBuilder, VRBagHandler, VRBagWriter, SRBagHandler, SRBagWriter
+from data.vr_bag import SidecarBuilder, detect_bag_type
 
 
 def setup_logging(level: str = "INFO"):
@@ -42,7 +38,7 @@ def setup_logging(level: str = "INFO"):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Native BAG inference - preserves BAG structure (VR or SR)"
+        description="Native BAG inference - auto-detects VR/SR and preserves structure"
     )
     
     # Required arguments
@@ -78,7 +74,7 @@ def parse_args():
         "--min-valid-ratio",
         type=float,
         default=0.01,
-        help="Minimum ratio of valid data to process a grid (default: 0.01)",
+        help="Minimum ratio of valid data to process a refinement grid (default: 0.01)",
     )
     parser.add_argument(
         "--auto-correct-threshold",
@@ -98,7 +94,7 @@ def parse_args():
         "--export-sidecar",
         action="store_true",
         default=True,
-        help="Export sidecar GeoTIFF with classification/confidence",
+        help="Export sidecar GeoTIFF with classification/confidence (resampled)",
     )
     parser.add_argument(
         "--no-export-sidecar",
@@ -111,8 +107,8 @@ def parse_args():
     return parser.parse_args()
 
 
-class NativeProcessor:
-    """Processes BAG grids through GNN."""
+class NativeVRProcessor:
+    """Processes VR BAG refinement grids through GNN."""
     
     CLASS_NOISE = 2
     
@@ -137,7 +133,7 @@ class NativeProcessor:
         resolution: tuple,
     ) -> tuple:
         """
-        Process a single grid through the GNN.
+        Process a single refinement grid.
         
         Args:
             depth: 2D depth array
@@ -224,10 +220,6 @@ def main():
     # Create output directory
     args.output.parent.mkdir(parents=True, exist_ok=True)
     
-    # Detect BAG type
-    bag_type = detect_bag_type(args.input)
-    logger.info(f"Detected BAG type: {bag_type}")
-    
     # Load config
     if args.config and args.config.exists():
         config = Config.load(args.config)
@@ -264,8 +256,8 @@ def main():
     checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     
     model_config = checkpoint['config'].model
-    in_channels = checkpoint.get('in_channels', 7)
-    edge_dim = checkpoint.get('edge_dim', 3)
+    in_channels = checkpoint.get('in_channels', 7)  # Default node features
+    edge_dim = checkpoint.get('edge_dim', 3)  # Default edge features
     
     model = BathymetricGNN(
         in_channels=in_channels,
@@ -275,7 +267,7 @@ def main():
         heads=model_config.gnn_heads,
         num_classes=model_config.num_classes,
         predict_correction=model_config.predict_correction,
-        dropout=0.0,
+        dropout=0.0,  # No dropout during inference
         edge_dim=edge_dim,
     )
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -288,15 +280,16 @@ def main():
         edge_features=config.graph.edge_features,
     )
     
-    processor = NativeProcessor(
+    processor = NativeVRProcessor(
         model=model,
         graph_builder=graph_builder,
         device=device,
         auto_correct_threshold=args.auto_correct_threshold,
     )
     
-    # Open BAG with appropriate handler
-    logger.info(f"Opening BAG: {args.input}")
+    # Detect BAG type and open with appropriate handler
+    bag_type = detect_bag_type(args.input)
+    logger.info(f"Detected BAG type: {bag_type}")
     
     if bag_type == 'VR':
         handler = VRBagHandler(args.input)
@@ -304,7 +297,7 @@ def main():
         handler = SRBagHandler(args.input)
     
     info = handler.get_refinement_info()
-    logger.info(f"BAG structure:")
+    logger.info(f"BAG structure ({bag_type}):")
     logger.info(f"  - Grid shape: {info['base_shape']}")
     if bag_type == 'VR':
         logger.info(f"  - Refined cells: {info['num_refined_cells']:,}")
@@ -323,7 +316,7 @@ def main():
     if args.export_sidecar:
         sidecar = SidecarBuilder(handler)
     
-    # Process grids
+    # Process refinement grids
     stats = {
         'grids_processed': 0,
         'cells_processed': 0,
@@ -375,7 +368,6 @@ def main():
             stats['cells_classified_noise'] += int(np.sum(noise_mask))
             stats['total_confidence'] += float(np.sum(confidence[grid.valid_mask]))
             
-            # Progress logging (more frequent for VR)
             if bag_type == 'VR' and (i + 1) % 500 == 0:
                 logger.info(f"Processed {i + 1}/{info['num_refined_cells']} refinement grids")
     
@@ -392,8 +384,8 @@ def main():
     logger.info("=" * 60)
     logger.info("Processing Summary")
     logger.info("=" * 60)
-    logger.info(f"BAG type: {bag_type}")
-    logger.info(f"Grids processed: {stats['grids_processed']:,}")
+    if bag_type == 'VR':
+        logger.info(f"Refinement grids processed: {stats['grids_processed']:,}")
     logger.info(f"Total cells processed: {stats['cells_processed']:,}")
     logger.info(f"Cells classified as noise: {stats['cells_classified_noise']:,} "
                 f"({100*stats['cells_classified_noise']/max(1,stats['cells_processed']):.1f}%)")

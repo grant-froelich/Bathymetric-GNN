@@ -13,7 +13,7 @@ This tool fits into the hydrographic workflow as a QC aid, similar to Flier Find
 | Use Case | When | Who |
 |----------|------|-----|
 | Field QC | After surface generation, before submission | Field hydrographers |
-| Office QC | Reviewing submitted surveys | Branch processors |
+| Office QC | Reviewing submitted ESD | Branch processors |
 | Batch processing | Screening multiple surveys | QC leads |
 
 **Workflow position:**
@@ -38,35 +38,29 @@ Local ambiguity + Spatial context = Better classification
 - An isolated spike breaking ridge continuity → probably noise
 ```
 
-## Architecture
+## How It Works
 
-```
-Stage 1: Local Feature Extraction
-    Extract per-point features (roughness, gradients, local statistics)
-    
-Stage 2: Graph Construction  
-    Build spatial graph connecting neighboring points
-    
-Stage 3: Graph Neural Network
-    Message passing to incorporate spatial context
-    Classify each point: seafloor / feature / noise
-    Estimate confidence
-    
-Stage 4: Selective Correction
-    Auto-correct high-confidence noise
-    Preserve high-confidence features
-    Flag low-confidence regions for human review
-```
+The tool examines each depth point and its neighbors to decide if it's real or noise:
+
+1. **Look at each point**: Gather local info (depth, slope, roughness, uncertainty)
+2. **Look at neighbors**: Build connections to surrounding points
+3. **Share information**: Each point "asks" its neighbors what they look like
+4. **Make a decision**: Classify as seafloor, feature, or noise with a confidence score
+5. **Apply selectively**: Only correct high-confidence noise; flag uncertain areas for human review
+
+The key advantage over simple filters: the model considers spatial context, not just local statistics.
 
 ### Classification Categories
 
-The model classifies each depth node into one of three categories:
+The model classifies each depth point into one of three categories. The model learns from ALL classes during training:
 
-| Class | Value | Meaning | Action |
-|-------|-------|---------|--------|
-| Seafloor | 0 | Depth is consistent with neighbors, represents true bottom | Preserve as-is |
-| Feature | 1 | Depth differs from neighbors BUT represents real object | Preserve and learn from |
-| Noise | 2 | Depth is inconsistent with context, likely artifact | Flag for correction |
+| Class | Value | Meaning | Training Role |
+|-------|-------|---------|---------------|
+| Seafloor | 0 | Consistent with neighbors, true bottom | Learn what "normal" looks like |
+| Feature | 1 | Different from neighbors BUT real (wreck, rock, etc.) | Learn to preserve real objects |
+| Noise | 2 | Inconsistent with context, likely artifact | Learn what noise looks like |
+
+**Important**: All three classes contribute to training. The model needs to see examples of clean seafloor (0), real features (1), and actual noise (2) to learn the differences between them.
 
 ### How ENC Features Help
 
@@ -95,17 +89,14 @@ The system processes overlapping tiles and stitches results.
 
 ### Training Strategy
 
-1. **Primary**: Synthetic noise added to clean reference surveys
-2. **Validation**: Small set of real noisy/clean pairs
-3. **Refinement**: Human reviewer corrections fed back as training data
+Training requires clean/noisy survey pairs where we know what the correct answer is:
 
-**Synthetic noise types** (see `data/synthetic_noise.py`):
-- Gaussian: Environmental/sensor noise
-- Spikes: Double returns, multipath artifacts
-- Blobs: Fish, kelp, suspended sediment
-- Systematic: Sonar artifacts, refraction errors
+1. **Primary**: Real noisy/clean survey pairs from field units or archives
+2. **Supplemental**: Human reviewer corrections fed back as new training data
 
-These patterns are designed to mimic real acoustic artifacts while providing ground truth labels for training. Real noisy/clean survey pairs are preferred when available.
+**Real data pairs are preferred.** Synthetic noise injection was used for initial script testing but is not recommended for production training since it doesn't capture the full complexity of real acoustic artifacts.
+
+See TRAINING_PLAN.md for detailed instructions on preparing ground truth data.
 
 ### Output Products
 
@@ -117,7 +108,7 @@ These patterns are designed to mimic real acoustic artifacts while providing gro
 
 ### Uncertainty Scaling
 
-When using native processing (`inference_native.py` or `inference_vr_native.py`), corrected depths have their uncertainty scaled to reflect AI intervention:
+When using native processing (`inference_native.py` or `inference_native.py`), corrected depths have their uncertainty scaled to reflect AI intervention:
 
 ```
 scale = 2.0 - confidence
@@ -173,7 +164,7 @@ bathymetric-gnn/
 └── scripts/
     ├── train.py                   # Training entry point
     ├── inference.py               # Inference (resampled mode)
-    ├── inference_vr_native.py     # Native VR BAG inference
+    ├── inference_native.py     # Native BAG inference (VR and SR)
     ├── diagnose_tiles.py          # Tile validity diagnostics
     └── explore_vr_bag.py          # VR BAG structure explorer
 ```
@@ -201,18 +192,24 @@ python scripts/inference.py \
     --min-valid-ratio 0.01
 ```
 
-### Native VR BAG Inference (Preserves VR Structure)
+### Native BAG Inference (Recommended)
+
+Handles both VR and SR BAGs automatically, preserving original structure:
 
 ```bash
-python scripts/inference_vr_native.py \
-    --input /path/to/vr_survey.bag \
+python scripts/inference_native.py \
+    --input /path/to/survey.bag \
     --model /path/to/model.pt \
     --output /path/to/output.bag \
     --min-valid-ratio 0.01
 ```
 
-This creates:
-- `output.bag` - VR BAG with corrections applied
+The script auto-detects whether the input is VR or SR and processes appropriately:
+- **VR BAGs**: Iterates through refinement grids, preserves multi-resolution structure
+- **SR BAGs**: Processes the full elevation grid directly
+
+Output:
+- `output.bag` - BAG with corrections applied (same type as input)
 - `output_gnn_outputs.tif` - Sidecar GeoTIFF with classification/confidence
 
 ### Diagnostic Tools

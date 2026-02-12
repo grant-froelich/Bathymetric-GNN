@@ -26,6 +26,43 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def detect_bag_type(path: Path) -> str:
+    """
+    Detect whether a BAG file is Variable Resolution (VR) or Single Resolution (SR).
+    
+    Args:
+        path: Path to BAG file
+        
+    Returns:
+        'VR' if variable resolution, 'SR' if single resolution
+        
+    Raises:
+        ValueError: If file is not a valid BAG
+    """
+    if not H5PY_AVAILABLE:
+        raise ImportError("h5py is required for BAG type detection")
+    
+    path = Path(path)
+    
+    with h5py.File(path, 'r') as f:
+        root = f['BAG_root']
+        
+        # Check for VR-specific datasets
+        has_varres_metadata = 'varres_metadata' in root
+        has_varres_refinements = 'varres_refinements' in root
+        
+        if has_varres_metadata and has_varres_refinements:
+            # Verify there are actual refinements
+            varres_metadata = root['varres_metadata'][:]
+            dims_x = varres_metadata['dimensions_x']
+            has_refinements = np.any(dims_x > 0)
+            
+            if has_refinements:
+                return 'VR'
+        
+        return 'SR'
+
+
 @dataclass
 class RefinementGrid:
     """A single refinement grid from a VR BAG."""
@@ -273,6 +310,167 @@ class VRBagHandler:
         logger.info(f"Copying VR BAG: {self.path} -> {output_path}")
         shutil.copy(str(self.path), str(output_path))
         return VRBagWriter(output_path)
+
+
+class SRBagHandler:
+    """
+    Handler for native SR BAG processing.
+    
+    Provides the same interface as VRBagHandler but for single-resolution BAGs.
+    The entire elevation grid is treated as a single "refinement" for consistency.
+    """
+    
+    def __init__(self, path: Path):
+        """
+        Open an SR BAG file for reading.
+        
+        Args:
+            path: Path to SR BAG file
+        """
+        if not H5PY_AVAILABLE:
+            raise ImportError("h5py is required for native BAG processing")
+        
+        self.path = Path(path)
+        
+        # Open and read structure
+        with h5py.File(self.path, 'r') as f:
+            root = f['BAG_root']
+            
+            # Read elevation data
+            elevation = root['elevation'][:]
+            self._depth = elevation.astype(np.float32)
+            
+            # Read uncertainty if available
+            if 'uncertainty' in root:
+                self._uncertainty = root['uncertainty'][:].astype(np.float32)
+            else:
+                self._uncertainty = np.zeros_like(self._depth)
+            
+            # Get metadata
+            self._shape = self._depth.shape
+            
+            # Get resolution from metadata
+            metadata = root['metadata'][()]
+            if isinstance(metadata, bytes):
+                metadata = metadata.decode('utf-8')
+            
+            # Parse resolution from XML metadata
+            import re
+            res_match = re.search(r'<gmd:resolution>.*?<gco:Measure[^>]*>([0-9.]+)</gco:Measure>', 
+                                  metadata, re.DOTALL)
+            if res_match:
+                self._resolution = float(res_match.group(1))
+            else:
+                # Fallback: try to get from georeferencing
+                try:
+                    from osgeo import gdal
+                    ds = gdal.Open(str(self.path))
+                    gt = ds.GetGeoTransform()
+                    self._resolution = abs(gt[1])
+                    ds = None
+                except:
+                    self._resolution = 1.0  # Default fallback
+            
+            logger.info(f"Opened SR BAG: {self.path}")
+            logger.info(f"  Shape: {self._shape}")
+            logger.info(f"  Resolution: {self._resolution}m")
+    
+    @property
+    def base_shape(self) -> Tuple[int, int]:
+        """Shape of the elevation grid."""
+        return self._shape
+    
+    def get_refinement_info(self) -> Dict:
+        """Get summary information (compatible with VRBagHandler interface)."""
+        valid_mask = (self._depth != 1.0e6) & np.isfinite(self._depth)
+        return {
+            'base_shape': self._shape,
+            'num_refined_cells': 1,  # SR has one "grid"
+            'total_refinement_nodes': int(np.sum(valid_mask)),
+            'unique_resolutions': [self._resolution],
+        }
+    
+    def iterate_refinements(self, min_valid_ratio: float = 0.0) -> Generator:
+        """
+        Yield the SR grid as a single RefinementGrid.
+        
+        This provides interface compatibility with VRBagHandler.
+        """
+        valid_mask = (self._depth != 1.0e6) & np.isfinite(self._depth)
+        valid_ratio = np.sum(valid_mask) / self._depth.size
+        
+        if valid_ratio >= min_valid_ratio:
+            yield RefinementGrid(
+                base_row=0,
+                base_col=0,
+                depth=self._depth.copy(),
+                uncertainty=self._uncertainty.copy(),
+                resolution=(self._resolution, self._resolution),
+                dimensions=self._shape,
+                sw_corner=(0.0, 0.0),
+                start_index=0,
+            )
+    
+    def copy_and_open_for_writing(self, output_path: Path):
+        """
+        Copy BAG file and open for modification.
+        
+        Args:
+            output_path: Path for output BAG
+            
+        Returns:
+            SRBagWriter for modifying the copy
+        """
+        logger.info(f"Copying SR BAG: {self.path} -> {output_path}")
+        shutil.copy(str(self.path), str(output_path))
+        return SRBagWriter(output_path)
+
+
+class SRBagWriter:
+    """
+    Writer for modifying SR BAG elevation data.
+    
+    Used in conjunction with SRBagHandler to apply corrections.
+    """
+    
+    def __init__(self, path: Path):
+        """Open SR BAG for writing."""
+        self.path = Path(path)
+        self.file = h5py.File(self.path, 'r+')
+        self.root = self.file['BAG_root']
+        logger.info(f"Opened SR BAG for writing: {self.path}")
+    
+    def update_refinement_batch(
+        self,
+        grid: RefinementGrid,
+        corrected_depth: np.ndarray,
+        corrected_uncertainty: np.ndarray,
+    ):
+        """
+        Update the elevation grid with corrections.
+        
+        Args:
+            grid: The RefinementGrid (ignored for SR, uses full grid)
+            corrected_depth: Corrected depth values
+            corrected_uncertainty: Corrected uncertainty values
+        """
+        self.root['elevation'][:] = corrected_depth
+        if 'uncertainty' in self.root:
+            self.root['uncertainty'][:] = corrected_uncertainty
+    
+    def close(self):
+        """Close the file."""
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+            logger.info(f"Closed SR BAG: {self.path}")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 class VRBagWriter:

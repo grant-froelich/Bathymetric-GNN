@@ -1,16 +1,29 @@
 # Changelog
 
-## 2026-02-12 - Bug Fix: Correction Direction
+## 2026-02-12 - Unified Native BAG Processing & Documentation Updates
+
+### Major Changes
+
+#### Unified Native BAG Inference
+- `inference_native.py` now handles BOTH VR and SR BAGs automatically
+- Added `detect_bag_type()` function to auto-detect BAG type
+- Added `SRBagHandler` and `SRBagWriter` classes for SR BAG native processing
+- Removed redundant `inference_native.py` script
+- Single script for all native BAG processing simplifies user workflow
 
 ### Bug Fixes
 
 #### Critical: Correction Sign Error in Native Inference Scripts
-- Fixed correction application direction in `scripts/inference_native.py` and `scripts/inference_vr_native.py`
-- **Bug**: Scripts were using `+= correction` which would double noise instead of removing it
+- Fixed correction application direction in `scripts/inference_native.py`
+- **Bug**: Script was using `+= correction` which would double noise instead of removing it
 - **Fix**: Changed to `-= correction` to match `models/pipeline.py` behavior
 - The model predicts `correction = noisy_depth - clean_depth`, so recovery requires `clean = noisy - correction`
 
 ### Documentation Updates
+- Simplified "Architecture" section in README to plain language "How It Works"
+- Clarified that ALL classification classes (0, 1, 2) contribute to training
+- Updated training strategy to emphasize real data pairs over synthetic noise
+- Clarified `inference_native.py` handles both VR and SR BAGs
 - Added "Practical Usage" section to README with workflow position
 - Added "Documentation" section with links to HOW_IT_WORKS.md and TRAINING_PLAN.md
 - Expanded "Current State" in TRAINING_PLAN.md with milestone table
@@ -29,7 +42,7 @@
 
 #### Native VR BAG Processing
 - Added `data/vr_bag.py` module for handling Variable Resolution BAGs without resampling
-- New `scripts/inference_vr_native.py` for native VR inference that preserves multi-resolution structure
+- New `scripts/inference_native.py` for native VR inference that preserves multi-resolution structure
 - `VRBagHandler` class for reading VR BAG refinement grids
 - `VRBagWriter` class for copy-and-modify workflow
 - `SidecarBuilder` class for generating GeoTIFF outputs from native VR processing
@@ -75,7 +88,7 @@
 
 ### New Files
 - `data/vr_bag.py` - Native VR BAG handler
-- `scripts/inference_vr_native.py` - Native VR inference script
+- `scripts/inference_native.py` - Native VR inference script
 - `scripts/diagnose_tiles.py` - Diagnostic tool for tile validity issues
 - `scripts/explore_vr_bag.py` - VR BAG structure explorer
 
@@ -109,7 +122,7 @@
 
 ```bash
 # Native VR BAG processing (preserves VR structure)
-python scripts/inference_vr_native.py \
+python scripts/inference_native.py \
     --input survey.bag \
     --model outputs/final_model.pt \
     --output survey_clean.bag \
