@@ -35,6 +35,29 @@ While noise can create spikes in both directions (shoaler or deeper), **shoal sp
 
 A false shoal spike that gets removed is a missed hazard. A real shoal feature that gets classified as noise is dangerous. This asymmetry means the model should be **conservative about removing shoal spikes** - when uncertain, preserve them for human review.
 
+### Protecting Uncharted Features
+
+A common concern: how do we prevent the model from cleaning away a real but uncharted feature (a new wreck, rock outcrop, or obstruction)?
+
+**Multiple layers of protection:**
+
+| Protection Layer | How It Works | Status |
+|------------------|--------------|--------|
+| **Confidence thresholds** | Low-confidence classifications are flagged for human review, not auto-corrected | ✓ Active |
+| **Sidecar GeoTIFF** | All changes are documented with classification and confidence, enabling review | ✓ Active |
+| **Conservative defaults** | Auto-correct threshold (0.85) means only high-confidence noise is touched | ✓ Active |
+| **Feature class training** | Model learns to recognize feature-like patterns from ENC examples | Phase 3 (planned) |
+
+**Current state:** With only synthetic noise training, the model classifies points as seafloor (0) or noise (2). Feature class (1) training is planned for Phase 3 when ENC feature labels are integrated.
+
+**The key insight:** A properly trained model learns what features *look like*, not just where charted features *are*. When trained on diverse seafloor types including rocky terrain and known features, the model learns patterns like:
+
+- Isolated spike on flat bottom → likely noise
+- Spike connected to similar-depth neighbors → likely real feature
+- Spike with low uncertainty in variable terrain → likely real feature
+
+**For truly novel features** (something the model has never seen), the confidence score will typically be lower because the model is uncertain. These get flagged for human review rather than auto-corrected.
+
 ---
 
 ## Why Graphs?
@@ -78,8 +101,8 @@ Each grid cell becomes a **node**. Connections between neighbors become **edges*
 |-----------|-------------------|---------------------|
 | **Nodes** | Individual data points | Grid cells with depth values |
 | **Edges** | Connections between points | Spatial adjacency (neighbors) |
-| **Node features** | Properties of each point | Depth, uncertainty, local roughness |
-| **Edge features** | Properties of connections | Distance, depth difference, slope direction |
+| **Node features** | Properties of each point | Depth, local statistics, gradients, curvature |
+| **Edge features** | Properties of connections | Distance, depth difference, slope angle |
 
 ### Message Passing
 
@@ -506,6 +529,42 @@ This calibration improves as the model trains on more real data.
 | Not magic | Can't detect noise that humans can't | Confidence scores flag uncertainty |
 | Domain shift | May struggle with very different surveys | Include diverse training data |
 | Feature confusion | May confuse rare features with noise | Train with feature examples |
+
+---
+
+## Processing Time
+
+Typical processing times (on GPU):
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| **Training** (5 survey pairs, 50 epochs) | Minutes | One-time or periodic retraining |
+| **Inference** (single survey) | Seconds to minutes | Depends on survey size |
+| **Full production run** | Minutes per survey | Includes sidecar GeoTIFF generation |
+
+Processing is slower than simple threshold filters but provides context-aware detection that filters cannot achieve. CPU-only processing is supported but significantly slower.
+
+---
+
+## Operational Confidence Thresholds
+
+The tool uses configurable confidence thresholds to balance automation vs. human review:
+
+| Threshold | Default | Purpose |
+|-----------|---------|---------|
+| `auto_correct_threshold` | 0.85 | Only auto-correct noise if confidence exceeds this |
+| `review_threshold` | 0.60 | Flag for human review if confidence below this |
+
+**These thresholds are policy decisions**, not technical requirements. Adjusting them changes the tradeoff:
+
+| Setting | Effect |
+|---------|--------|
+| Higher auto-correct threshold (e.g., 0.95) | More conservative - fewer auto-corrections, more human review |
+| Lower auto-correct threshold (e.g., 0.75) | More aggressive - more auto-corrections, less human review |
+| Higher review threshold (e.g., 0.70) | More items flagged for review |
+| Lower review threshold (e.g., 0.50) | Fewer items flagged for review |
+
+The "right" thresholds depend on operational risk tolerance. A 95% confidence benchmark for shoal safety is a policy question for Coast Survey leadership, not a technical decision.
 
 ---
 

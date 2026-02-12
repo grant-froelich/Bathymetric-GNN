@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-02-12 - Bug Fix: Correction Direction
+
+### Bug Fixes
+
+#### Critical: Correction Sign Error in Native Inference Scripts
+- Fixed correction application direction in `scripts/inference_native.py` and `scripts/inference_vr_native.py`
+- **Bug**: Scripts were using `+= correction` which would double noise instead of removing it
+- **Fix**: Changed to `-= correction` to match `models/pipeline.py` behavior
+- The model predicts `correction = noisy_depth - clean_depth`, so recovery requires `clean = noisy - correction`
+
+### Documentation Updates
+- Added "Practical Usage" section to README with workflow position
+- Added "Documentation" section with links to HOW_IT_WORKS.md and TRAINING_PLAN.md
+- Expanded "Current State" in TRAINING_PLAN.md with milestone table
+- Added "Training Terminology" section clarifying epochs vs iterations vs surveys
+- Added "Ground Truth Acquisition Options" and "Why Train on Diverse Data" sections
+- Added "Protecting Uncharted Features" section to HOW_IT_WORKS.md
+- Added "Processing Time" and "Operational Confidence Thresholds" sections
+- Fixed node feature description (was "roughness", now "local statistics, gradients, curvature")
+- Fixed edge feature description (was "slope direction", now "slope angle")
+- Clarified uncertainty scaling only applies to native processing scripts
+- Clarified feature class training is Phase 3 (planned), not currently active
+
 ## 2025-12-10 - Native VR BAG Support & Pipeline Fixes
 
 ### Major Features

@@ -4,10 +4,27 @@ Detailed plan for training a production-quality model for bathymetric noise dete
 
 ## Current State
 
-- Model trained on synthetic noise only
+**Where we are in development:**
+
+| Milestone | Status | Notes |
+|-----------|--------|-------|
+| Core architecture | ✓ Complete | GNN with 4 attention heads, 3-way classification |
+| SR BAG support | ✓ Complete | Read/write single-resolution BAGs |
+| VR BAG support | ✓ Complete | Native processing preserves multi-resolution structure |
+| Synthetic noise training | ✓ Complete | Proof-of-concept, scripts validated |
+| Real data training | **In Progress** | Need clean/noisy survey pairs |
+| Production deployment | Pending | Awaiting real-data validation |
+
+**Current model performance** (trained on synthetic noise only):
 - 50 epochs, 5 clean VR BAGs, 100 tiles
 - Accuracy on synthetic data: 63.2%
-- Real-world performance: Unknown (100% classified as noise, but 73.5% mean confidence with native VR processing)
+- Real-world performance: Unknown (needs real data validation)
+
+**What "trained on synthetic noise only" means:**
+
+The current model was trained using artificially generated noise (gaussian, spikes, blobs, systematic patterns) added to clean surveys. This was primarily to validate that the code works end-to-end - the scripts run, process SR and VR BAGs correctly, and don't flatten the seafloor like the previous CAE approach did.
+
+**Next step:** Train on real clean/noisy survey pairs to learn actual noise patterns.
 
 ## Training Terminology
 
@@ -1145,6 +1162,40 @@ python scripts/evaluate_model.py ^
 
 **Duration:** Ongoing  
 **Goal:** Continuous improvement from deployment feedback
+
+### How Continuous Learning Works
+
+The model improves over time by incorporating corrections from production use:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CONTINUOUS LEARNING CYCLE                                      │
+│                                                                 │
+│  1. Run inference on new survey                                 │
+│     ↓                                                           │
+│  2. Hydrographer reviews flagged regions                        │
+│     ↓                                                           │
+│  3. Hydrographer makes corrections (if needed)                  │
+│     ↓                                                           │
+│  4. Save corrected survey as new "clean" ground truth           │
+│     ↓                                                           │
+│  5. Pair with original "noisy" survey                           │
+│     ↓                                                           │
+│  6. Add pair to training data (batch periodically)              │
+│     ↓                                                           │
+│  7. Retrain model with expanded dataset                         │
+│     ↓                                                           │
+│  8. Deploy updated model → better predictions next time         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key points:**
+
+- Retraining is periodic (e.g., after accumulating 5-10 new survey pairs), not after every correction
+- New pairs are added to existing training data, not replacing it
+- The model retains what it learned before while learning from new examples
+- Scenarios the model struggled with become training data, directly addressing weaknesses
 
 ### Step 5.1: Export Low-Confidence Regions for Review
 

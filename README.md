@@ -23,6 +23,11 @@ Point Cloud → Surface Generation → GNN Noise Detection → Human Review → 
 
 The tool does NOT replace human review - it focuses attention on areas that need it.
 
+## Documentation
+
+- [Training Plan](docs/TRAINING_PLAN.md) - Detailed training phases, ground truth acquisition, and timeline
+- [How It Works](docs/HOW_IT_WORKS.md) - Technical deep-dive on GNN architecture and attention mechanisms
+
 ## Core Concept
 
 ```
@@ -112,7 +117,7 @@ These patterns are designed to mimic real acoustic artifacts while providing gro
 
 ### Uncertainty Scaling
 
-When the model corrects a depth, it adjusts the uncertainty to reflect the AI intervention:
+When using native processing (`inference_native.py` or `inference_vr_native.py`), corrected depths have their uncertainty scaled to reflect AI intervention:
 
 ```
 scale = 2.0 - confidence
@@ -126,6 +131,8 @@ new_uncertainty = original_uncertainty × scale
 | 0.5 (low) | 1.5 | Larger increase |
 
 **Rationale**: This provides traceability - downstream users can identify where AI modified the data and how confident the model was in those changes. The scaling factors can be adjusted based on operational risk tolerance.
+
+**Note**: Resampled processing (`inference.py`) currently preserves original uncertainty without scaling.
 
 ## Installation
 

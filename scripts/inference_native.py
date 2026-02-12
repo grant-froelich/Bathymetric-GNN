@@ -355,7 +355,7 @@ def main():
             apply_mask = noise_mask & high_conf
             
             if np.any(apply_mask):
-                corrected_depth[apply_mask] += correction[apply_mask]
+                corrected_depth[apply_mask] -= correction[apply_mask]
                 stats['cells_corrected'] += int(np.sum(apply_mask))
                 
                 # Scale uncertainty by confidence
