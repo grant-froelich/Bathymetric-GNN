@@ -13,7 +13,7 @@ This tool fits into the hydrographic workflow as a QC aid, similar to Flier Find
 | Use Case | When | Who |
 |----------|------|-----|
 | Field QC | After surface generation, before submission | Field hydrographers |
-| Office QC | Reviewing submitted ESD | Branch processors |
+| Office QC | Reviewing submitted surveys | Branch processors |
 | Batch processing | Screening multiple surveys | QC leads |
 
 **Workflow position:**
