@@ -3,6 +3,7 @@ Training utilities for bathymetric GNN.
 
 Includes:
 - Dataset creation from clean surveys + synthetic noise
+- Dataset creation from ground truth files (real noise)
 - Training loop with validation
 - Checkpoint management
 - Logging and metrics tracking
@@ -28,6 +29,12 @@ try:
 except ImportError:
     TORCH_GEOMETRIC_AVAILABLE = False
 
+try:
+    from osgeo import gdal
+    GDAL_AVAILABLE = True
+except ImportError:
+    GDAL_AVAILABLE = False
+
 from config import Config
 from data import (
     BathymetricLoader,
@@ -40,6 +47,175 @@ from models.gnn import BathymetricGNN
 from .losses import BathymetricGNNLoss, compute_class_weights
 
 logger = logging.getLogger(__name__)
+
+
+class GroundTruthDataset(Dataset):
+    """
+    Dataset that loads training samples from prepared ground truth files.
+    
+    Ground truth files are GeoTIFFs with 4 bands:
+    - Band 1: Labels (0=seafloor, 2=noise, -1=nodata)
+    - Band 2: Difference (noisy - clean = correction target)
+    - Band 3: Noisy depth
+    - Band 4: Clean depth
+    """
+    
+    def __init__(
+        self,
+        ground_truth_paths: List[Path],
+        graph_builder: GraphBuilder,
+        tile_size: int = 512,
+        overlap: int = 64,
+        min_valid_ratio: float = 0.1,
+    ):
+        """
+        Initialize dataset from ground truth files.
+        
+        Args:
+            ground_truth_paths: Paths to ground truth GeoTIFF files
+            graph_builder: GraphBuilder for creating graphs
+            tile_size: Size of tiles to extract
+            overlap: Overlap between tiles
+            min_valid_ratio: Minimum ratio of valid cells to include a tile
+        """
+        if not GDAL_AVAILABLE:
+            raise ImportError("GDAL is required for GroundTruthDataset")
+        
+        self.graph_builder = graph_builder
+        self.tile_size = tile_size
+        self.overlap = overlap
+        self.min_valid_ratio = min_valid_ratio
+        
+        # Load all ground truth files and extract tiles
+        self.tiles = []
+        
+        logger.info(f"Loading {len(ground_truth_paths)} ground truth files...")
+        
+        for gt_path in ground_truth_paths:
+            try:
+                self._load_ground_truth(gt_path)
+            except Exception as e:
+                logger.warning(f"Failed to load ground truth {gt_path}: {e}")
+        
+        logger.info(f"Dataset contains {len(self.tiles)} tiles from {len(ground_truth_paths)} ground truth files")
+    
+    def _load_ground_truth(self, path: Path):
+        """Load a ground truth file and extract tiles."""
+        ds = gdal.Open(str(path))
+        if ds is None:
+            raise IOError(f"Failed to open ground truth file: {path}")
+        
+        # Read bands
+        labels = ds.GetRasterBand(1).ReadAsArray().astype(np.int32)
+        difference = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
+        noisy_depth = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
+        clean_depth = ds.GetRasterBand(4).ReadAsArray().astype(np.float32)
+        
+        # Get resolution from geotransform
+        gt = ds.GetGeoTransform()
+        resolution = (abs(gt[1]), abs(gt[5]))
+        
+        ds = None
+        
+        height, width = labels.shape
+        stride = self.tile_size - self.overlap
+        
+        # Extract tiles
+        for row_start in range(0, height - self.tile_size + 1, stride):
+            for col_start in range(0, width - self.tile_size + 1, stride):
+                row_end = row_start + self.tile_size
+                col_end = col_start + self.tile_size
+                
+                # Extract tile data
+                tile_labels = labels[row_start:row_end, col_start:col_end]
+                tile_diff = difference[row_start:row_end, col_start:col_end]
+                tile_noisy = noisy_depth[row_start:row_end, col_start:col_end]
+                tile_clean = clean_depth[row_start:row_end, col_start:col_end]
+                
+                # Valid mask (labels != -1)
+                valid_mask = tile_labels >= 0
+                valid_ratio = np.sum(valid_mask) / valid_mask.size
+                
+                if valid_ratio >= self.min_valid_ratio:
+                    self.tiles.append({
+                        'labels': tile_labels.copy(),
+                        'difference': tile_diff.copy(),
+                        'noisy_depth': tile_noisy.copy(),
+                        'clean_depth': tile_clean.copy(),
+                        'valid_mask': valid_mask.copy(),
+                        'resolution': resolution,
+                        'source': path.stem,
+                    })
+        
+        # Handle edge tiles if there's remaining data
+        if height % stride != 0 or width % stride != 0:
+            # Bottom-right corner tile
+            if height > self.tile_size and width > self.tile_size:
+                row_start = height - self.tile_size
+                col_start = width - self.tile_size
+                
+                tile_labels = labels[row_start:, col_start:]
+                tile_diff = difference[row_start:, col_start:]
+                tile_noisy = noisy_depth[row_start:, col_start:]
+                tile_clean = clean_depth[row_start:, col_start:]
+                
+                valid_mask = tile_labels >= 0
+                valid_ratio = np.sum(valid_mask) / valid_mask.size
+                
+                if valid_ratio >= self.min_valid_ratio:
+                    self.tiles.append({
+                        'labels': tile_labels.copy(),
+                        'difference': tile_diff.copy(),
+                        'noisy_depth': tile_noisy.copy(),
+                        'clean_depth': tile_clean.copy(),
+                        'valid_mask': valid_mask.copy(),
+                        'resolution': resolution,
+                        'source': path.stem,
+                    })
+    
+    def __len__(self) -> int:
+        return len(self.tiles)
+    
+    def __getitem__(self, idx: int) -> Data:
+        """Get a single training sample."""
+        tile = self.tiles[idx]
+        
+        noisy_depth = tile['noisy_depth']
+        valid_mask = tile['valid_mask']
+        labels = tile['labels']
+        difference = tile['difference']
+        resolution = tile['resolution']
+        
+        # Build graph from noisy data
+        # Note: We don't have uncertainty from ground truth, so pass None
+        graph = self.graph_builder.build_graph(
+            depth=noisy_depth,
+            valid_mask=valid_mask,
+            uncertainty=None,
+            resolution=resolution,
+        )
+        
+        # Add labels to graph
+        if graph.num_nodes > 0:
+            rows = graph.valid_rows.numpy()
+            cols = graph.valid_cols.numpy()
+            
+            # Classification labels
+            graph.y = torch.tensor(labels[rows, cols], dtype=torch.long)
+            
+            # Correction targets (difference = noisy - clean, so correction to apply is -difference)
+            # Model predicts: correction = noisy - clean
+            # To recover clean: clean = noisy - correction
+            graph.correction_target = torch.tensor(difference[rows, cols], dtype=torch.float32)
+            
+            # Noise mask (where labels == 2)
+            graph.noise_mask = torch.tensor(labels[rows, cols] == 2, dtype=torch.bool)
+        else:
+            graph.y = torch.tensor([], dtype=torch.long)
+            graph.correction_target = torch.tensor([], dtype=torch.float32)
+            graph.noise_mask = torch.tensor([], dtype=torch.bool)
+        
+        return graph
 
 
 class BathymetricGraphDataset(Dataset):

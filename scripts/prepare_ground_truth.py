@@ -8,6 +8,8 @@ Generate ground truth labels from clean/noisy survey pairs.
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
+import torch  # Must import before data module on Windows
+
 import argparse
 import logging
 from pathlib import Path
@@ -28,11 +30,70 @@ CLASS_FEATURE = 1
 CLASS_NOISE = 2
 
 
-def load_survey(path: Path, vr_bag_mode: str = 'resampled') -> tuple:
-    """Load survey and return depth, uncertainty, geotransform, crs."""
+def load_survey(path: Path, vr_bag_mode: str = 'resampled'):
+    """Load survey and return full BathymetricGrid object."""
     loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
-    grid = loader.load(path)
-    return grid.depth, grid.uncertainty, grid.geotransform, grid.crs
+    return loader.load(path)
+
+
+def find_intersection(bounds1, bounds2):
+    """Find intersection of two bounding boxes.
+    
+    Bounds format: (min_x, min_y, max_x, max_y)
+    Returns: (min_x, min_y, max_x, max_y) or None if no intersection
+    """
+    min_x = max(bounds1[0], bounds2[0])
+    min_y = max(bounds1[1], bounds2[1])
+    max_x = min(bounds1[2], bounds2[2])
+    max_y = min(bounds1[3], bounds2[3])
+    
+    if min_x < max_x and min_y < max_y:
+        return (min_x, min_y, max_x, max_y)
+    return None
+
+
+def extract_region(grid, intersection):
+    """Extract a region from a grid based on geographic bounds.
+    
+    Args:
+        grid: BathymetricGrid object
+        intersection: (min_x, min_y, max_x, max_y)
+        
+    Returns:
+        Tuple of (depth_array, uncertainty_array, new_transform)
+    """
+    min_x, min_y, max_x, max_y = intersection
+    transform = grid.transform
+    res_x = abs(transform[1])
+    res_y = abs(transform[5])
+    origin_x = transform[0]
+    origin_y = transform[3]
+    
+    # Calculate pixel coordinates
+    col_start = int(round((min_x - origin_x) / res_x))
+    col_end = int(round((max_x - origin_x) / res_x))
+    row_start = int(round((origin_y - max_y) / res_y))
+    row_end = int(round((origin_y - min_y) / res_y))
+    
+    # Clamp to valid range
+    col_start = max(0, col_start)
+    col_end = min(grid.depth.shape[1], col_end)
+    row_start = max(0, row_start)
+    row_end = min(grid.depth.shape[0], row_end)
+    
+    # Extract arrays
+    depth = grid.depth[row_start:row_end, col_start:col_end]
+    uncertainty = None
+    if grid.uncertainty is not None:
+        uncertainty = grid.uncertainty[row_start:row_end, col_start:col_end]
+    
+    # New transform for the extracted region
+    new_origin_x = origin_x + col_start * res_x
+    new_origin_y = origin_y - row_start * res_y
+    new_transform = (new_origin_x, transform[1], transform[2], 
+                     new_origin_y, transform[4], transform[5])
+    
+    return depth, uncertainty, new_transform
 
 
 def compute_ground_truth(
@@ -45,6 +106,8 @@ def compute_ground_truth(
     """
     Compute ground truth labels from clean/noisy pair.
     
+    Handles surveys with different extents by finding the intersection.
+    
     Args:
         clean_path: Path to clean survey
         noisy_path: Path to noisy survey
@@ -53,18 +116,45 @@ def compute_ground_truth(
         vr_bag_mode: How to load VR BAGs
     """
     logger.info(f"Loading clean survey: {clean_path}")
-    clean_depth, clean_uncert, geotransform, crs = load_survey(clean_path, vr_bag_mode)
+    clean_grid = load_survey(clean_path, vr_bag_mode)
     
     logger.info(f"Loading noisy survey: {noisy_path}")
-    noisy_depth, noisy_uncert, _, _ = load_survey(noisy_path, vr_bag_mode)
+    noisy_grid = load_survey(noisy_path, vr_bag_mode)
     
-    # Validate shapes match
-    if clean_depth.shape != noisy_depth.shape:
+    # Check for geographic intersection
+    intersection = find_intersection(clean_grid.bounds, noisy_grid.bounds)
+    if intersection is None:
+        raise ValueError("Surveys do not overlap geographically")
+    
+    logger.info(f"Clean bounds: {clean_grid.bounds}")
+    logger.info(f"Noisy bounds: {noisy_grid.bounds}")
+    logger.info(f"Intersection: {intersection}")
+    
+    # Check resolution compatibility
+    clean_res = clean_grid.resolution
+    noisy_res = noisy_grid.resolution
+    if abs(clean_res[0] - noisy_res[0]) > 0.01 or abs(clean_res[1] - noisy_res[1]) > 0.01:
         raise ValueError(
-            f"Shape mismatch: clean {clean_depth.shape} vs noisy {noisy_depth.shape}"
+            f"Resolution mismatch: clean {clean_res} vs noisy {noisy_res}. "
+            "Surveys must have the same resolution."
         )
     
-    logger.info(f"Grid shape: {clean_depth.shape}")
+    # Extract overlapping regions
+    clean_depth, clean_uncert, transform = extract_region(clean_grid, intersection)
+    noisy_depth, noisy_uncert, _ = extract_region(noisy_grid, intersection)
+    crs = clean_grid.crs
+    
+    # Handle potential size mismatch due to rounding
+    min_rows = min(clean_depth.shape[0], noisy_depth.shape[0])
+    min_cols = min(clean_depth.shape[1], noisy_depth.shape[1])
+    clean_depth = clean_depth[:min_rows, :min_cols]
+    noisy_depth = noisy_depth[:min_rows, :min_cols]
+    if clean_uncert is not None:
+        clean_uncert = clean_uncert[:min_rows, :min_cols]
+    if noisy_uncert is not None:
+        noisy_uncert = noisy_uncert[:min_rows, :min_cols]
+    
+    logger.info(f"Aligned grid shape: {clean_depth.shape}")
     
     # Compute difference
     difference = noisy_depth - clean_depth
@@ -116,7 +206,7 @@ def compute_ground_truth(
         options=['COMPRESS=LZW', 'TILED=YES']
     )
     
-    ds.SetGeoTransform(geotransform)
+    ds.SetGeoTransform(transform)
     if crs:
         ds.SetProjection(crs)
     

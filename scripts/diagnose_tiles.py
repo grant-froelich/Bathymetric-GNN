@@ -9,12 +9,8 @@ import sys
 import argparse
 from pathlib import Path
 
-# Add project to path
-script_dir = Path(__file__).parent
-sys.path.insert(0, str(script_dir.parent / 'bathymetric-gnn' / 'bathymetric-gnn'))
-# Also try current directory structure
-sys.path.insert(0, str(script_dir / 'bathymetric-gnn' / 'bathymetric-gnn'))
-sys.path.insert(0, 'bathymetric-gnn/bathymetric-gnn')
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 from data import BathymetricLoader, TileManager

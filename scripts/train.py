@@ -30,7 +30,7 @@ from data import (
     SyntheticNoiseGenerator,
 )
 from models import BathymetricGNN
-from training import BathymetricGraphDataset, Trainer
+from training import BathymetricGraphDataset, GroundTruthDataset, Trainer
 
 
 def setup_logging(log_level: str = "INFO"):
@@ -54,8 +54,15 @@ def parse_args():
     parser.add_argument(
         "--clean-surveys",
         type=Path,
-        required=True,
-        help="Directory containing clean survey files for training",
+        required=False,
+        help="Directory containing clean survey files for training (used with synthetic noise)",
+    )
+    parser.add_argument(
+        "--ground-truth-dir",
+        type=Path,
+        default=None,
+        help="Directory containing ground truth GeoTIFF files (from prepare_ground_truth.py). "
+             "If provided, uses real noise instead of synthetic noise.",
     )
     parser.add_argument(
         "--val-surveys",
@@ -156,61 +163,115 @@ def main():
     # Save config
     config.save(args.output_dir / "config.yaml")
     
-    # Find training files
-    train_files = find_survey_files(args.clean_surveys)
-    if not train_files:
-        logger.error(f"No survey files found in {args.clean_surveys}")
-        sys.exit(1)
-    logger.info(f"Found {len(train_files)} training surveys")
-    
-    # Find validation files
-    val_files = []
-    if args.val_surveys:
-        val_files = find_survey_files(args.val_surveys)
-        logger.info(f"Found {len(val_files)} validation surveys")
-    
-    # Initialize components
-    tile_manager = TileManager(
-        tile_size=config.tile.tile_size,
-        overlap=config.tile.overlap,
-        min_valid_ratio=config.tile.min_valid_ratio,
-    )
-    
+    # Initialize graph builder (used for both modes)
     graph_builder = GraphBuilder(
         connectivity=config.graph.connectivity,
         edge_features=config.graph.edge_features,
     )
     
-    noise_generator = SyntheticNoiseGenerator(
-        enable_gaussian=config.noise.enable_gaussian,
-        enable_spikes=config.noise.enable_spikes,
-        enable_blobs=config.noise.enable_blobs,
-        enable_systematic=config.noise.enable_systematic,
-        seed=args.seed,
-    )
+    # Choose dataset mode based on arguments
+    if args.ground_truth_dir:
+        # Use real ground truth data
+        logger.info("Using GROUND TRUTH mode (real noise from clean/noisy pairs)")
+        
+        gt_files = list(args.ground_truth_dir.glob("*_ground_truth.tif"))
+        if not gt_files:
+            logger.error(f"No ground truth files found in {args.ground_truth_dir}")
+            sys.exit(1)
+        logger.info(f"Found {len(gt_files)} ground truth files")
+        
+        # Split into train/val if no separate val set provided
+        if args.val_surveys:
+            val_gt_files = list(args.val_surveys.glob("*_ground_truth.tif"))
+            train_gt_files = gt_files
+        elif len(gt_files) > 1:
+            # Use last file for validation
+            train_gt_files = gt_files[:-1]
+            val_gt_files = gt_files[-1:]
+            logger.info(f"Using {len(train_gt_files)} files for training, {len(val_gt_files)} for validation")
+        else:
+            train_gt_files = gt_files
+            val_gt_files = []
+        
+        # Create datasets
+        logger.info("Creating training dataset from ground truth...")
+        train_dataset = GroundTruthDataset(
+            ground_truth_paths=train_gt_files,
+            graph_builder=graph_builder,
+            tile_size=config.tile.tile_size,
+            overlap=config.tile.overlap,
+            min_valid_ratio=config.tile.min_valid_ratio,
+        )
+        
+        val_dataset = None
+        if val_gt_files:
+            logger.info("Creating validation dataset from ground truth...")
+            val_dataset = GroundTruthDataset(
+                ground_truth_paths=val_gt_files,
+                graph_builder=graph_builder,
+                tile_size=config.tile.tile_size,
+                overlap=config.tile.overlap,
+                min_valid_ratio=config.tile.min_valid_ratio,
+            )
     
-    # Create datasets
-    logger.info("Creating training dataset...")
-    train_dataset = BathymetricGraphDataset(
-        survey_paths=train_files,
-        tile_manager=tile_manager,
-        graph_builder=graph_builder,
-        noise_generator=noise_generator,
-        augment=True,
-        vr_bag_mode=args.vr_bag_mode,
-    )
-    
-    val_dataset = None
-    if val_files:
-        logger.info("Creating validation dataset...")
-        val_dataset = BathymetricGraphDataset(
-            survey_paths=val_files,
+    else:
+        # Use synthetic noise mode
+        if not args.clean_surveys:
+            logger.error("Either --ground-truth-dir or --clean-surveys must be provided")
+            sys.exit(1)
+        
+        logger.info("Using SYNTHETIC NOISE mode")
+        
+        # Find training files
+        train_files = find_survey_files(args.clean_surveys)
+        if not train_files:
+            logger.error(f"No survey files found in {args.clean_surveys}")
+            sys.exit(1)
+        logger.info(f"Found {len(train_files)} training surveys")
+        
+        # Find validation files
+        val_files = []
+        if args.val_surveys:
+            val_files = find_survey_files(args.val_surveys)
+            logger.info(f"Found {len(val_files)} validation surveys")
+        
+        # Initialize components for synthetic noise
+        tile_manager = TileManager(
+            tile_size=config.tile.tile_size,
+            overlap=config.tile.overlap,
+            min_valid_ratio=config.tile.min_valid_ratio,
+        )
+        
+        noise_generator = SyntheticNoiseGenerator(
+            enable_gaussian=config.noise.enable_gaussian,
+            enable_spikes=config.noise.enable_spikes,
+            enable_blobs=config.noise.enable_blobs,
+            enable_systematic=config.noise.enable_systematic,
+            seed=args.seed,
+        )
+        
+        # Create datasets
+        logger.info("Creating training dataset with synthetic noise...")
+        train_dataset = BathymetricGraphDataset(
+            survey_paths=train_files,
             tile_manager=tile_manager,
             graph_builder=graph_builder,
             noise_generator=noise_generator,
-            augment=False,  # No augmentation for validation
+            augment=True,
             vr_bag_mode=args.vr_bag_mode,
         )
+        
+        val_dataset = None
+        if val_files:
+            logger.info("Creating validation dataset...")
+            val_dataset = BathymetricGraphDataset(
+                survey_paths=val_files,
+                tile_manager=tile_manager,
+                graph_builder=graph_builder,
+                noise_generator=noise_generator,
+                augment=False,
+                vr_bag_mode=args.vr_bag_mode,
+            )
     
     # Determine input dimensions from first sample
     sample = train_dataset[0]

@@ -8,8 +8,12 @@
 - `inference_native.py` now handles BOTH VR and SR BAGs automatically
 - Added `detect_bag_type()` function to auto-detect BAG type
 - Added `SRBagHandler` and `SRBagWriter` classes for SR BAG native processing
-- Removed redundant `inference_native.py` script
 - Single script for all native BAG processing simplifies user workflow
+
+#### Auto-Detection in BathymetricLoader
+- `BathymetricLoader` now auto-detects SR vs VR BAGs before loading
+- SR BAGs are loaded directly, ignoring `--vr-bag-mode` setting
+- Eliminates "No supergrids available" errors when loading SR BAGs with default settings
 
 ### Bug Fixes
 
@@ -18,6 +22,10 @@
 - **Bug**: Script was using `+= correction` which would double noise instead of removing it
 - **Fix**: Changed to `-= correction` to match `models/pipeline.py` behavior
 - The model predicts `correction = noisy_depth - clean_depth`, so recovery requires `clean = noisy - correction`
+
+#### SR BAG Metadata Parsing
+- Fixed `SRBagHandler` failing on SR BAGs with array-based metadata
+- Metadata stored as numpy array of bytes now correctly converted via `tobytes()`
 
 ### Documentation Updates
 - Simplified "Architecture" section in README to plain language "How It Works"

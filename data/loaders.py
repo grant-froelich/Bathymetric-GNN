@@ -29,6 +29,12 @@ try:
 except ImportError:
     H5PY_AVAILABLE = False
 
+# Import BAG type detection (lazy import to avoid circular dependency)
+def _detect_bag_type(path):
+    """Wrapper to import and call detect_bag_type."""
+    from .vr_bag import detect_bag_type
+    return detect_bag_type(path)
+
 logger = logging.getLogger(__name__)
 
 
@@ -147,7 +153,19 @@ class BathymetricLoader:
         """Load ONSWG BAG format file (supports both SR and VR BAGs)."""
         logger.info(f"Loading BAG file: {path}")
         
-        # For resampled mode, use GDAL's built-in VR support directly
+        # Auto-detect BAG type
+        bag_type = _detect_bag_type(path)
+        logger.info(f"Detected BAG type: {bag_type}")
+        
+        # For SR BAGs, always load directly (ignore vr_bag_mode)
+        if bag_type == 'SR':
+            logger.info("Loading SR BAG directly")
+            ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+            if ds is None:
+                raise IOError(f"Failed to open BAG file: {path}")
+            return self._load_sr_bag(path, ds)
+        
+        # For VR BAGs, use the specified mode
         if self.vr_bag_mode == 'resampled':
             return self._load_vr_bag_resampled(path, vr_target_resolution)
         

@@ -351,7 +351,9 @@ class SRBagHandler:
             
             # Get resolution from metadata
             metadata = root['metadata'][()]
-            if isinstance(metadata, bytes):
+            if hasattr(metadata, 'tobytes'):
+                metadata = metadata.tobytes().decode('utf-8')
+            elif isinstance(metadata, bytes):
                 metadata = metadata.decode('utf-8')
             
             # Parse resolution from XML metadata

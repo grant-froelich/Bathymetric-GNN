@@ -8,6 +8,7 @@ from .losses import (
 )
 from .trainer import (
     BathymetricGraphDataset,
+    GroundTruthDataset,
     Trainer,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "compute_class_weights",
     # Training
     "BathymetricGraphDataset",
+    "GroundTruthDataset",
     "Trainer",
 ]
