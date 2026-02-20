@@ -1,267 +1,307 @@
-# Bathymetric GNN
-
-Context-aware bathymetric data denoising using Graph Neural Networks.
-
-## Overview
-
-This system addresses the challenge of distinguishing acoustic noise from real seafloor features in bathymetric data. Unlike traditional approaches that treat each point independently, this GNN-based approach leverages spatial context to make better decisions - particularly in dynamic seafloor environments where noise and features are difficult to distinguish locally.
-
-## Practical Usage
-
-This tool fits into the hydrographic workflow as a QC aid, similar to Flier Finder:
-
-| Use Case | When | Who |
-|----------|------|-----|
-| Field QC | After surface generation, before submission | Field hydrographers |
-| Office QC | Reviewing submitted ESD | Branch processors |
-| Batch processing | Screening multiple surveys | QC leads |
-
-**Workflow position:**
-```
-Point Cloud → Surface Generation → GNN Noise Detection → Human Review → Final Product
-```
-
-The tool does NOT replace human review - it focuses attention on areas that need it.
-
-## Documentation
-
-- [Training Plan](docs/TRAINING_PLAN.md) - Detailed training phases, ground truth acquisition, and timeline
-- [How It Works](docs/HOW_IT_WORKS.md) - Technical deep-dive on GNN architecture and attention mechanisms
-
-## Core Concept
-
-```
-Local ambiguity + Spatial context = Better classification
-
-- A spike on flat seafloor → almost certainly noise
-- A spike in a rocky area connected to other spikes → probably a real feature
-- An isolated spike breaking ridge continuity → probably noise
-```
-
-## How It Works
-
-The tool examines each depth point and its neighbors to decide if it's real or noise:
-
-1. **Look at each point**: Gather local info (depth, slope, roughness, uncertainty)
-2. **Look at neighbors**: Build connections to surrounding points
-3. **Share information**: Each point "asks" its neighbors what they look like
-4. **Make a decision**: Classify as seafloor, feature, or noise with a confidence score
-5. **Apply selectively**: Only correct high-confidence noise; flag uncertain areas for human review
-
-The key advantage over simple filters: the model considers spatial context, not just local statistics.
-
-### Classification Categories
-
-The model classifies each depth point into one of three categories. The model learns from ALL classes during training:
-
-| Class | Value | Meaning | Training Role |
-|-------|-------|---------|---------------|
-| Seafloor | 0 | Consistent with neighbors, true bottom | Learn what "normal" looks like |
-| Feature | 1 | Different from neighbors BUT real (wreck, rock, etc.) | Learn to preserve real objects |
-| Noise | 2 | Inconsistent with context, likely artifact | Learn what noise looks like |
-
-**Important**: All three classes contribute to training. The model needs to see examples of clean seafloor (0), real features (1), and actual noise (2) to learn the differences between them.
-
-### How ENC Features Help
-
-ENC feature extraction (`scripts/extract_s57_features.py`) serves two purposes:
-
-1. **Preservation**: Known charted features (wrecks, rocks, obstructions) are labeled as class 1, protecting them from being flagged as noise even if they appear as isolated spikes.
-
-2. **Training**: The model learns what real features look like vs. noise by seeing examples where we KNOW the spike is real. This helps it recognize similar patterns in areas without ENC coverage.
-
-**Current status**: The ENC feature extraction pipeline is implemented but not yet integrated into training. See Phase 3 in TRAINING_PLAN.md.
-
-## Key Features
-
-### Variable Resolution (VR) BAG Support
-
-Native VR BAG processing preserves multi-resolution structure:
-- Processes each refinement grid (3x3 to 50x50 cells) individually
-- Maintains original VR BAG format in output
-- Generates sidecar GeoTIFF with classification/confidence layers
-- Much higher confidence scores than resampled approach
-
-### Tile-Based Processing
-
-Full surveys (e.g., 60,000 x 60,000 at 0.5m resolution) are too large for memory. 
-The system processes overlapping tiles and stitches results.
-
-### Training Strategy
-
-Training requires clean/noisy survey pairs where we know what the correct answer is:
-
-1. **Primary**: Real noisy/clean survey pairs from field units or archives
-2. **Supplemental**: Human reviewer corrections fed back as new training data
-
-**Real data pairs are preferred.** Synthetic noise injection was used for initial script testing but is not recommended for production training since it doesn't capture the full complexity of real acoustic artifacts.
-
-See TRAINING_PLAN.md for detailed instructions on preparing ground truth data.
-
-### Output Products
-
-- Cleaned depth grid (same format as input)
-- Classification map (noise/feature/seafloor per point)
-- Confidence map (0-1 per point)
-- Correction map (suggested depth adjustments)
-- Valid data mask
-
-### Uncertainty Scaling
-
-When using native processing (`inference_native.py` or `inference_native.py`), corrected depths have their uncertainty scaled to reflect AI intervention:
-
-```
-scale = 2.0 - confidence
-new_uncertainty = original_uncertainty × scale
-```
-
-| Confidence | Scale Factor | Effect |
-|------------|--------------|--------|
-| 0.9 (high) | 1.1 | Small uncertainty increase |
-| 0.7 | 1.3 | Moderate increase |
-| 0.5 (low) | 1.5 | Larger increase |
-
-**Rationale**: This provides traceability - downstream users can identify where AI modified the data and how confident the model was in those changes. The scaling factors can be adjusted based on operational risk tolerance.
-
-**Note**: Resampled processing (`inference.py`) currently preserves original uncertainty without scaling.
-
-## Installation
-
-```bash
-# Create conda environment
-conda env create -f environment.yml
-conda activate bathymetric-gnn
-
-# Verify installation
-python -c "import torch; import torch_geometric; print('Ready')"
-```
-
-### Windows with GDAL HDF5 Support
-
-```bash
-conda activate bathymetric-gnn
-conda install -c conda-forge gdal libgdal-hdf5
-```
-
-## Project Structure
-
-```
-bathymetric-gnn/
-├── config/
-│   └── config.py                  # Configuration dataclass
-├── data/
-│   ├── loaders.py                 # BAG/GeoTIFF loading via GDAL
-│   ├── graph_construction.py      # Build graphs from grids
-│   ├── synthetic_noise.py         # Generate training data
-│   ├── tiling.py                  # Tile management for large grids
-│   └── vr_bag.py                  # Native VR BAG handler
-├── models/
-│   ├── gnn.py                     # Graph neural network
-│   └── pipeline.py                # Full inference pipeline
-├── training/
-│   ├── trainer.py                 # Training loop
-│   └── losses.py                  # Loss functions
-└── scripts/
-    ├── train.py                   # Training entry point
-    ├── inference.py               # Inference (resampled mode)
-    ├── inference_native.py     # Native BAG inference (VR and SR)
-    ├── diagnose_tiles.py          # Tile validity diagnostics
-    └── explore_vr_bag.py          # VR BAG structure explorer
-```
-
-## Usage
-
-### Training
-
-```bash
-python scripts/train.py \
-    --clean-surveys /path/to/clean/surveys \
-    --output-dir /path/to/model/output \
-    --epochs 100 \
-    --vr-bag-mode resampled
-```
-
-### Inference (Single Resolution or Resampled VR)
-
-```bash
-python scripts/inference.py \
-    --input /path/to/survey.bag \
-    --model /path/to/model.pt \
-    --output /path/to/output.tif \
-    --vr-bag-mode resampled \
-    --min-valid-ratio 0.01
-```
-
-### Native BAG Inference (Recommended)
-
-Handles both VR and SR BAGs automatically, preserving original structure:
-
-```bash
-python scripts/inference_native.py \
-    --input /path/to/survey.bag \
-    --model /path/to/model.pt \
-    --output /path/to/output.bag \
-    --min-valid-ratio 0.01
-```
-
-The script auto-detects whether the input is VR or SR and processes appropriately:
-- **VR BAGs**: Iterates through refinement grids, preserves multi-resolution structure
-- **SR BAGs**: Processes the full elevation grid directly
-
-Output:
-- `output.bag` - BAG with corrections applied (same type as input)
-- `output_gnn_outputs.tif` - Sidecar GeoTIFF with classification/confidence
-
-### Diagnostic Tools
-
-```bash
-# Check tile validity and coverage
-python scripts/diagnose_tiles.py \
-    --survey /path/to/survey.bag \
-    --vr-bag-mode resampled
-
-# Explore VR BAG HDF5 structure
-python scripts/explore_vr_bag.py \
-    --survey /path/to/vr_survey.bag
-```
-
-## Data Format Support
-
-- **Input**: ONSWG BAG (SR and VR), GeoTIFF, ASC (via GDAL)
-- **Output**: 
-  - BAG: Copy-and-modify for SR, new SR for resampled VR
-  - GeoTIFF: Multi-band with depth, uncertainty, classification, confidence, correction, valid_mask
-  - Native VR: Preserved VR structure + sidecar GeoTIFF
-
-### Why BAG Files?
-
-**Current implementation uses BAG files because:**
-- Open format with well-documented HDF5 structure
-- Easy to read/write with standard GDAL/Python tools
-- Available for both field units and archives
-
-**Future expansion to CSAR working formats is planned to enable:**
-- Pushing edits back to point cloud
-- Integration with standard CARIS workflows
-- Better traceability of changes
-
-## Hardware Requirements
-
-- **Minimum**: 16 GB RAM, NVIDIA GPU with 8 GB VRAM
-- **Recommended**: 32 GB RAM, NVIDIA GPU with 16+ GB VRAM
-- **CPU-only**: Supported but significantly slower
-- **RTX 50 Series (Blackwell)**: Auto-detected and falls back to CPU until PyTorch adds support
-
-## Known Issues
-
-- RTX 50 series GPUs (sm_120) not yet supported by PyTorch; auto-falls back to CPU
-- VR BAG output from resampled input creates SR BAG (cannot recreate VR structure)
-- Full BAG XML metadata not preserved when creating new BAGs
-
-## License
-
-[TBD]
-
-## Citation
-
-[TBD]
+"""
+Loss functions for bathymetric GNN training.
+
+Includes:
+- Classification loss (noise vs feature vs seafloor)
+- Correction loss (predicted vs actual depth correction)
+- Confidence calibration loss
+- Combined multi-task loss
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Optional
+
+
+class ClassificationLoss(nn.Module):
+    """
+    Weighted cross-entropy loss for node classification.
+    
+    Handles class imbalance (typically more seafloor than noise/features).
+    """
+    
+    def __init__(
+        self,
+        class_weights: Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.0,
+    ):
+        super().__init__()
+        self.class_weights = class_weights
+        self.label_smoothing = label_smoothing
+    
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute classification loss.
+        
+        Args:
+            logits: [num_nodes, num_classes]
+            targets: [num_nodes] class labels
+            
+        Returns:
+            Scalar loss
+        """
+        return F.cross_entropy(
+            logits,
+            targets,
+            weight=self.class_weights,
+            label_smoothing=self.label_smoothing,
+        )
+
+
+class CorrectionLoss(nn.Module):
+    """
+    Loss for depth correction prediction.
+    
+    Uses Huber loss for robustness to outliers.
+    """
+    
+    def __init__(self, delta: float = 1.0):
+        super().__init__()
+        self.delta = delta
+    
+    def forward(
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute correction loss.
+        
+        Args:
+            predicted: [num_nodes] predicted corrections
+            target: [num_nodes] true corrections (noisy - clean)
+            mask: Optional [num_nodes] mask for which nodes to include
+            
+        Returns:
+            Scalar loss
+        """
+        if mask is not None:
+            predicted = predicted[mask]
+            target = target[mask]
+        
+        if len(predicted) == 0:
+            return torch.tensor(0.0, device=predicted.device)
+        
+        return F.huber_loss(predicted, target, delta=self.delta)
+
+
+class ConfidenceCalibrationLoss(nn.Module):
+    """
+    Loss to calibrate confidence predictions.
+    
+    Encourages the model to output high confidence when correct
+    and low confidence when wrong.
+    """
+    
+    def __init__(self):
+        super().__init__()
+    
+    def forward(
+        self,
+        confidence: torch.Tensor,
+        predicted_class: torch.Tensor,
+        true_class: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute confidence calibration loss.
+        
+        Args:
+            confidence: [num_nodes] predicted confidence (0-1)
+            predicted_class: [num_nodes] predicted class labels
+            true_class: [num_nodes] true class labels
+            
+        Returns:
+            Scalar loss
+        """
+        # Correctness indicator
+        correct = (predicted_class == true_class).float()
+        
+        # We want confidence to match correctness
+        # High confidence when correct, low when wrong
+        return F.binary_cross_entropy(confidence, correct)
+
+
+class FeaturePreservationLoss(nn.Module):
+    """
+    Loss to encourage preservation of real features.
+    
+    Penalizes classifying real features as noise more heavily
+    than the reverse error.
+    """
+    
+    def __init__(self, feature_class: int = 1, noise_class: int = 2, penalty_weight: float = 2.0):
+        super().__init__()
+        self.feature_class = feature_class
+        self.noise_class = noise_class
+        self.penalty_weight = penalty_weight
+    
+    def forward(
+        self,
+        predicted_class: torch.Tensor,
+        true_class: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute feature preservation penalty.
+        
+        Args:
+            predicted_class: [num_nodes] predicted class labels
+            true_class: [num_nodes] true class labels
+            
+        Returns:
+            Scalar loss
+        """
+        # Identify cases where real features were classified as noise
+        is_real_feature = true_class == self.feature_class
+        predicted_as_noise = predicted_class == self.noise_class
+        
+        false_noise = (is_real_feature & predicted_as_noise).float()
+        
+        # Return weighted penalty
+        return self.penalty_weight * false_noise.mean()
+
+
+class BathymetricGNNLoss(nn.Module):
+    """
+    Combined multi-task loss for bathymetric GNN training.
+    
+    Combines:
+    - Classification loss
+    - Correction loss (optional)
+    - Confidence calibration loss
+    - Feature preservation penalty
+    """
+    
+    def __init__(
+        self,
+        class_weights: Optional[torch.Tensor] = None,
+        classification_weight: float = 1.0,
+        correction_weight: float = 0.5,
+        confidence_weight: float = 0.2,
+        feature_preservation_weight: float = 0.3,
+        label_smoothing: float = 0.0,
+    ):
+        """
+        Initialize combined loss.
+        
+        Args:
+            class_weights: Weights for each class in classification loss
+            classification_weight: Weight for classification loss
+            correction_weight: Weight for correction loss
+            confidence_weight: Weight for confidence calibration loss
+            feature_preservation_weight: Weight for feature preservation penalty
+            label_smoothing: Label smoothing for classification
+        """
+        super().__init__()
+        
+        self.classification_loss = ClassificationLoss(
+            class_weights=class_weights,
+            label_smoothing=label_smoothing,
+        )
+        self.correction_loss = CorrectionLoss()
+        self.confidence_loss = ConfidenceCalibrationLoss()
+        self.feature_preservation_loss = FeaturePreservationLoss()
+        
+        self.classification_weight = classification_weight
+        self.correction_weight = correction_weight
+        self.confidence_weight = confidence_weight
+        self.feature_preservation_weight = feature_preservation_weight
+    
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute combined loss.
+        
+        Args:
+            outputs: Model outputs dictionary containing:
+                - class_logits: [num_nodes, num_classes]
+                - predicted_class: [num_nodes]
+                - confidence: [num_nodes]
+                - correction: [num_nodes] (optional)
+            targets: Target values dictionary containing:
+                - class_labels: [num_nodes]
+                - correction_targets: [num_nodes] (optional)
+                - noise_mask: [num_nodes] (optional)
+                
+        Returns:
+            Dictionary with individual losses and total loss
+        """
+        losses = {}
+        
+        # Classification loss
+        class_loss = self.classification_loss(
+            outputs['class_logits'],
+            targets['class_labels'],
+        )
+        losses['classification'] = class_loss
+        
+        # Correction loss (only for noise points if mask provided)
+        if 'correction' in outputs and 'correction_targets' in targets:
+            noise_mask = targets.get('noise_mask', None)
+            corr_loss = self.correction_loss(
+                outputs['correction'],
+                targets['correction_targets'],
+                mask=noise_mask,
+            )
+            losses['correction'] = corr_loss
+        else:
+            losses['correction'] = torch.tensor(0.0, device=class_loss.device)
+        
+        # Confidence calibration loss
+        conf_loss = self.confidence_loss(
+            outputs['confidence'],
+            outputs['predicted_class'],
+            targets['class_labels'],
+        )
+        losses['confidence'] = conf_loss
+        
+        # Feature preservation penalty
+        feat_loss = self.feature_preservation_loss(
+            outputs['predicted_class'],
+            targets['class_labels'],
+        )
+        losses['feature_preservation'] = feat_loss
+        
+        # Total weighted loss
+        total = (
+            self.classification_weight * losses['classification'] +
+            self.correction_weight * losses['correction'] +
+            self.confidence_weight * losses['confidence'] +
+            self.feature_preservation_weight * losses['feature_preservation']
+        )
+        losses['total'] = total
+        
+        return losses
+
+
+def compute_class_weights(
+    labels: torch.Tensor,
+    num_classes: int = 3,
+    smoothing: float = 0.1,
+) -> torch.Tensor:
+    """
+    Compute inverse frequency class weights.
+    
+    Args:
+        labels: [N] tensor of class labels
+        num_classes: Number of classes
+        smoothing: Smoothing factor to prevent extreme weights
+        
+    Returns:
+        [num_classes] tensor of weights
+    """
+    counts = torch.bincount(labels, minlength=num_classes).float()
+    counts = counts + smoothing * counts.sum()  # Add smoothing
+    
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * num_classes  # Normalize
+    
+    return weights
