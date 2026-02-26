@@ -132,7 +132,7 @@ class GraphBuilder:
         
         # Compute node features
         node_features = self._compute_node_features(
-            depth, valid_rows, valid_cols, uncertainty
+            depth, valid_rows, valid_cols, uncertainty, valid_mask
         )
         
         # Compute edge features
@@ -214,17 +214,37 @@ class GraphBuilder:
         valid_rows: np.ndarray,
         valid_cols: np.ndarray,
         uncertainty: Optional[np.ndarray] = None,
+        valid_mask: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
-        """Compute features for each node."""
+        """Compute features for each node using boundary-aware operations.
+        
+        All local statistics (mean, std, gradient, curvature) are computed
+        using only valid neighbors. This prevents nodata values (1e6, NaN)
+        from contaminating features near survey boundaries, which would
+        otherwise create artificial signals the model mistakes for noise.
+        """
         num_nodes = len(valid_rows)
         features = []
         
-        # Precompute derived arrays
-        local_mean = ndimage.uniform_filter(depth, size=5, mode='nearest')
-        local_std = self._local_std(depth, size=5)
-        grad_y, grad_x = np.gradient(depth)
+        # Build valid mask if not provided
+        if valid_mask is None:
+            valid_mask = np.isfinite(depth) & (np.abs(depth) < 1.0e5)
+        
+        # Precompute boundary-aware local statistics
+        local_mean, local_std, valid_count = self._masked_local_stats(
+            depth, valid_mask, size=5
+        )
+        
+        # Fill invalid cells with local mean before computing gradient/curvature.
+        # This prevents nodata values from creating false gradients at boundaries.
+        # A cell at the survey edge will see gradients relative to the local
+        # surface trend rather than a spike to nodata.
+        depth_filled = np.where(valid_mask, depth, local_mean)
+        depth_filled = np.nan_to_num(depth_filled, nan=0.0)
+        
+        grad_y, grad_x = np.gradient(depth_filled)
         grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-        curvature = self._compute_curvature(depth)
+        curvature = self._compute_curvature(depth_filled)
         
         for feature_name in self.node_features:
             if feature_name == "depth":
@@ -309,8 +329,69 @@ class GraphBuilder:
         
         return torch.tensor(feature_matrix, dtype=torch.float32)
     
+    def _masked_local_stats(
+        self,
+        depth: np.ndarray,
+        valid_mask: np.ndarray,
+        size: int = 5,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute local mean and std using only valid neighbors.
+        
+        Uses a counting approach: sum valid values in each window and divide
+        by the count of valid cells rather than the full kernel area. This
+        prevents nodata cells from contaminating statistics near boundaries.
+        
+        Args:
+            depth: 2D depth array (may contain nodata values)
+            valid_mask: Boolean mask of valid cells
+            size: Window size for local statistics
+            
+        Returns:
+            Tuple of (local_mean, local_std, valid_count) arrays
+        """
+        # Zero out invalid cells so they don't contribute to sums
+        depth_masked = np.where(valid_mask, depth, 0.0).astype(np.float64)
+        valid_float = valid_mask.astype(np.float64)
+        
+        kernel_area = float(size * size)
+        
+        # uniform_filter computes the mean over the window, so multiply by
+        # kernel_area to recover the sum. Use mode='constant', cval=0 so
+        # cells outside the array boundary contribute nothing (not 'nearest'
+        # which would replicate edge values).
+        sum_vals = ndimage.uniform_filter(
+            depth_masked, size=size, mode='constant', cval=0.0
+        ) * kernel_area
+        
+        count = ndimage.uniform_filter(
+            valid_float, size=size, mode='constant', cval=0.0
+        ) * kernel_area
+        
+        # Avoid division by zero where no valid neighbors exist
+        safe_count = np.maximum(count, 1.0)
+        
+        local_mean = (sum_vals / safe_count).astype(np.float32)
+        
+        # Masked standard deviation: E[x^2] - E[x]^2
+        depth_sq_masked = np.where(valid_mask, depth.astype(np.float64)**2, 0.0)
+        sum_sq = ndimage.uniform_filter(
+            depth_sq_masked, size=size, mode='constant', cval=0.0
+        ) * kernel_area
+        
+        mean_sq = sum_sq / safe_count
+        variance = mean_sq - (sum_vals / safe_count)**2
+        variance = np.maximum(variance, 0.0)  # Numerical stability
+        local_std = np.sqrt(variance).astype(np.float32)
+        
+        return local_mean, local_std, count.astype(np.float32)
+    
     def _local_std(self, arr: np.ndarray, size: int = 5) -> np.ndarray:
-        """Compute local standard deviation using uniform filter."""
+        """Compute local standard deviation using uniform filter.
+        
+        Note: This legacy method does NOT handle boundaries correctly.
+        Use _masked_local_stats instead for boundary-aware computation.
+        Kept for backward compatibility with any external callers.
+        """
         arr_sq = ndimage.uniform_filter(arr**2, size=size, mode='nearest')
         arr_mean = ndimage.uniform_filter(arr, size=size, mode='nearest')
         variance = arr_sq - arr_mean**2
