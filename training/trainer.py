@@ -52,6 +52,12 @@ logger = logging.getLogger(__name__)
 # in perfectly flat areas. 0.01m is well below any real bathymetric variability.
 CORRECTION_NORM_FLOOR = 0.01
 
+# Maximum allowed normalized correction magnitude (in local_std units).
+# Corrections beyond this are clamped to prevent extreme outliers from
+# dominating training. 50 std devs is well beyond any legitimate noise
+# pattern while still allowing the model to learn large corrections.
+CORRECTION_NORM_CAP = 50.0
+
 
 class GroundTruthDataset(Dataset):
     """
@@ -231,9 +237,11 @@ class GroundTruthDataset(Dataset):
             # perfectly flat areas.
             raw_corrections = difference[rows, cols]
             norm_scale = torch.clamp(graph.local_std, min=CORRECTION_NORM_FLOOR)
-            graph.correction_target = torch.tensor(
-                raw_corrections, dtype=torch.float32
-            ) / norm_scale
+            graph.correction_target = torch.clamp(
+                torch.tensor(raw_corrections, dtype=torch.float32) / norm_scale,
+                min=-CORRECTION_NORM_CAP,
+                max=CORRECTION_NORM_CAP,
+            )
             
             # Noise mask (where labels == 2)
             graph.noise_mask = torch.tensor(labels[rows, cols] == 2, dtype=torch.bool)
@@ -361,9 +369,11 @@ class BathymetricGraphDataset(Dataset):
             # Correction targets - local_std normalized (see GroundTruthDataset for details)
             raw_corrections = noise_result.noisy_depth[rows, cols] - clean_depth[rows, cols]
             norm_scale = torch.clamp(graph.local_std, min=CORRECTION_NORM_FLOOR)
-            graph.correction_target = torch.tensor(
-                raw_corrections, dtype=torch.float32
-            ) / norm_scale
+            graph.correction_target = torch.clamp(
+                torch.tensor(raw_corrections, dtype=torch.float32) / norm_scale,
+                min=-CORRECTION_NORM_CAP,
+                max=CORRECTION_NORM_CAP,
+            )
             
             # Noise mask for loss computation
             graph.noise_mask = torch.tensor(
@@ -573,8 +583,11 @@ class Trainer:
             # Compute correction delta from normalized distribution
             if all_normalized_corrections:
                 combined_norm = np.concatenate(all_normalized_corrections)
+                
+                # Compute delta from capped values since that's what the model sees
+                capped_norm = np.clip(combined_norm, -CORRECTION_NORM_CAP, CORRECTION_NORM_CAP)
                 correction_delta = compute_correction_delta(
-                    combined_norm, percentile=95.0, min_delta=1.0
+                    capped_norm, percentile=95.0, min_delta=1.0
                 )
                 
                 # Log both raw and normalized stats
@@ -591,6 +604,12 @@ class Trainer:
                     f"max |correction|={np.max(np.abs(combined_norm)):.3f}, "
                     f"95th percentile={np.percentile(np.abs(combined_norm), 95):.3f}"
                 )
+                num_capped = np.sum(np.abs(combined_norm) > CORRECTION_NORM_CAP)
+                if num_capped > 0:
+                    logger.info(
+                        f"Corrections capped to +/-{CORRECTION_NORM_CAP}: "
+                        f"{num_capped:,} cells ({100*num_capped/len(combined_norm):.2f}%)"
+                    )
             else:
                 correction_delta = 1.0
                 logger.warning("No noise corrections found, using default delta=1.0")
