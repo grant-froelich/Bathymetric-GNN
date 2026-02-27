@@ -5,6 +5,7 @@ from .losses import (
     ConfidenceCalibrationLoss,
     FeaturePreservationLoss,
     compute_class_weights,
+    compute_correction_delta,
 )
 from .trainer import (
     BathymetricGraphDataset,
@@ -20,6 +21,7 @@ __all__ = [
     "ConfidenceCalibrationLoss",
     "FeaturePreservationLoss",
     "compute_class_weights",
+    "compute_correction_delta",
     # Training
     "BathymetricGraphDataset",
     "GroundTruthDataset",

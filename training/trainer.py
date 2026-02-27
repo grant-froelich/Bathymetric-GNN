@@ -44,7 +44,7 @@ from data import (
     NoiseAugmentor,
 )
 from models.gnn import BathymetricGNN
-from .losses import BathymetricGNNLoss, compute_class_weights
+from .losses import BathymetricGNNLoss, compute_class_weights, compute_correction_delta
 
 logger = logging.getLogger(__name__)
 
@@ -455,17 +455,19 @@ class Trainer:
         else:
             self.scheduler = None
         
-        # Setup loss with class weights computed from training data
-        class_weights = self._compute_class_weights_from_dataset()
+        # Setup loss with class weights and correction delta computed from training data
+        class_weights, correction_delta = self._compute_training_stats()
         if class_weights is not None:
             class_weights = class_weights.to(self.device)
             logger.info(f"Class weights: {class_weights.tolist()}")
+        logger.info(f"Correction Huber delta: {correction_delta:.3f}")
         
         self.criterion = BathymetricGNNLoss(
             class_weights=class_weights,
             classification_weight=config.training.classification_weight,
             correction_weight=config.training.correction_weight,
             confidence_weight=config.training.confidence_weight,
+            correction_delta=correction_delta,
         )
         
         # Training state
@@ -475,29 +477,43 @@ class Trainer:
         
         logger.info(f"Trainer initialized, device: {self.device}")
     
-    def _compute_class_weights_from_dataset(self) -> Optional[torch.Tensor]:
+    def _compute_training_stats(self) -> Tuple[Optional[torch.Tensor], float]:
         """
-        Compute inverse-frequency class weights from training dataset labels.
+        Compute class weights and correction Huber delta from training dataset.
         
-        Scans all tiles in the training dataset to count per-class samples,
-        then returns weights that up-weight minority classes.
+        Scans all tiles in the training dataset to:
+        1. Count per-class samples for inverse-frequency class weights
+        2. Collect correction magnitudes for noise cells to set Huber delta
         
         Returns:
-            Tensor of shape [num_classes] with class weights, or None if labels unavailable.
+            Tuple of (class_weights tensor or None, correction_delta float)
         """
         num_classes = self.config.model.num_classes
         counts = torch.zeros(num_classes, dtype=torch.long)
+        all_noise_corrections = []
         
         try:
             dataset = self.train_dataset
             
-            # For GroundTruthDataset, we can read labels directly from tiles
+            # For GroundTruthDataset, read labels and corrections directly from tiles
             if hasattr(dataset, 'tiles'):
                 for tile in dataset.tiles:
                     labels = tile['labels']
+                    difference = tile['difference']
                     valid = labels >= 0
+                    
+                    # Count class distribution
                     for c in range(num_classes):
                         counts[c] += int(np.sum(labels[valid] == c))
+                    
+                    # Collect correction magnitudes for noise cells
+                    noise_mask = (labels == 2) & valid
+                    if np.any(noise_mask):
+                        noise_corrections = difference[noise_mask]
+                        # Filter out NaN/Inf
+                        noise_corrections = noise_corrections[np.isfinite(noise_corrections)]
+                        if len(noise_corrections) > 0:
+                            all_noise_corrections.append(noise_corrections)
             else:
                 # For BathymetricGraphDataset, sample a subset of the data
                 num_samples = min(len(dataset), 50)
@@ -506,25 +522,46 @@ class Trainer:
                     if hasattr(graph, 'y') and graph.y.numel() > 0:
                         for c in range(num_classes):
                             counts[c] += (graph.y == c).sum().item()
+                    if hasattr(graph, 'noise_mask') and hasattr(graph, 'correction_target'):
+                        if graph.noise_mask.any():
+                            corrections = graph.correction_target[graph.noise_mask].numpy()
+                            corrections = corrections[np.isfinite(corrections)]
+                            if len(corrections) > 0:
+                                all_noise_corrections.append(corrections)
             
-            if counts.sum() == 0:
+            # Compute class weights
+            class_weights = None
+            if counts.sum() > 0:
+                logger.info(f"Class distribution: {dict(enumerate(counts.tolist()))}")
+                class_weights = compute_class_weights(
+                    torch.arange(num_classes).repeat_interleave(counts.clamp(min=1)),
+                    num_classes=num_classes,
+                    smoothing=0.1,
+                )
+            else:
                 logger.warning("No valid labels found, skipping class weights")
-                return None
             
-            logger.info(f"Class distribution: {dict(enumerate(counts.tolist()))}")
+            # Compute correction delta
+            if all_noise_corrections:
+                combined = np.concatenate(all_noise_corrections)
+                correction_delta = compute_correction_delta(
+                    combined, percentile=95.0, min_delta=1.0
+                )
+                logger.info(
+                    f"Correction stats: {len(combined):,} noise cells, "
+                    f"mean |correction|={np.mean(np.abs(combined)):.3f}m, "
+                    f"max |correction|={np.max(np.abs(combined)):.3f}m, "
+                    f"95th percentile={np.percentile(np.abs(combined), 95):.3f}m"
+                )
+            else:
+                correction_delta = 1.0
+                logger.warning("No noise corrections found, using default delta=1.0")
             
-            # Compute inverse frequency weights with smoothing
-            weights = compute_class_weights(
-                torch.arange(num_classes).repeat_interleave(counts.clamp(min=1)),
-                num_classes=num_classes,
-                smoothing=0.1,
-            )
-            
-            return weights
+            return class_weights, correction_delta
             
         except Exception as e:
-            logger.warning(f"Failed to compute class weights: {e}")
-            return None
+            logger.warning(f"Failed to compute training stats: {e}")
+            return None, 1.0
     
     def train(self) -> Dict[str, List[float]]:
         """

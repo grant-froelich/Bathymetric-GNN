@@ -11,6 +11,7 @@ Includes:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, Optional
 
 
@@ -252,6 +253,7 @@ class BathymetricGNNLoss(nn.Module):
         feature_preservation_weight: float = 0.3,
         shoal_safety_weight: float = 0.5,
         label_smoothing: float = 0.0,
+        correction_delta: float = 1.0,
     ):
         """
         Initialize combined loss.
@@ -264,6 +266,12 @@ class BathymetricGNNLoss(nn.Module):
             feature_preservation_weight: Weight for feature preservation penalty
             shoal_safety_weight: Weight for shoal safety penalty
             label_smoothing: Label smoothing for classification
+            correction_delta: Huber loss delta for correction head. Controls
+                the transition point between quadratic (MSE-like) and linear
+                (MAE-like) loss. Errors below delta get proportional gradients;
+                errors above delta get constant gradients. Should be set to
+                cover the typical range of correction magnitudes in the
+                training data (e.g. 95th percentile of |corrections|).
         """
         super().__init__()
         
@@ -271,7 +279,7 @@ class BathymetricGNNLoss(nn.Module):
             class_weights=class_weights,
             label_smoothing=label_smoothing,
         )
-        self.correction_loss = CorrectionLoss()
+        self.correction_loss = CorrectionLoss(delta=correction_delta)
         self.confidence_loss = ConfidenceCalibrationLoss()
         self.feature_preservation_loss = FeaturePreservationLoss()
         self.shoal_safety_loss = ShoalSafetyLoss()
@@ -387,3 +395,66 @@ def compute_class_weights(
     weights = weights / weights.sum() * num_classes  # Normalize
     
     return weights
+
+
+def compute_correction_delta(
+    corrections: np.ndarray,
+    percentile: float = 95.0,
+    min_delta: float = 1.0,
+) -> float:
+    """
+    Compute Huber loss delta from the training data correction distribution.
+    
+    Sets delta to a percentile of the absolute correction magnitudes so that
+    the vast majority of corrections fall within the quadratic (proportional
+    gradient) regime of the Huber loss. Only the extreme tail beyond this
+    percentile gets capped gradients.
+    
+    This is Option 1 (data-derived, compute-once) of three approaches:
+    
+    Option 1 (CURRENT): Compute delta once from training data at startup.
+        Pros: Simple, deterministic, no risk of instability.
+        Cons: Fixed for entire training run. If the model improves and
+        errors shrink, the quadratic regime is wider than necessary.
+    
+    Option 2 (FUTURE): Adapt delta during training based on prediction error.
+        Track the running distribution of the model's actual correction
+        errors each epoch. Set delta to a percentile of recent errors.
+        Early in training when errors are large, delta is large. As the
+        model improves, delta shrinks to keep the quadratic regime focused
+        on the range where the model is still learning.
+        Implementation notes:
+        - Compute percentile of |predicted - target| at end of each epoch
+        - Use exponential moving average (momentum ~0.9) to smooth updates
+        - Set a floor value (e.g. min_delta) to prevent collapse
+        - Risk: if delta drops too fast, large corrections that the model
+          hasn't learned yet get constant gradients again
+    
+    Option 3 (FUTURE): Combine Options 1 and 2.
+        Use the data-derived delta (Option 1) as a ceiling. Allow the
+        error-derived delta (Option 2) to decay below this ceiling with
+        momentum, but never exceed it. This gives the adaptive benefits
+        of Option 2 with a safety bound from Option 1.
+        Implementation notes:
+        - ceiling = data-derived delta (computed once)
+        - running_delta = EMA of per-epoch error percentile
+        - effective_delta = min(running_delta, ceiling)
+        - Provides best of both: adapts as model learns, but can't
+          exceed the data-justified range
+    
+    Args:
+        corrections: Array of correction magnitudes from training data
+            (absolute values of noisy - clean for noise-labeled cells)
+        percentile: Percentile to use for delta (default 95th)
+        min_delta: Minimum delta to prevent degenerate behavior
+        
+    Returns:
+        Huber delta value
+    """
+    if len(corrections) == 0:
+        return min_delta
+    
+    abs_corrections = np.abs(corrections)
+    delta = float(np.percentile(abs_corrections, percentile))
+    
+    return max(delta, min_delta)
