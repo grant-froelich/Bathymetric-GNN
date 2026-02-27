@@ -130,8 +130,8 @@ class GraphBuilder:
             valid_rows, valid_cols, coord_to_node, depth.shape
         )
         
-        # Compute node features
-        node_features = self._compute_node_features(
+        # Compute node features (also returns per-node local_std for correction normalization)
+        node_features, node_local_std = self._compute_node_features(
             depth, valid_rows, valid_cols, uncertainty, valid_mask
         )
         
@@ -159,6 +159,12 @@ class GraphBuilder:
         data.valid_rows = torch.tensor(valid_rows, dtype=torch.long)
         data.valid_cols = torch.tensor(valid_cols, dtype=torch.long)
         data.num_valid_cells = num_nodes
+        
+        # Store local_std per node for correction normalization/denormalization.
+        # Training normalizes correction targets by local_std so the model learns
+        # corrections in units of local variability rather than raw meters.
+        # Inference denormalizes by multiplying predicted correction by local_std.
+        data.local_std = node_local_std
         
         logger.debug(
             f"Built graph: {data.num_nodes} nodes, {data.num_edges} edges, "
@@ -215,13 +221,18 @@ class GraphBuilder:
         valid_cols: np.ndarray,
         uncertainty: Optional[np.ndarray] = None,
         valid_mask: Optional[np.ndarray] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute features for each node using boundary-aware operations.
         
         All local statistics (mean, std, gradient, curvature) are computed
         using only valid neighbors. This prevents nodata values (1e6, NaN)
         from contaminating features near survey boundaries, which would
         otherwise create artificial signals the model mistakes for noise.
+        
+        Returns:
+            Tuple of (node_features tensor, local_std tensor).
+            local_std is returned separately for use in correction
+            normalization/denormalization.
         """
         num_nodes = len(valid_rows)
         features = []
@@ -278,7 +289,14 @@ class GraphBuilder:
         
         feature_matrix = np.stack(features, axis=1).astype(np.float32)
         
-        return torch.tensor(feature_matrix, dtype=torch.float32)
+        # Extract per-node local_std for correction normalization
+        node_local_std = local_std[valid_rows, valid_cols]
+        node_local_std = np.nan_to_num(node_local_std, nan=0.0).astype(np.float32)
+        
+        return (
+            torch.tensor(feature_matrix, dtype=torch.float32),
+            torch.tensor(node_local_std, dtype=torch.float32),
+        )
     
     def _compute_edge_features(
         self,
@@ -404,12 +422,14 @@ class GraphBuilder:
     
     def _create_empty_graph(self) -> Data:
         """Create an empty graph for invalid tiles."""
-        return Data(
+        data = Data(
             x=torch.zeros((0, len(self.node_features)), dtype=torch.float32),
             edge_index=torch.zeros((2, 0), dtype=torch.long),
             edge_attr=torch.zeros((0, len(self.edge_features)), dtype=torch.float32),
             pos=torch.zeros((0, 2), dtype=torch.float32),
         )
+        data.local_std = torch.zeros(0, dtype=torch.float32)
+        return data
     
     def graph_to_grid(
         self,

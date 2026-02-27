@@ -207,11 +207,22 @@ class NativeVRProcessor:
         
         correction = np.zeros_like(depth, dtype=np.float32)
         if 'correction' in outputs:
-            correction = self.graph_builder.graph_to_grid(
+            # Model outputs corrections in normalized units (correction / local_std).
+            # Denormalize by multiplying back by local_std to get meters.
+            norm_correction = self.graph_builder.graph_to_grid(
                 graph.cpu(),
                 outputs['correction'].cpu(),
                 fill_value=0.0,
             )
+            local_std_grid = self.graph_builder.graph_to_grid(
+                graph.cpu(),
+                graph.local_std.cpu() if hasattr(graph, 'local_std') else 
+                    torch.zeros(graph.num_nodes),
+                fill_value=0.0,
+            )
+            # Floor to prevent near-zero multiplication in flat areas
+            local_std_grid = np.maximum(local_std_grid, 0.01)
+            correction = norm_correction * local_std_grid
         
         return classification, confidence, correction
 

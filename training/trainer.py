@@ -48,6 +48,10 @@ from .losses import BathymetricGNNLoss, compute_class_weights, compute_correctio
 
 logger = logging.getLogger(__name__)
 
+# Floor value for local_std normalization to prevent division by near-zero
+# in perfectly flat areas. 0.01m is well below any real bathymetric variability.
+CORRECTION_NORM_FLOOR = 0.01
+
 
 class GroundTruthDataset(Dataset):
     """
@@ -216,10 +220,20 @@ class GroundTruthDataset(Dataset):
             # Classification labels
             graph.y = torch.tensor(labels[rows, cols], dtype=torch.long)
             
-            # Correction targets (difference = noisy - clean, so correction to apply is -difference)
-            # Model predicts: correction = noisy - clean
-            # To recover clean: clean = noisy - correction
-            graph.correction_target = torch.tensor(difference[rows, cols], dtype=torch.float32)
+            # Correction targets normalized by local surface variability.
+            # Raw correction = noisy - clean (meters). We normalize by the
+            # local standard deviation of the surface so the model learns
+            # corrections in units of local variability rather than raw meters.
+            # This makes corrections comparable across depth regimes:
+            #   - 0.3m spike in flat area (local_std=0.05m) -> 6.0 std devs
+            #   - 70m spike in variable area (local_std=5m) -> 14.0 std devs
+            # CORRECTION_NORM_FLOOR prevents division by near-zero in
+            # perfectly flat areas.
+            raw_corrections = difference[rows, cols]
+            norm_scale = torch.clamp(graph.local_std, min=CORRECTION_NORM_FLOOR)
+            graph.correction_target = torch.tensor(
+                raw_corrections, dtype=torch.float32
+            ) / norm_scale
             
             # Noise mask (where labels == 2)
             graph.noise_mask = torch.tensor(labels[rows, cols] == 2, dtype=torch.bool)
@@ -344,9 +358,12 @@ class BathymetricGraphDataset(Dataset):
             class_labels = np.where(class_labels == 1, 2, 0)  # Map 1->2 (noise class)
             graph.y = torch.tensor(class_labels, dtype=torch.long)
             
-            # Correction targets (how much the depth was changed)
-            corrections = noise_result.noisy_depth[rows, cols] - clean_depth[rows, cols]
-            graph.correction_target = torch.tensor(corrections, dtype=torch.float32)
+            # Correction targets - local_std normalized (see GroundTruthDataset for details)
+            raw_corrections = noise_result.noisy_depth[rows, cols] - clean_depth[rows, cols]
+            norm_scale = torch.clamp(graph.local_std, min=CORRECTION_NORM_FLOOR)
+            graph.correction_target = torch.tensor(
+                raw_corrections, dtype=torch.float32
+            ) / norm_scale
             
             # Noise mask for loss computation
             graph.noise_mask = torch.tensor(
@@ -483,39 +500,51 @@ class Trainer:
         
         Scans all tiles in the training dataset to:
         1. Count per-class samples for inverse-frequency class weights
-        2. Collect correction magnitudes for noise cells to set Huber delta
+        2. Collect NORMALIZED correction magnitudes for noise cells to set
+           Huber delta. Since corrections are normalized by local_std during
+           training, the delta must be computed in the same normalized space.
         
         Returns:
             Tuple of (class_weights tensor or None, correction_delta float)
         """
         num_classes = self.config.model.num_classes
         counts = torch.zeros(num_classes, dtype=torch.long)
-        all_noise_corrections = []
+        all_raw_corrections = []
+        all_normalized_corrections = []
         
         try:
             dataset = self.train_dataset
             
-            # For GroundTruthDataset, read labels and corrections directly from tiles
             if hasattr(dataset, 'tiles'):
+                # Fast scan of tiles for class counts
                 for tile in dataset.tiles:
                     labels = tile['labels']
-                    difference = tile['difference']
                     valid = labels >= 0
-                    
-                    # Count class distribution
                     for c in range(num_classes):
                         counts[c] += int(np.sum(labels[valid] == c))
-                    
-                    # Collect correction magnitudes for noise cells
-                    noise_mask = (labels == 2) & valid
-                    if np.any(noise_mask):
-                        noise_corrections = difference[noise_mask]
-                        # Filter out NaN/Inf
-                        noise_corrections = noise_corrections[np.isfinite(noise_corrections)]
-                        if len(noise_corrections) > 0:
-                            all_noise_corrections.append(noise_corrections)
+                
+                # Sample a subset of actual training items to get normalized
+                # corrections (requires graph construction for local_std)
+                num_samples = min(len(dataset), 100)
+                logger.info(f"Sampling {num_samples} tiles for correction statistics...")
+                sample_indices = np.linspace(0, len(dataset) - 1, num_samples, dtype=int)
+                for idx in sample_indices:
+                    graph = dataset[int(idx)]
+                    if hasattr(graph, 'noise_mask') and graph.noise_mask.any():
+                        # correction_target is already normalized by local_std
+                        norm_corr = graph.correction_target[graph.noise_mask].numpy()
+                        norm_corr = norm_corr[np.isfinite(norm_corr)]
+                        if len(norm_corr) > 0:
+                            all_normalized_corrections.append(norm_corr)
+                        
+                        # Also collect raw corrections for logging
+                        local_std = graph.local_std[graph.noise_mask].numpy()
+                        local_std = np.maximum(local_std, CORRECTION_NORM_FLOOR)
+                        raw_corr = norm_corr * local_std
+                        all_raw_corrections.append(raw_corr)
+                        
             else:
-                # For BathymetricGraphDataset, sample a subset of the data
+                # For BathymetricGraphDataset, sample a subset
                 num_samples = min(len(dataset), 50)
                 for i in range(num_samples):
                     graph = dataset[i]
@@ -524,10 +553,10 @@ class Trainer:
                             counts[c] += (graph.y == c).sum().item()
                     if hasattr(graph, 'noise_mask') and hasattr(graph, 'correction_target'):
                         if graph.noise_mask.any():
-                            corrections = graph.correction_target[graph.noise_mask].numpy()
-                            corrections = corrections[np.isfinite(corrections)]
-                            if len(corrections) > 0:
-                                all_noise_corrections.append(corrections)
+                            norm_corr = graph.correction_target[graph.noise_mask].numpy()
+                            norm_corr = norm_corr[np.isfinite(norm_corr)]
+                            if len(norm_corr) > 0:
+                                all_normalized_corrections.append(norm_corr)
             
             # Compute class weights
             class_weights = None
@@ -541,17 +570,26 @@ class Trainer:
             else:
                 logger.warning("No valid labels found, skipping class weights")
             
-            # Compute correction delta
-            if all_noise_corrections:
-                combined = np.concatenate(all_noise_corrections)
+            # Compute correction delta from normalized distribution
+            if all_normalized_corrections:
+                combined_norm = np.concatenate(all_normalized_corrections)
                 correction_delta = compute_correction_delta(
-                    combined, percentile=95.0, min_delta=1.0
+                    combined_norm, percentile=95.0, min_delta=1.0
                 )
+                
+                # Log both raw and normalized stats
+                if all_raw_corrections:
+                    combined_raw = np.concatenate(all_raw_corrections)
+                    logger.info(
+                        f"Correction stats (raw meters): {len(combined_raw):,} noise cells, "
+                        f"mean |correction|={np.mean(np.abs(combined_raw)):.3f}m, "
+                        f"max |correction|={np.max(np.abs(combined_raw)):.3f}m"
+                    )
                 logger.info(
-                    f"Correction stats: {len(combined):,} noise cells, "
-                    f"mean |correction|={np.mean(np.abs(combined)):.3f}m, "
-                    f"max |correction|={np.max(np.abs(combined)):.3f}m, "
-                    f"95th percentile={np.percentile(np.abs(combined), 95):.3f}m"
+                    f"Correction stats (normalized by local_std): "
+                    f"mean |correction|={np.mean(np.abs(combined_norm)):.3f}, "
+                    f"max |correction|={np.max(np.abs(combined_norm)):.3f}, "
+                    f"95th percentile={np.percentile(np.abs(combined_norm), 95):.3f}"
                 )
             else:
                 correction_delta = 1.0
