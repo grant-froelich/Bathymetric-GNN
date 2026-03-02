@@ -1,5 +1,69 @@
 # Changelog
 
+## 2026-03-02 - Training Data Diversity Investigation
+
+### Data Pair Evaluation
+- Tested 3 new survey pairs for training data diversity:
+  - H13532: Florida river survey (SR BAG, 1m) - 4 noise cells / 456K valid (0.00%)
+  - H14190: Coastal Alaska (VR BAG, 1m) - 149 noise cells / 30M valid (0.00%)
+  - F00889: Norfolk river survey (SR BAG, 0.5m) - 1 noise cell / 23M valid (0.00%)
+- All three pairs produced near-zero noise because differences don't propagate to gridded surfaces
+- `prepare_ground_truth.py` confirmed working for both SR and VR BAGs (auto-detection via BathymetricLoader)
+- Decision: Do not include these pairs in training; find pairs with grid-visible noise instead
+
+### Lesson Documented
+- Added data quality verification step to workflow: visually inspect difference layer in QGIS before running ground truth preparation
+- Training data with near-zero noise would shift class balance from 75/25 to 97/3, risking majority-class collapse
+
+---
+
+## 2026-02-27 - V7/V8/V9 Training Runs & Correction Normalization
+
+### V7: Boundary-Aware Feature Computation
+- **Root cause identified (V6 failure):** `scipy.ndimage.uniform_filter` with `mode='nearest'` bled nodata values (1e6) into local statistics at survey boundaries, creating artificial feature spikes
+- **Fix:** Replaced with masked local statistics using only valid neighbors; nodata filled with local mean before gradient/curvature computation
+- **Results:** Noise detection jumped from 3.3% to 34.8%, matching ground truth distributions; peak val accuracy 72% exceeded seafloor proportion (75%); 11,790 auto-corrections applied; mean confidence 0.825
+- **Visual validation:** QGIS confirmed noise classifications follow actual noise spatial patterns, not survey boundaries
+
+### V8: Dynamic Huber Delta (No Effect)
+- Added data-derived Huber delta computation from correction target distribution
+- 95th percentile of raw corrections (0.652m) was below min_delta floor (1.0)
+- Training dynamics identical to V7; no inference run needed
+- Documented adaptive delta Options 2/3 in `losses.py` for future implementation
+
+### V9: Local Standard Deviation Correction Normalization
+- **Problem:** V7 predicted 0.4m corrections where 70m was needed; Huber loss gradient plateau above delta means model cannot distinguish large from small corrections
+- **Solution:** Normalize correction targets by per-node local_std from graph construction
+  - `graph_construction.py`: `_compute_node_features` returns `(features, local_std)` tuple; `build_graph` stores `data.local_std`
+  - `trainer.py`: Both dataset classes divide correction targets by `max(local_std, 0.01m)`, clamp to +/-50 std devs
+  - `inference_native.py`: Denormalize by multiplying predicted corrections by local_std
+- Constants: `CORRECTION_NORM_FLOOR = 0.01`, `CORRECTION_NORM_CAP = 50.0`
+- **Initial extreme value problem:** Max normalized correction of 2,692 from noise spikes in flat areas; solved by capping at +/-50 std devs
+- **V9 training results:** Best val loss 1.813 (epoch 5), early stopping at epoch 19, classification identical to V7 (34.8% noise, 0.825 confidence), but corrections up to 32m larger than V7
+
+### Code Changes
+- `data/graph_construction.py`: Added local_std output from node feature computation
+- `training/trainer.py`: Added correction normalization in both dataset classes and stats computation
+- `scripts/inference_native.py`: Added denormalization step in `NativeVRProcessor.process_grid`
+- `training/losses.py`: Added documentation for adaptive Huber delta options (unchanged functionally)
+
+---
+
+## 2026-02-27 - V5/V6 Training Iterations
+
+### V5: Class Weight Bug Discovery
+- Training without class weights resulted in model predicting seafloor for all cells
+- Val accuracy of 67% matched seafloor proportion exactly (appeared healthy but was total failure)
+- Inference produced 0% noise detection with 0.967 confidence
+
+### V6: Auto Class Weight Implementation
+- `trainer.py` now scans training tiles to count class distributions automatically
+- Computes inverse-frequency weights with smoothing: `weight = total / (n_classes * count + smooth)`
+- Broke the all-seafloor pattern, noise detection at 3.3%
+- However, visual validation revealed boundary artifact problem (see V7 above)
+
+---
+
 ## 2026-02-12 - Unified Native BAG Processing & Documentation Updates
 
 ### Major Changes
@@ -122,31 +186,6 @@
 
 ### Uncertainty Scaling
 - Corrected cells have uncertainty scaled by model confidence:
-  - High confidence (0.9) → uncertainty × 1.1
-  - Low confidence (0.5) → uncertainty × 1.5
+  - High confidence (0.9) -> uncertainty x 1.1
+  - Low confidence (0.5) -> uncertainty x 1.5
   - Formula: `scale_factor = 2.0 - confidence`
-
-### Command Line Examples
-
-```bash
-# Native VR BAG processing (preserves VR structure)
-python scripts/inference_native.py \
-    --input survey.bag \
-    --model outputs/final_model.pt \
-    --output survey_clean.bag \
-    --min-valid-ratio 0.01
-
-# Resampled VR BAG processing (uniform grid output)
-python scripts/inference.py \
-    --input survey.bag \
-    --model outputs/final_model.pt \
-    --output survey_clean.tif \
-    --vr-bag-mode resampled \
-    --min-valid-ratio 0.01
-
-# Diagnose tile validity issues
-python scripts/diagnose_tiles.py --survey survey.bag --vr-bag-mode resampled
-
-# Explore VR BAG structure
-python scripts/explore_vr_bag.py --survey survey.bag
-```
