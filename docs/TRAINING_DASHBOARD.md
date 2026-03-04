@@ -40,7 +40,7 @@ Switched from synthetic noise to real clean/noisy survey pairs from Seward, Alas
 
 Key observations per version:
 
-- **V5 (purple):** Train loss decreases smoothly but val loss diverges wildly. Model collapsed to all-seafloor prediction (67% accuracy = seafloor proportion). Root cause: missing class weights.
+- **V5 (purple):** Train loss decreases smoothly but val loss diverges wildly. Model collapsed to all-seafloor prediction (~67% accuracy). Inference confirmed 0% noise detection. Root cause: missing class weights.
 - **V6 (green):** Val loss diverges early. Model learned boundary artifacts instead of real noise. Root cause: `uniform_filter` bleeding nodata into features.
 - **V7 (yellow):** Most stable training. Val loss stays bounded. First version to genuinely classify noise spatially. Boundary-aware masked statistics fixed the V6 bug.
 - **V9 (teal):** Higher absolute loss values (expected, since correction targets are now in std dev units). Training dynamics similar to V7 because classification head is unchanged.
@@ -49,7 +49,7 @@ Key observations per version:
 
 ![Validation Accuracy V5-V9](images/04_val_acc_compare.png)
 
-The red dashed line marks the seafloor proportion (75%). V5 sits right at the seafloor proportion, confirming majority-class collapse. V7 and V9 land slightly below it (~72%), which is expected: they trade some seafloor accuracy for genuine noise detection (34.8%). The accuracy dip below 75% reflects false positives (seafloor misclassified as noise), but the model is doing useful work because it's actually finding noise cells. The V6 dip to ~35% (epoch 10) shows the boundary artifact model periodically "losing" its signal.
+The red dashed line marks the seafloor proportion (75%). V5 sits below the line at ~67%, consistent with majority-class-like collapse (inference confirmed 0% noise detection). V7 and V9 land slightly below it (~72%), which is expected: they trade some seafloor accuracy for genuine noise detection (34.8%). The accuracy dip below 75% reflects false positives (seafloor misclassified as noise), but the model is doing useful work because it's actually finding noise cells. However, 34.8% detection against the validation set's 18.8% actual noise rate indicates the model is over-predicting noise, nearly doubling the true rate. The V6 dip to ~35% (epoch 10) shows the boundary artifact model periodically "losing" its signal.
 
 ### Validation Loss Comparison
 
@@ -65,7 +65,7 @@ Validation loss diverges from training loss after approximately 5 epochs in ever
 
 ![Noise Detection by Version](images/06_noise_detection.png)
 
-V4 (96.8%) flagged everything as noise -- a failed overcorrection from V3's conservatism. V5 (0.0%) swung to the opposite extreme. V7 and V9 both land at 34.8%, matching the ground truth distribution.
+V4 (96.8%) flagged everything as noise -- a failed overcorrection from V3's conservatism. V5 (0.0%) swung to the opposite extreme. V7 and V9 both land at 34.8%, which represents genuine noise detection but is nearly double the validation set's actual noise rate of 18.8%. This over-prediction indicates a significant false positive rate, likely from the model learning Seward-specific seafloor patterns as noise-like. Geographic diversity in training data is the expected path to reducing these false positives.
 
 ### Mean Confidence
 
@@ -207,7 +207,7 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 
 **Overfitting:** Validation loss diverges from training loss after ~5 epochs in every ground truth run (V5-V9). All training data is from Seward, Alaska. The model memorizes location-specific patterns rather than learning generalizable noise signatures. The data acquisition plan above is the primary mitigation.
 
-**Classification plateau:** ~72% overall accuracy is slightly below the 75% seafloor proportion. The model trades some seafloor accuracy for noise detection (34.8%), which is useful but indicates room for improvement on both fronts. Both false positives (seafloor flagged as noise) and false negatives (noise missed) are present.
+**Classification plateau and noise over-prediction:** ~72% overall accuracy is slightly below the 75% seafloor proportion. The model detects noise at 34.8%, nearly double the validation set's actual 18.8% noise rate. This means the model is making more corrections than necessary, flagging real seafloor as noise. The model trades some seafloor accuracy for noise detection, but needs to become more precise. Geographic diversity in training data should tighten the decision boundary. Additionally, tracking precision and recall separately (rather than just overall detection rate) would better diagnose whether the priority is reducing false positives or improving true positive detection.
 
 **Correction magnitude gap:** V9 corrections are up to 32m larger than V7, but still don't fully recover the clean reference surface.
 
@@ -218,9 +218,10 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 1. :star: **Process E00269 (N. Mariana Islands)** -- Available locally. Run QGIS difference check, then `prepare_ground_truth.py` if viable. First non-Seward training pair.
 2. **Process archive data as it arrives** -- One per region first, QGIS pre-check on each, reject pairs with <1% noise.
 3. **Train V10 with multi-region data** -- Incorporate ShoalSafetyLoss, local_std correction normalization, and geographic diversity.
-4. **Sounding density feature** -- Per-cell sounding count from point cloud data would be the strongest noise discriminator. Single-hit cells in the surface are almost certainly noise.
-5. **Validate V9 corrections** -- Quantify how close V9 corrections come to recovering the clean surface at known noise locations.
-6. **Adaptive Huber delta** -- Options documented in `training/losses.py` for future implementation once diverse data is available.
+4. **Add precision/recall metrics** -- Current 34.8% detection rate vs 18.8% ground truth indicates significant false positives. Track precision (what fraction of flagged cells are actually noise) and recall (what fraction of actual noise cells are detected) separately to diagnose whether the priority is reducing false positives or improving true positive detection.
+5. **Sounding density feature** -- Per-cell sounding count from point cloud data would be the strongest noise discriminator. Single-hit cells in the surface are almost certainly noise.
+6. **Validate V9 corrections** -- Quantify how close V9 corrections come to recovering the clean surface at known noise locations.
+7. **Adaptive Huber delta** -- Options documented in `training/losses.py` for future implementation once diverse data is available.
 
 ---
 

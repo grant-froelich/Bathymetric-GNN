@@ -37,7 +37,7 @@ This document captures practical lessons from training the Bathymetric GNN on re
 
 ### 2. Class Imbalance Causes Majority-Class Prediction
 
-**Problem Discovered (V5):** Without class weights, the model learned to predict "seafloor" for every cell. Validation accuracy of 67% matched the seafloor proportion exactly, giving the illusion of learning.
+**Problem Discovered (V5):** Without class weights, the model learned to predict "seafloor" for every cell. Validation accuracy stabilized at ~67%, and inference produced 0% noise detection, confirming majority-class-like collapse.
 
 **Symptoms:**
 - High validation accuracy (~67%) but 0% noise detection at inference
@@ -86,7 +86,7 @@ Model checkpoint saves `in_channels` so inference knows expected feature count.
 - Nodata cells filled with local mean before gradient and curvature computation
 - This eliminates artificial feature spikes at boundaries
 
-**Impact:** Noise detection jumped from 3.3% (boundary artifacts) to 34.8% (actual noise), matching ground truth distributions of 16-34%.
+**Impact:** Noise detection jumped from 3.3% (boundary artifacts) to 34.8% (actual noise spatial patterns). However, the validation set (Seward 4of4) has 18.8% noise, so 34.8% detection indicates significant over-prediction -- the model flags nearly twice as many cells as are actually noise, meaning a substantial false positive rate. This is likely due to the model learning Seward-specific patterns: normal seafloor variation that looks "noise-like" within that one geographic context gets incorrectly flagged.
 
 **Lesson:** Always validate model outputs spatially. A model can achieve reasonable accuracy metrics while learning the wrong signal entirely. If V6's classifications had not been visualized in QGIS, this bug could have persisted through many iterations.
 
@@ -154,7 +154,8 @@ Model checkpoint saves `in_channels` so inference knows expected feature count.
 
 **Healthy training (V7+):**
 - Train loss steadily decreases
-- Val accuracy (~72%) is slightly below the seafloor proportion (75%), but this is expected: the model trades some seafloor accuracy for noise detection (34.8%), confirming genuine classification rather than majority-class collapse
+- Val accuracy (~72%) is slightly below the seafloor proportion (75%), but this is expected: the model trades some seafloor accuracy for noise detection, confirming genuine classification rather than majority-class collapse
+- Caveat: the noise detection rate (34.8%) is nearly double the validation ground truth (18.8%), indicating significant false positives that should improve with geographic diversity in training data
 - Val loss oscillates but stays in a bounded range
 - Early stopping triggers around epoch 15-25
 
@@ -164,8 +165,8 @@ Model checkpoint saves `in_channels` so inference knows expected feature count.
 - Indicates data quality issue, not model issue
 
 **Majority-class collapse (V5):**
-- Val accuracy ~67% matches seafloor proportion exactly
-- Inference produces 0% noise detection
+- Val accuracy stabilizes at ~67% with no learning progression
+- Inference produces 0% noise detection, confirming the model never learned to identify noise
 - High confidence (0.967) masking total failure
 
 ---
@@ -254,3 +255,4 @@ After any training run, validate in QGIS before trusting metrics:
 | Low correction magnitudes | Model flags noise but corrections too small | Use local_std correction normalization (V9+) |
 | Near-zero noise in GT | Noise doesn't propagate to grid surface | Verify noise visible in gridded BAG, not just point cloud |
 | All-seafloor training data | Pushes model toward majority-class collapse | Only use pairs with 10-40% noise in gridded surface |
+| Noise over-prediction | Detection rate (~35%) far exceeds ground truth (~19%) | Add geographically diverse training data; track precision/recall separately; tune classification threshold |

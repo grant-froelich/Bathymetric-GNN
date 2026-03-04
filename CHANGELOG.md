@@ -43,7 +43,7 @@
 ### V7: Boundary-Aware Feature Computation
 - **Root cause identified (V6 failure):** `scipy.ndimage.uniform_filter` with `mode='nearest'` bled nodata values (1e6) into local statistics at survey boundaries, creating artificial feature spikes
 - **Fix:** Replaced with masked local statistics using only valid neighbors; nodata filled with local mean before gradient/curvature computation
-- **Results:** Noise detection jumped from 3.3% to 34.8%, matching ground truth distributions; peak val accuracy ~72% with meaningful noise detection (confirming genuine classification, not majority-class collapse); 11,790 auto-corrections applied; mean confidence 0.825
+- **Results:** Noise detection jumped from 3.3% to 34.8%; peak val accuracy ~72% with meaningful noise detection (confirming genuine classification, not majority-class collapse); 11,790 auto-corrections applied; mean confidence 0.825. Note: 34.8% detection against the validation set's 18.8% actual noise rate indicates significant over-prediction (false positives), likely from Seward-specific pattern memorization.
 - **Visual validation:** QGIS confirmed noise classifications follow actual noise spatial patterns, not survey boundaries
 
 ### V8: Dynamic Huber Delta (No Effect)
@@ -74,7 +74,7 @@
 
 ### V5: Class Weight Bug Discovery
 - Training without class weights resulted in model predicting seafloor for all cells
-- Val accuracy of 67% matched seafloor proportion exactly (appeared healthy but was total failure)
+- Val accuracy stabilized at ~67% with no learning progression (majority-class-like collapse)
 - Inference produced 0% noise detection with 0.967 confidence
 
 ### V6: Auto Class Weight Implementation

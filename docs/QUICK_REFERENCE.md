@@ -108,6 +108,10 @@ powershell -Command "(Get-Content 'path/to/model_output/config.yaml') -replace '
 **Cause:** Noise in point cloud doesn't propagate to gridded BAG surface
 **Fix:** This pair is not suitable for training. Find pairs where noise is visible in the gridded surface.
 
+### Issue: Model over-predicts noise (detection rate >> ground truth noise %)
+**Cause:** Model learned location-specific seafloor patterns as noise-like from limited geographic training data
+**Fix:** Add geographically diverse training data. Also consider tracking precision/recall separately and tuning the classification threshold to reduce false positives.
+
 ---
 
 ## Output Files Explained
@@ -170,7 +174,7 @@ Before adding a survey pair to training data:
 - **Training time**: ~3-5 hours (CUDA, batch-size 2, 298 tiles, 30 epochs)
 - **Inference time**: ~20 seconds per survey (CUDA)
 - **Best validation accuracy**: ~72%
-- **Noise detection rate**: ~35% (matching ground truth distribution)
+- **Noise detection rate**: ~35% (over-predicts vs 18.8% validation ground truth; expect improvement with diverse training data)
 - **Mean confidence**: 0.825
 - **Memory**: ~6-8 GB GPU RAM with batch-size 2
 
