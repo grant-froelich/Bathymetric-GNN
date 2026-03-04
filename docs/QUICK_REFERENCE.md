@@ -186,4 +186,23 @@ Before adding a survey pair to training data:
 
 ---
 
-*Quick Reference v2.0 | March 2026*
+## Data Acquisition Tracker
+
+22 surveys across 8 regions requested from NCEI archive (2026-03-04). E00269 available locally.
+
+| Region | Surveys | Status |
+|--------|---------|--------|
+| Gulf Coast (TX/LA/MS/FL) | H13818, H13651, H13837 | Awaiting archive |
+| SE Atlantic (SC/GA) | H13851, F00881 | Awaiting archive |
+| Mid-Atlantic (MD/VA/NC) | H13762, H13804, H13750 | Awaiting archive |
+| Northeast (NY/CT/RI) | H13927 | Awaiting archive |
+| Great Lakes | H13940, H13943 | Awaiting archive |
+| Pacific NW (WA/OR) | H14070, H13847 | Awaiting archive |
+| Alaska | H13774, F00886, H14116, H13914, E01093, H13695 | Awaiting archive |
+| Pacific Islands | H13739, H13735, E00269 | E00269 ready, others awaiting |
+
+**Processing order:** One per region first (prioritize Gulf Coast, Great Lakes, Pacific Islands), then fill in remaining surveys.
+
+---
+
+*Quick Reference v2.1 | March 2026*

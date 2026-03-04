@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-03-04 - Data Acquisition Plan for Geographic Diversity
+
+### Survey Identification
+- Identified 22 surveys across 8 regions for training data expansion
+- Regions: Gulf Coast (3), SE Atlantic (2), Mid-Atlantic (3), Northeast (1), Great Lakes (2), Pacific NW (2), Alaska (6), Pacific Islands (3)
+- Alaska surveys include diverse acquisition types: set line spacing in shallow flat water, Bering Sea/North Slope trackline, standard multibeam
+- E00269 (Northern Mariana Islands) available locally for immediate processing
+
+### Archive Request
+- Clean BAGs downloadable directly from NCEI for 21 of 22 surveys
+- Processed (pre-cleaning) data requested from NCEI archive to produce noisy BAGs
+- Expected delivery: days to weeks
+- Processing plan: one survey per region first to detect unusable pairs early
+
+### Expected Outcome
+- At 30-50% attrition, expect 11-15 usable pairs
+- Combined with 4 existing Seward pairs: 15-19 total from 8+ environments
+- Primary mitigation for persistent overfitting observed in V5-V9
+
+---
+
 ## 2026-03-02 - Training Data Diversity Investigation
 
 ### Data Pair Evaluation

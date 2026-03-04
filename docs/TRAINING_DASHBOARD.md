@@ -152,9 +152,60 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 
 ---
 
+## Data Acquisition Plan (2026-03-04)
+
+22 surveys identified across 8 regions to address the geographic diversity gap. Clean BAGs will be downloaded from NCEI. Processed (pre-cleaning) data requested from the NCEI archive to produce noisy BAGs for training pairs. One survey (E00269) is available locally and can be processed immediately.
+
+![Acquisition Plan](images/12_acquisition_plan.png)
+
+### Target Surveys by Region
+
+| Region | Count | Registry Numbers | Environment |
+|--------|-------|-----------------|-------------|
+| Gulf Coast Shallow (TX/LA/MS/FL) | 3 | H13818, H13651, H13837 | Shallow saltwater, warm water refraction, post-storm dynamics |
+| Southeast Atlantic (SC/GA) | 2 | H13851, F00881 | Sandy, tidal, dynamic bottom |
+| Mid-Atlantic (MD/VA/NC) | 3 | H13762, H13804, H13750 | Estuarine, mixed bottom, current-affected |
+| Northeast (NY/CT/RI) | 1 | H13927 | Rocky/sand mixed, different acoustic environment |
+| Great Lakes | 2 | H13940, H13943 | Freshwater, glacial sediment, shallow, thermocline refraction |
+| Pacific NW (WA/OR) | 2 | H14070, H13847 | Rocky, deep, cold saltwater |
+| Alaska | 6 | H13774, F00886, H14116, H13914, E01093, H13695 | Mixed: shallow flat (set line spacing), Bering Sea/North Slope (trackline), plus standard multibeam |
+| Pacific Islands | 3 | H13739, H13735, E00269 | Coral/volcanic substrate, warm shallow water, Northern Mariana Islands |
+
+### Acquisition Status
+
+| Source | Surveys | Status |
+|--------|---------|--------|
+| NCEI archive (clean BAGs) | 21 | Download directly |
+| NCEI archive (processed data) | 21 | Requested, awaiting delivery (days to weeks) |
+| Local data (E00269, N. Mariana Islands) | 1 | Available now, ready to process |
+
+### Processing Plan
+
+**Immediate:** Process E00269 locally. Run QGIS difference-layer check first.
+
+**As data arrives:** Prioritize one survey per region before processing all surveys from any single region. This reveals early if any region consistently produces unusable pairs. Suggested first batch: one Gulf Coast, one Great Lakes, one Pacific Islands.
+
+**Quality gate:** For each pair, subtract surfaces in QGIS raster calculator before running `prepare_ground_truth.py`. If the difference layer is uniformly near zero, reject the pair. Target 10-40% noise in the gridded surface.
+
+**Expected yield:** At ~30-50% attrition (near-zero grid noise), expect 11-15 usable pairs. Combined with 4 existing Seward pairs, that would give 15-19 total training pairs from 8+ distinct environments.
+
+### Training Value by Region
+
+| Region | Key Diversity Contribution |
+|--------|---------------------------|
+| Gulf Coast | Shallow water noise regime, warm water refraction artifacts |
+| SE / Mid-Atlantic | Sandy/estuarine bottom, tidal current effects |
+| Northeast | Rocky New England coast, different from Alaska rocky |
+| Great Lakes | Freshwater acoustics, glacial sediment, no tidal corrections |
+| Pacific NW | Deep cold saltwater, volcanic/rocky substrate |
+| Alaska (non-Seward) | Validates generalization within Alaska; trackline and set-line-spacing survey types add acquisition geometry diversity |
+| Pacific Islands | Coral/volcanic, warm shallow, most acoustically distinct from Seward |
+
+---
+
 ## Persistent Issues
 
-**Overfitting:** Validation loss diverges from training loss after ~5 epochs in every ground truth run (V5-V9). All training data is from Seward, Alaska. The model memorizes location-specific patterns rather than learning generalizable noise signatures.
+**Overfitting:** Validation loss diverges from training loss after ~5 epochs in every ground truth run (V5-V9). All training data is from Seward, Alaska. The model memorizes location-specific patterns rather than learning generalizable noise signatures. The data acquisition plan above is the primary mitigation.
 
 **Classification plateau:** ~72% accuracy against 75% seafloor proportion means the model is only marginally better than always predicting seafloor. Both false positives and false negatives are present.
 
@@ -164,11 +215,13 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 
 ## Next Steps
 
-1. **Find diverse training data** -- Survey pairs where noise is visible in the gridded BAG surface, from varied geographic locations and depth regimes. Quick test: subtract surfaces in QGIS raster calculator and look for scattered spikes.
-2. **Sounding density feature** -- Per-cell sounding count from point cloud data would be the strongest noise discriminator. Single-hit cells in the surface are almost certainly noise.
-3. **Validate V9 corrections** -- Quantify how close V9 corrections come to recovering the clean surface at known noise locations.
-4. **Adaptive Huber delta** -- Options documented in `training/losses.py` for future implementation once diverse data is available.
+1. :star: **Process E00269 (N. Mariana Islands)** -- Available locally. Run QGIS difference check, then `prepare_ground_truth.py` if viable. First non-Seward training pair.
+2. **Process archive data as it arrives** -- One per region first, QGIS pre-check on each, reject pairs with <1% noise.
+3. **Train V10 with multi-region data** -- Incorporate ShoalSafetyLoss, local_std correction normalization, and geographic diversity.
+4. **Sounding density feature** -- Per-cell sounding count from point cloud data would be the strongest noise discriminator. Single-hit cells in the surface are almost certainly noise.
+5. **Validate V9 corrections** -- Quantify how close V9 corrections come to recovering the clean surface at known noise locations.
+6. **Adaptive Huber delta** -- Options documented in `training/losses.py` for future implementation once diverse data is available.
 
 ---
 
-*Dashboard v2.0 | March 2026*
+*Dashboard v2.1 | March 2026*
