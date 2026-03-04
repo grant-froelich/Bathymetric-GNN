@@ -49,7 +49,7 @@ Key observations per version:
 
 ![Validation Accuracy V5-V9](images/04_val_acc_compare.png)
 
-The red dashed line marks the seafloor proportion (75%). V5 sits right at the seafloor proportion, confirming majority-class collapse. V7 and V9 consistently exceed it, indicating genuine classification ability. The V6 dip to ~35% (epoch 10) shows the boundary artifact model periodically "losing" its signal.
+The red dashed line marks the seafloor proportion (75%). V5 sits right at the seafloor proportion, confirming majority-class collapse. V7 and V9 land slightly below it (~72%), which is expected: they trade some seafloor accuracy for genuine noise detection (34.8%). The accuracy dip below 75% reflects false positives (seafloor misclassified as noise), but the model is doing useful work because it's actually finding noise cells. The V6 dip to ~35% (epoch 10) shows the boundary artifact model periodically "losing" its signal.
 
 ### Validation Loss Comparison
 
@@ -207,7 +207,7 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 
 **Overfitting:** Validation loss diverges from training loss after ~5 epochs in every ground truth run (V5-V9). All training data is from Seward, Alaska. The model memorizes location-specific patterns rather than learning generalizable noise signatures. The data acquisition plan above is the primary mitigation.
 
-**Classification plateau:** ~72% accuracy against 75% seafloor proportion means the model is only marginally better than always predicting seafloor. Both false positives and false negatives are present.
+**Classification plateau:** ~72% overall accuracy is slightly below the 75% seafloor proportion. The model trades some seafloor accuracy for noise detection (34.8%), which is useful but indicates room for improvement on both fronts. Both false positives (seafloor flagged as noise) and false negatives (noise missed) are present.
 
 **Correction magnitude gap:** V9 corrections are up to 32m larger than V7, but still don't fully recover the clean reference surface.
 

@@ -43,7 +43,7 @@
 ### V7: Boundary-Aware Feature Computation
 - **Root cause identified (V6 failure):** `scipy.ndimage.uniform_filter` with `mode='nearest'` bled nodata values (1e6) into local statistics at survey boundaries, creating artificial feature spikes
 - **Fix:** Replaced with masked local statistics using only valid neighbors; nodata filled with local mean before gradient/curvature computation
-- **Results:** Noise detection jumped from 3.3% to 34.8%, matching ground truth distributions; peak val accuracy 72% exceeded seafloor proportion (75%); 11,790 auto-corrections applied; mean confidence 0.825
+- **Results:** Noise detection jumped from 3.3% to 34.8%, matching ground truth distributions; peak val accuracy ~72% with meaningful noise detection (confirming genuine classification, not majority-class collapse); 11,790 auto-corrections applied; mean confidence 0.825
 - **Visual validation:** QGIS confirmed noise classifications follow actual noise spatial patterns, not survey boundaries
 
 ### V8: Dynamic Huber Delta (No Effect)
