@@ -120,14 +120,14 @@ class GraphBuilder:
             logger.warning("No valid cells in grid")
             return self._create_empty_graph()
         
-        # Create mapping from (row, col) to node index
-        coord_to_node = {}
-        for node_idx, (r, c) in enumerate(zip(valid_rows, valid_cols)):
-            coord_to_node[(r, c)] = node_idx
+        # Create mapping from (row, col) to node index using a grid array
+        # (Fix #5: numpy index grid replaces Python dict for O(1) array lookups)
+        node_index_grid = np.full(depth.shape, -1, dtype=np.int64)
+        node_index_grid[valid_rows, valid_cols] = np.arange(num_nodes)
         
         # Build edges
         edge_index, edge_coords = self._build_edges(
-            valid_rows, valid_cols, coord_to_node, depth.shape
+            valid_rows, valid_cols, node_index_grid, depth.shape
         )
         
         # Compute node features (also returns per-node local_std for correction normalization)
@@ -177,42 +177,70 @@ class GraphBuilder:
         self,
         valid_rows: np.ndarray,
         valid_cols: np.ndarray,
-        coord_to_node: dict,
+        node_index_grid: np.ndarray,
         grid_shape: Tuple[int, int],
     ) -> Tuple[torch.Tensor, List[Tuple]]:
-        """Build edge index tensor."""
+        """Build edge index tensor using vectorized numpy operations.
+        
+        Uses a node_index_grid (2D array mapping grid coords to node indices,
+        -1 for invalid) instead of a Python dict for fast neighbor lookups.
+        """
         height, width = grid_shape
+        num_nodes = len(valid_rows)
         
-        source_nodes = []
-        target_nodes = []
-        edge_coords = []  # Store (src_row, src_col, tgt_row, tgt_col) for feature computation
+        all_src = []
+        all_tgt = []
+        all_edge_coords = []
+        node_indices = np.arange(num_nodes)
         
-        for node_idx, (r, c) in enumerate(zip(valid_rows, valid_cols)):
-            for dr, dc in self.neighbor_offsets:
-                nr, nc = r + dr, c + dc
-                
-                # Check bounds
-                if 0 <= nr < height and 0 <= nc < width:
-                    # Check if neighbor is valid
-                    if (nr, nc) in coord_to_node:
-                        neighbor_idx = coord_to_node[(nr, nc)]
-                        source_nodes.append(node_idx)
-                        target_nodes.append(neighbor_idx)
-                        edge_coords.append((r, c, nr, nc))
+        for dr, dc in self.neighbor_offsets:
+            # Compute neighbor coordinates for ALL valid nodes at once
+            nr = valid_rows + dr
+            nc = valid_cols + dc
+            
+            # Bounds check (vectorized)
+            in_bounds = (nr >= 0) & (nr < height) & (nc >= 0) & (nc < width)
+            
+            # For out-of-bounds, clip to valid range to avoid index errors
+            # (we'll filter these out with in_bounds mask)
+            nr_safe = np.clip(nr, 0, height - 1)
+            nc_safe = np.clip(nc, 0, width - 1)
+            
+            # Look up neighbor node indices from the grid
+            neighbor_idx = node_index_grid[nr_safe, nc_safe]
+            
+            # Valid edge: in bounds AND neighbor is a valid node (index >= 0)
+            valid_edge = in_bounds & (neighbor_idx >= 0)
+            
+            all_src.append(node_indices[valid_edge])
+            all_tgt.append(neighbor_idx[valid_edge])
+            
+            # Store edge coordinates for feature computation
+            src_r = valid_rows[valid_edge]
+            src_c = valid_cols[valid_edge]
+            tgt_r = nr[valid_edge]
+            tgt_c = nc[valid_edge]
+            all_edge_coords.extend(zip(src_r, src_c, tgt_r, tgt_c))
         
         # Add self loops if requested
         if self.include_self_loops:
-            for node_idx, (r, c) in enumerate(zip(valid_rows, valid_cols)):
-                source_nodes.append(node_idx)
-                target_nodes.append(node_idx)
-                edge_coords.append((r, c, r, c))
+            all_src.append(node_indices)
+            all_tgt.append(node_indices)
+            all_edge_coords.extend(zip(valid_rows, valid_cols, valid_rows, valid_cols))
+        
+        if len(all_src) > 0:
+            src_array = np.concatenate(all_src)
+            tgt_array = np.concatenate(all_tgt)
+        else:
+            src_array = np.array([], dtype=np.int64)
+            tgt_array = np.array([], dtype=np.int64)
         
         edge_index = torch.tensor(
-            [source_nodes, target_nodes],
+            np.stack([src_array, tgt_array]),
             dtype=torch.long
         )
         
-        return edge_index, edge_coords
+        return edge_index, all_edge_coords
     
     def _compute_node_features(
         self,
@@ -255,7 +283,7 @@ class GraphBuilder:
         
         grad_y, grad_x = np.gradient(depth_filled)
         grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-        curvature = self._compute_curvature(depth_filled)
+        curvature = self._compute_curvature(depth_filled, valid_mask)
         
         for feature_name in self.node_features:
             if feature_name == "depth":
@@ -403,22 +431,31 @@ class GraphBuilder:
         
         return local_mean, local_std, count.astype(np.float32)
     
-    def _local_std(self, arr: np.ndarray, size: int = 5) -> np.ndarray:
-        """Compute local standard deviation using uniform filter.
+    def _compute_curvature(
+        self,
+        depth: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Compute surface curvature (Laplacian).
         
-        Note: This legacy method does NOT handle boundaries correctly.
-        Use _masked_local_stats instead for boundary-aware computation.
-        Kept for backward compatibility with any external callers.
+        Args:
+            depth: 2D depth array (should be boundary-filled before calling)
+            valid_mask: If provided, nodes with fewer than 3 valid neighbors
+                in the 3x3 Laplacian kernel get curvature = 0.0 to avoid
+                misleading edge artifacts.
         """
-        arr_sq = ndimage.uniform_filter(arr**2, size=size, mode='nearest')
-        arr_mean = ndimage.uniform_filter(arr, size=size, mode='nearest')
-        variance = arr_sq - arr_mean**2
-        variance = np.maximum(variance, 0)  # Numerical stability
-        return np.sqrt(variance)
-    
-    def _compute_curvature(self, depth: np.ndarray) -> np.ndarray:
-        """Compute surface curvature (Laplacian)."""
-        return ndimage.laplace(depth)
+        curvature = ndimage.laplace(depth)
+        
+        if valid_mask is not None:
+            # Count valid neighbors in the 3x3 Laplacian kernel
+            kernel = np.ones((3, 3), dtype=np.float64)
+            neighbor_count = ndimage.convolve(
+                valid_mask.astype(np.float64), kernel, mode='constant', cval=0.0
+            )
+            # Zero out curvature where fewer than 3 valid cells in kernel
+            curvature[neighbor_count < 3] = 0.0
+        
+        return curvature
     
     def _create_empty_graph(self) -> Data:
         """Create an empty graph for invalid tiles."""

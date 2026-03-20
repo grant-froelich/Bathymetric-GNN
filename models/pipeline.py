@@ -28,6 +28,7 @@ from data import (
     GraphBuilder,
 )
 from .gnn import BathymetricGNN
+from config.constants import CORRECTION_NORM_FLOOR
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,6 @@ class BathymetricPipeline:
         
         # Process tiles
         num_tiles = 0
-        num_skipped = 0
         _, _, specs = self.tile_manager.compute_tile_grid(grid.shape)
         
         for tile in self.tile_manager.iterate_tiles(grid, skip_empty=True):
@@ -184,15 +184,13 @@ class BathymetricPipeline:
             if num_tiles % 10 == 0:
                 logger.info(f"Processed {num_tiles}/{len(specs)} tiles")
         
-        logger.info(f"Processed {num_tiles} tiles")
+        logger.info(f"Processed {num_tiles} tiles ({len(specs) - num_tiles} skipped below min_valid_ratio)")
         
         # Finalize results
         results = merger.finalize()
         
-        # Create valid mask for output
-        valid_mask = np.isfinite(grid.depth)
-        if grid.nodata_value is not None and not np.isnan(grid.nodata_value):
-            valid_mask &= (grid.depth != grid.nodata_value)
+        # Create valid mask for output (use grid's canonical mask)
+        valid_mask = grid.valid_mask
         results['valid_mask'] = valid_mask.astype(np.float32)
         
         # Fill in unprocessed areas with original data
@@ -291,11 +289,22 @@ class BathymetricPipeline:
         
         correction = np.zeros(tile.shape, dtype=np.float32)
         if 'correction' in outputs:
-            correction = self.graph_builder.graph_to_grid(
+            # Model outputs corrections in normalized units (correction / local_std).
+            # Denormalize by multiplying back by local_std to get meters.
+            norm_correction = self.graph_builder.graph_to_grid(
                 graph.cpu(),
                 outputs['correction'].cpu(),
                 fill_value=0.0,
             )
+            local_std_grid = self.graph_builder.graph_to_grid(
+                graph.cpu(),
+                graph.local_std.cpu() if hasattr(graph, 'local_std') else
+                    torch.zeros(graph.num_nodes),
+                fill_value=0.0,
+            )
+            # Floor to prevent near-zero multiplication in flat areas
+            local_std_grid = np.maximum(local_std_grid, CORRECTION_NORM_FLOOR)
+            correction = norm_correction * local_std_grid
         
         return {
             'cleaned_depth': tile.data,  # Original, corrections applied later

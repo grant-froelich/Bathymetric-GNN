@@ -23,7 +23,14 @@ import numpy as np
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+try:
+    from torch_geometric.data import Batch as PyGBatch
+    PYG_BATCH_AVAILABLE = True
+except ImportError:
+    PYG_BATCH_AVAILABLE = False
+
 from config import Config
+from config.constants import CORRECTION_NORM_FLOOR
 from models.gnn import BathymetricGNN
 from data import GraphBuilder, VRBagHandler, VRBagWriter, SRBagHandler, SRBagWriter
 from data.vr_bag import SidecarBuilder, detect_bag_type
@@ -108,9 +115,17 @@ def parse_args():
 
 
 class NativeVRProcessor:
-    """Processes VR BAG refinement grids through GNN."""
+    """Processes VR BAG refinement grids through GNN.
+    
+    Supports both single-grid and batched processing. Batched mode
+    accumulates multiple small grids into a single PyTorch Geometric
+    Batch for a single forward pass, reducing per-grid overhead for
+    VR BAGs with thousands of tiny refinement grids.
+    """
     
     CLASS_NOISE = 2
+    # Maximum number of nodes to accumulate before flushing a batch
+    BATCH_NODE_BUDGET = 50000
     
     def __init__(
         self,
@@ -131,44 +146,26 @@ class NativeVRProcessor:
         try:
             self.expected_in_channels = model.feature_extractor.mlp[0].in_features
             logger.info(f"Model expects {self.expected_in_channels} input features")
-        except:
+        except (AttributeError, IndexError):
+            logger.warning("Could not detect model input channels; will use all available features")
             self.expected_in_channels = None
-    
-    def process_grid(
-        self,
-        depth: np.ndarray,
-        uncertainty: np.ndarray,
-        resolution: tuple,
-    ) -> tuple:
-        """
-        Process a single refinement grid.
         
-        Args:
-            depth: 2D depth array
-            uncertainty: 2D uncertainty array
-            resolution: (x_res, y_res) tuple
-            
-        Returns:
-            (classification, confidence, correction) arrays
-        """
-        # Create valid mask
-        nodata = 1.0e6
+        # Batching support
+        self._batch_graphs = []
+        self._batch_metadata = []  # (depth_shape, has_local_std)
+        self._batch_node_count = 0
+    
+    def _build_graph_for_grid(self, depth, uncertainty, resolution, nodata):
+        """Build a graph from a single grid, handling uncertainty channel selection."""
         valid_mask = (depth != nodata) & np.isfinite(depth)
         
         if not np.any(valid_mask):
-            # Return empty results
-            return (
-                np.zeros_like(depth, dtype=np.float32),
-                np.zeros_like(depth, dtype=np.float32),
-                np.zeros_like(depth, dtype=np.float32),
-            )
+            return None, valid_mask
         
-        # Build graph
-        # Skip uncertainty if model was trained without it (expects 7 features vs 8)
         use_uncertainty = uncertainty
         if self.expected_in_channels == 7:
             use_uncertainty = None
-            
+        
         graph = self.graph_builder.build_graph(
             depth=depth,
             valid_mask=valid_mask,
@@ -177,54 +174,172 @@ class NativeVRProcessor:
         )
         
         if graph.num_nodes == 0:
-            return (
-                np.zeros_like(depth, dtype=np.float32),
-                np.zeros_like(depth, dtype=np.float32),
-                np.zeros_like(depth, dtype=np.float32),
+            return None, valid_mask
+        
+        return graph, valid_mask
+    
+    def _extract_results_from_outputs(self, graph, outputs, depth_shape):
+        """Convert model outputs back to grids for a single graph."""
+        classification = self.graph_builder.graph_to_grid(
+            graph, outputs['predicted_class'].float(), fill_value=0.0,
+        )
+        confidence = self.graph_builder.graph_to_grid(
+            graph, outputs['confidence'], fill_value=0.0,
+        )
+        
+        correction = np.zeros(depth_shape, dtype=np.float32)
+        if 'correction' in outputs:
+            norm_correction = self.graph_builder.graph_to_grid(
+                graph, outputs['correction'], fill_value=0.0,
             )
+            local_std_grid = self.graph_builder.graph_to_grid(
+                graph,
+                graph.local_std if hasattr(graph, 'local_std') else
+                    torch.zeros(graph.num_nodes),
+                fill_value=0.0,
+            )
+            local_std_grid = np.maximum(local_std_grid, CORRECTION_NORM_FLOOR)
+            correction = norm_correction * local_std_grid
         
-        # Run inference
+        return classification, confidence, correction
+    
+    def process_grid(
+        self,
+        depth: np.ndarray,
+        uncertainty: np.ndarray,
+        resolution: tuple,
+        nodata: float = 1.0e6,
+    ) -> tuple:
+        """
+        Process a single refinement grid (unbatched).
+        
+        Args:
+            depth: 2D depth array
+            uncertainty: 2D uncertainty array
+            resolution: (x_res, y_res) tuple
+            nodata: NoData sentinel value
+            
+        Returns:
+            (classification, confidence, correction) arrays
+        """
+        empty = (
+            np.zeros_like(depth, dtype=np.float32),
+            np.zeros_like(depth, dtype=np.float32),
+            np.zeros_like(depth, dtype=np.float32),
+        )
+        
+        graph, valid_mask = self._build_graph_for_grid(depth, uncertainty, resolution, nodata)
+        if graph is None:
+            return empty
+        
+        # Run inference on single graph
         graph = graph.to(self.device)
-        
         with torch.no_grad():
             outputs = self.model.predict(
                 graph,
                 auto_correct_threshold=self.auto_correct_threshold,
             )
         
-        # Convert back to grids
-        classification = self.graph_builder.graph_to_grid(
-            graph.cpu(),
-            outputs['predicted_class'].cpu().float(),
-            fill_value=0.0,
+        # Move back to CPU for grid conversion
+        graph_cpu = graph.cpu()
+        outputs_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+        
+        return self._extract_results_from_outputs(graph_cpu, outputs_cpu, depth.shape)
+    
+    def add_to_batch(self, depth, uncertainty, resolution, nodata=1.0e6):
+        """Accumulate a grid into the pending batch.
+        
+        Returns None if the grid was added to the batch (results pending).
+        Returns results tuple immediately for grids with no valid data.
+        Call flush_batch() to process all accumulated grids.
+        """
+        empty = (
+            np.zeros_like(depth, dtype=np.float32),
+            np.zeros_like(depth, dtype=np.float32),
+            np.zeros_like(depth, dtype=np.float32),
         )
         
-        confidence = self.graph_builder.graph_to_grid(
-            graph.cpu(),
-            outputs['confidence'].cpu(),
-            fill_value=0.0,
-        )
+        graph, valid_mask = self._build_graph_for_grid(depth, uncertainty, resolution, nodata)
+        if graph is None:
+            return empty  # Immediately return empty results
         
-        correction = np.zeros_like(depth, dtype=np.float32)
-        if 'correction' in outputs:
-            # Model outputs corrections in normalized units (correction / local_std).
-            # Denormalize by multiplying back by local_std to get meters.
-            norm_correction = self.graph_builder.graph_to_grid(
-                graph.cpu(),
-                outputs['correction'].cpu(),
-                fill_value=0.0,
-            )
-            local_std_grid = self.graph_builder.graph_to_grid(
-                graph.cpu(),
-                graph.local_std.cpu() if hasattr(graph, 'local_std') else 
-                    torch.zeros(graph.num_nodes),
-                fill_value=0.0,
-            )
-            # Floor to prevent near-zero multiplication in flat areas
-            local_std_grid = np.maximum(local_std_grid, 0.01)
-            correction = norm_correction * local_std_grid
+        self._batch_graphs.append(graph)
+        self._batch_metadata.append(depth.shape)
+        self._batch_node_count += graph.num_nodes
+        return None  # Results pending
+    
+    @property
+    def batch_ready(self):
+        """True if accumulated batch has enough nodes to justify a forward pass."""
+        return self._batch_node_count >= self.BATCH_NODE_BUDGET
+    
+    @property
+    def batch_pending(self):
+        """True if there are any graphs waiting in the batch."""
+        return len(self._batch_graphs) > 0
+    
+    def flush_batch(self):
+        """Process all accumulated graphs in a single batched forward pass.
         
-        return classification, confidence, correction
+        Returns:
+            List of (classification, confidence, correction) tuples,
+            one per grid in the order they were added.
+        """
+        if not self._batch_graphs:
+            return []
+        
+        graphs = self._batch_graphs
+        metadata = self._batch_metadata
+        self._batch_graphs = []
+        self._batch_metadata = []
+        self._batch_node_count = 0
+        
+        # If only one graph or PyG Batch unavailable, process individually
+        if len(graphs) == 1 or not PYG_BATCH_AVAILABLE:
+            results = []
+            for graph, shape in zip(graphs, metadata):
+                graph = graph.to(self.device)
+                with torch.no_grad():
+                    outputs = self.model.predict(
+                        graph, auto_correct_threshold=self.auto_correct_threshold,
+                    )
+                graph_cpu = graph.cpu()
+                outputs_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+                results.append(self._extract_results_from_outputs(graph_cpu, outputs_cpu, shape))
+            return results
+        
+        # Batch all graphs into a single forward pass
+        batch = PyGBatch.from_data_list(graphs).to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model.predict(
+                batch,
+                auto_correct_threshold=self.auto_correct_threshold,
+            )
+        
+        # Move everything to CPU for unbatching
+        batch_cpu = batch.cpu()
+        outputs_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+        batch_indices = batch_cpu.batch.numpy()
+        
+        # Unbatch: split per-node tensors back into per-graph results
+        results = []
+        for graph_idx, (orig_graph, shape) in enumerate(zip(graphs, metadata)):
+            node_mask = batch_indices == graph_idx
+            
+            # Build a per-graph outputs dict by slicing the batched tensors
+            graph_outputs = {}
+            for key, val in outputs_cpu.items():
+                if isinstance(val, torch.Tensor) and val.shape[0] == len(batch_indices):
+                    graph_outputs[key] = val[node_mask]
+                else:
+                    graph_outputs[key] = val
+            
+            # Reconstruct a minimal graph with correct metadata for graph_to_grid
+            # We use the original (CPU) graph which has grid_shape, valid_rows, valid_cols
+            results.append(self._extract_results_from_outputs(orig_graph, graph_outputs, shape))
+        
+        return results
 
 
 def main():
@@ -239,6 +354,11 @@ def main():
     
     if not args.model.exists():
         logger.error(f"Model file not found: {args.model}")
+        sys.exit(1)
+    
+    # Validate thresholds
+    if not (0.0 <= args.auto_correct_threshold <= 1.0):
+        logger.error(f"--auto-correct-threshold must be between 0.0 and 1.0, got {args.auto_correct_threshold}")
         sys.exit(1)
     
     # Create output directory
@@ -349,24 +469,22 @@ def main():
         'total_confidence': 0.0,
     }
     
+    # Get nodata value from handler
+    handler_nodata = getattr(handler, 'NODATA', 1.0e6)
+    total_grids = info.get('num_refined_cells', info.get('total_refinement_nodes', 0))
+    
     try:
-        for i, grid in enumerate(handler.iterate_refinements(args.min_valid_ratio)):
-            # Process through GNN
-            classification, confidence, correction = processor.process_grid(
-                grid.depth,
-                grid.uncertainty,
-                grid.resolution,
-            )
-            
-            # Add to sidecar if building one
+        # Accumulate grids for batched processing
+        pending_grids = []  # Stores (grid, immediate_result_or_None) for batch flush
+        
+        def apply_results(grid, classification, confidence, correction):
+            """Apply inference results for a single grid."""
             if sidecar is not None:
                 sidecar.add_refinement_results(grid, classification, confidence, correction)
             
-            # Apply corrections
             corrected_depth = grid.depth.copy()
             corrected_uncertainty = grid.uncertainty.copy()
             
-            # Only correct high-confidence noise
             noise_mask = (classification == processor.CLASS_NOISE) & grid.valid_mask
             high_conf = confidence >= args.auto_correct_threshold
             apply_mask = noise_mask & high_conf
@@ -374,26 +492,50 @@ def main():
             if np.any(apply_mask):
                 corrected_depth[apply_mask] -= correction[apply_mask]
                 stats['cells_corrected'] += int(np.sum(apply_mask))
-                
-                # Scale uncertainty by confidence
                 scale = 2.0 - confidence[apply_mask]
                 corrected_uncertainty[apply_mask] *= scale
             
-            # Write back
-            writer.update_refinement_batch(
-                grid,
-                corrected_depth,
-                corrected_uncertainty,
-            )
+            writer.update_refinement_batch(grid, corrected_depth, corrected_uncertainty)
             
-            # Update stats
             stats['grids_processed'] += 1
             stats['cells_processed'] += grid.num_valid
             stats['cells_classified_noise'] += int(np.sum(noise_mask))
             stats['total_confidence'] += float(np.sum(confidence[grid.valid_mask]))
+        
+        def flush_pending():
+            """Flush accumulated batch and apply all results."""
+            if not pending_grids:
+                return
+            batch_results = processor.flush_batch()
+            batch_idx = 0
+            for grid, immediate in pending_grids:
+                if immediate is not None:
+                    # Grid had no valid data; results were returned immediately
+                    apply_results(grid, *immediate)
+                else:
+                    apply_results(grid, *batch_results[batch_idx])
+                    batch_idx += 1
+            pending_grids.clear()
+        
+        for i, grid in enumerate(handler.iterate_refinements(args.min_valid_ratio)):
+            immediate = processor.add_to_batch(
+                grid.depth, grid.uncertainty, grid.resolution, nodata=handler_nodata,
+            )
+            pending_grids.append((grid, immediate))
             
-            if bag_type == 'VR' and (i + 1) % 500 == 0:
-                logger.info(f"Processed {i + 1}/{info['num_refined_cells']} refinement grids")
+            # Flush when batch is large enough
+            if processor.batch_ready:
+                flush_pending()
+            
+            if (i + 1) % 100 == 0 or (i + 1) == total_grids:
+                pct = 100 * (i + 1) / max(1, total_grids)
+                logger.info(
+                    f"Processed {i + 1:,}/{total_grids:,} grids ({pct:.1f}%) - "
+                    f"{stats['cells_corrected']:,} cells corrected so far"
+                )
+        
+        # Flush any remaining grids
+        flush_pending()
     
     finally:
         writer.close()

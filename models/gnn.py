@@ -23,7 +23,7 @@ try:
         BatchNorm,
         global_mean_pool,
     )
-    from torch_geometric.data import Data, Batch
+    from torch_geometric.data import Data
     TORCH_GEOMETRIC_AVAILABLE = True
 except ImportError:
     TORCH_GEOMETRIC_AVAILABLE = False
@@ -451,44 +451,3 @@ class BathymetricGNN(nn.Module):
         return outputs
 
 
-class BathymetricGNNLightning(nn.Module):
-    """
-    PyTorch Lightning wrapper for BathymetricGNN.
-    
-    Handles training, validation, and logging.
-    
-    Note: Requires pytorch-lightning to be installed.
-    This is a placeholder showing the interface - full implementation
-    would go in training/trainer.py
-    """
-    
-    def __init__(self, model: BathymetricGNN, learning_rate: float = 1e-3):
-        super().__init__()
-        self.model = model
-        self.learning_rate = learning_rate
-    
-    def forward(self, data: Data) -> Dict[str, torch.Tensor]:
-        return self.model(data)
-    
-    def training_step(self, batch: Batch, batch_idx: int) -> torch.Tensor:
-        """Single training step."""
-        outputs = self.forward(batch)
-        
-        # Classification loss
-        class_loss = F.cross_entropy(
-            outputs['class_logits'],
-            batch.y,  # Ground truth labels
-        )
-        
-        # Correction loss (if applicable)
-        if self.model.predict_correction and hasattr(batch, 'correction_target'):
-            correction_loss = F.mse_loss(
-                outputs['correction'],
-                batch.correction_target,
-            )
-        else:
-            correction_loss = 0.0
-        
-        total_loss = class_loss + 0.5 * correction_loss
-        
-        return total_loss

@@ -145,34 +145,29 @@ def test_tiling(grid):
     num_rows, num_cols, specs = tile_manager.compute_tile_grid(grid.shape)
     print(f"Grid {grid.shape} -> {num_rows} x {num_cols} = {len(specs)} tiles")
     
-    # Extract a few tiles
+    # Extract tiles in a single pass - count valid and skipped
     print("\nExtracting sample tiles...")
     tiles_extracted = 0
     tiles_skipped = 0
+    sample_tile = None
     
-    for i, tile in enumerate(tile_manager.iterate_tiles(grid, skip_empty=True)):
-        tiles_extracted += 1
-        if tiles_extracted <= 3:
-            print(f"  Tile ({tile.tile_row}, {tile.tile_col}): "
-                  f"{tile.shape}, valid={tile.valid_ratio:.1%}")
-        if tiles_extracted >= 10:
-            break
-    
-    # Count skipped
     for tile in tile_manager.iterate_tiles(grid, skip_empty=False):
         if tile.valid_ratio < 0.1:
             tiles_skipped += 1
+            continue
+        tiles_extracted += 1
+        if sample_tile is None:
+            sample_tile = tile
+        if tiles_extracted <= 3:
+            print(f"  Tile ({tile.tile_row}, {tile.tile_col}): "
+                  f"{tile.shape}, valid={tile.valid_ratio:.1%}")
     
     print(f"\n✓ Tiling works")
     print(f"  Total tiles: {len(specs)}")
     print(f"  Would skip (low valid): ~{tiles_skipped}")
-    print(f"  Usable tiles: ~{len(specs) - tiles_skipped}")
+    print(f"  Usable tiles: ~{tiles_extracted}")
     
-    # Return a sample tile for further testing
-    for tile in tile_manager.iterate_tiles(grid, skip_empty=True):
-        return tile
-    
-    return None
+    return sample_tile
 
 
 def test_graph_construction(tile, resolution):

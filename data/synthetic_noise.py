@@ -29,7 +29,7 @@ class NoiseLabel:
     clean_depth: np.ndarray           # Original clean depth
     noise_mask: np.ndarray            # Boolean mask where noise was added
     noise_magnitude: np.ndarray       # Magnitude of noise at each point
-    classification: np.ndarray        # Per-pixel class (0=clean, 1=noise)
+    classification: np.ndarray        # Per-pixel class (0=seafloor, 2=noise) - model convention
 
 
 class SyntheticNoiseGenerator:
@@ -162,8 +162,10 @@ class SyntheticNoiseGenerator:
                 depth_std, intensity
             )
         
-        # Create classification labels
-        classification = np.where(noise_mask, 1, 0).astype(np.int64)
+        # Create classification labels using model convention:
+        # 0=seafloor, 1=feature, 2=noise
+        # Synthetic data has no explicit features, only seafloor and noise.
+        classification = np.where(noise_mask, 2, 0).astype(np.int64)
         
         logger.debug(
             f"Generated noise: {np.sum(noise_mask)} noisy cells "

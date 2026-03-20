@@ -161,10 +161,9 @@ class TileManager:
                 spec.col_start:spec.col_end
             ].copy()
         
-        # Compute valid mask
-        valid_mask = np.isfinite(data)
-        if grid.nodata_value is not None and not np.isnan(grid.nodata_value):
-            valid_mask &= (data != grid.nodata_value)
+        # Compute valid mask from grid's canonical mask for this region
+        full_valid_mask = grid.valid_mask
+        valid_mask = full_valid_mask[spec.row_start:spec.row_end, spec.col_start:spec.col_end].copy()
         
         return Tile(
             data=data,
@@ -312,16 +311,21 @@ class TileManager:
         return weights.astype(np.float32)
     
     def _create_1d_blend(self, size: int) -> np.ndarray:
-        """Create 1D blend weights with ramps at edges."""
+        """Create 1D blend weights with cosine ramps at edges.
+        
+        Uses raised cosine (Hann) window ramps for C1 continuity at
+        blend boundaries, avoiding the gradient discontinuity that
+        linear ramps produce.
+        """
         weights = np.ones(size, dtype=np.float32)
         
         ramp_size = min(self.overlap, size // 4)
         
         if ramp_size > 0:
-            # Linear ramp at start
-            weights[:ramp_size] = np.linspace(0, 1, ramp_size)
-            # Linear ramp at end
-            weights[-ramp_size:] = np.linspace(1, 0, ramp_size)
+            # Cosine ramp at start (0 -> 1)
+            weights[:ramp_size] = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, ramp_size)))
+            # Cosine ramp at end (1 -> 0)
+            weights[-ramp_size:] = 0.5 * (1 - np.cos(np.pi * np.linspace(1, 0, ramp_size)))
         
         return weights
 
@@ -337,10 +341,17 @@ class TileMerger:
     - Any additional outputs
     """
     
+    # Channels that should NOT be blended via weighted averaging because
+    # they are discrete labels. In overlap regions, we keep the value from
+    # the tile with higher confidence rather than averaging class indices.
+    DISCRETE_CHANNELS = {'classification'}
+
     def __init__(self, tile_manager: TileManager):
         self.tile_manager = tile_manager
         self.outputs = {}
         self.weights = {}
+        # Separate confidence tracker for resolving discrete channel overlaps
+        self._confidence_tracker = None
     
     def initialize(
         self,
@@ -365,6 +376,10 @@ class TileMerger:
             self.weights[channel] = np.zeros(grid_shape, dtype=np.float32)
         
         logger.info(f"Initialized {len(channels)} output channels for {grid_shape}")
+        
+        # Track per-cell confidence to resolve discrete channel overlaps
+        if any(ch in self.DISCRETE_CHANNELS for ch in channels):
+            self._confidence_tracker = np.full(grid_shape, -1.0, dtype=np.float32)
     
     def add_tile(
         self,
@@ -374,20 +389,43 @@ class TileMerger:
         """
         Add processed tile data for all channels.
         
+        For continuous channels (depth, confidence, correction), uses weighted
+        blending in overlap regions. For discrete channels (classification),
+        keeps the value from the tile with higher confidence to avoid producing
+        invalid fractional class indices.
+        
         Args:
             spec: Tile specification
             channel_data: Dict of channel_name -> tile_data
         """
+        # Get this tile's confidence for resolving discrete channel overlaps
+        tile_confidence = channel_data.get('confidence', None)
+        
         for channel, data in channel_data.items():
             if channel not in self.outputs:
                 raise ValueError(f"Unknown channel: {channel}")
             
-            self.tile_manager.merge_tile(
-                self.outputs[channel],
-                data,
-                spec,
-                self.weights[channel],
-            )
+            if channel in self.DISCRETE_CHANNELS and tile_confidence is not None and self._confidence_tracker is not None:
+                # For discrete channels: keep value from tile with higher confidence
+                region = self.outputs[channel][spec.row_start:spec.row_end, spec.col_start:spec.col_end]
+                conf_region = self._confidence_tracker[spec.row_start:spec.row_end, spec.col_start:spec.col_end]
+                
+                valid_mask = np.isfinite(data)
+                higher_confidence = tile_confidence > conf_region
+                # Also write where we have no previous value
+                no_previous = np.isnan(region)
+                update_mask = valid_mask & (higher_confidence | no_previous)
+                
+                region[update_mask] = data[update_mask]
+                conf_region[update_mask] = tile_confidence[update_mask]
+            else:
+                # For continuous channels: standard weighted blending
+                self.tile_manager.merge_tile(
+                    self.outputs[channel],
+                    data,
+                    spec,
+                    self.weights[channel],
+                )
     
     def finalize(self) -> dict:
         """
@@ -399,13 +437,18 @@ class TileMerger:
         results = {}
         
         for channel in self.outputs:
-            results[channel] = self.tile_manager.finalize_output(
-                self.outputs[channel],
-                self.weights[channel],
-            )
+            if channel in self.DISCRETE_CHANNELS:
+                # Discrete channels were resolved by confidence selection, no averaging needed
+                results[channel] = self.outputs[channel]
+            else:
+                results[channel] = self.tile_manager.finalize_output(
+                    self.outputs[channel],
+                    self.weights[channel],
+                )
         
         # Clear internal state
         self.outputs = {}
         self.weights = {}
+        self._confidence_tracker = None
         
         return results

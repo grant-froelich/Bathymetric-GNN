@@ -36,6 +36,7 @@ except ImportError:
     GDAL_AVAILABLE = False
 
 from config import Config
+from config.constants import CORRECTION_NORM_FLOOR, CORRECTION_NORM_CAP
 from data import (
     BathymetricLoader,
     TileManager,
@@ -48,26 +49,21 @@ from .losses import BathymetricGNNLoss, compute_class_weights, compute_correctio
 
 logger = logging.getLogger(__name__)
 
-# Floor value for local_std normalization to prevent division by near-zero
-# in perfectly flat areas. 0.01m is well below any real bathymetric variability.
-CORRECTION_NORM_FLOOR = 0.01
-
-# Maximum allowed normalized correction magnitude (in local_std units).
-# Corrections beyond this are clamped to prevent extreme outliers from
-# dominating training. 50 std devs is well beyond any legitimate noise
-# pattern while still allowing the model to learn large corrections.
-CORRECTION_NORM_CAP = 50.0
-
 
 class GroundTruthDataset(Dataset):
     """
     Dataset that loads training samples from prepared ground truth files.
     
-    Ground truth files are GeoTIFFs with 4 bands:
+    Ground truth files are GeoTIFFs with 4+ bands:
     - Band 1: Labels (0=seafloor, 2=noise, -1=nodata)
     - Band 2: Difference (noisy - clean = correction target)
     - Band 3: Noisy depth
     - Band 4: Clean depth
+    - Band 5: Uncertainty (optional)
+    
+    Tiles are loaded lazily from disk on demand with an LRU cache to
+    avoid loading all survey data into RAM at initialization. This allows
+    scaling to 22+ surveys without exhausting memory.
     """
     
     def __init__(
@@ -77,6 +73,7 @@ class GroundTruthDataset(Dataset):
         tile_size: int = 512,
         overlap: int = 64,
         min_valid_ratio: float = 0.1,
+        cache_size: int = 256,
     ):
         """
         Initialize dataset from ground truth files.
@@ -87,6 +84,7 @@ class GroundTruthDataset(Dataset):
             tile_size: Size of tiles to extract
             overlap: Overlap between tiles
             min_valid_ratio: Minimum ratio of valid cells to include a tile
+            cache_size: Number of tiles to keep in the LRU cache
         """
         if not GDAL_AVAILABLE:
             raise ImportError("GDAL is required for GroundTruthDataset")
@@ -96,112 +94,151 @@ class GroundTruthDataset(Dataset):
         self.overlap = overlap
         self.min_valid_ratio = min_valid_ratio
         
-        # Load all ground truth files and extract tiles
-        self.tiles = []
+        # Store tile metadata (file path + coordinates) instead of tile data.
+        # Actual tile data is loaded lazily in __getitem__.
+        self._tile_specs = []  # List of (path, row_start, col_start, row_end, col_end, resolution, has_uncertainty)
         
-        logger.info(f"Loading {len(ground_truth_paths)} ground truth files...")
+        # Pre-computed class counts from scanning (avoids loading all tiles for stats)
+        self._class_counts = {0: 0, 1: 0, 2: 0}
+        
+        # LRU cache: maps tile index -> tile dict
+        self._cache = {}
+        self._cache_order = []  # Oldest first
+        self._cache_size = cache_size
+        
+        logger.info(f"Scanning {len(ground_truth_paths)} ground truth files for tile specs...")
         
         for gt_path in ground_truth_paths:
             try:
-                self._load_ground_truth(gt_path)
+                self._scan_ground_truth(gt_path)
             except Exception as e:
-                logger.warning(f"Failed to load ground truth {gt_path}: {e}")
+                logger.warning(f"Failed to scan ground truth {gt_path}: {e}")
         
-        logger.info(f"Dataset contains {len(self.tiles)} tiles from {len(ground_truth_paths)} ground truth files")
+        logger.info(f"Dataset contains {len(self._tile_specs)} tiles from {len(ground_truth_paths)} ground truth files")
     
-    def _load_ground_truth(self, path: Path):
-        """Load a ground truth file and extract tiles."""
+    def _scan_ground_truth(self, path: Path):
+        """Scan a ground truth file and record valid tile specs without loading full data."""
         ds = gdal.Open(str(path))
         if ds is None:
             raise IOError(f"Failed to open ground truth file: {path}")
         
-        # Read bands
-        labels = ds.GetRasterBand(1).ReadAsArray().astype(np.int32)
-        difference = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
-        noisy_depth = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
-        clean_depth = ds.GetRasterBand(4).ReadAsArray().astype(np.float32)
-        
-        # Read uncertainty if available (band 5)
-        uncertainty = None
-        if ds.RasterCount >= 5:
-            uncertainty = ds.GetRasterBand(5).ReadAsArray().astype(np.float32)
-        
-        # Get resolution from geotransform
-        gt = ds.GetGeoTransform()
-        resolution = (abs(gt[1]), abs(gt[5]))
-        
-        ds = None
+        try:
+            labels = ds.GetRasterBand(1).ReadAsArray().astype(np.int32)
+            gt = ds.GetGeoTransform()
+            resolution = (abs(gt[1]), abs(gt[5]))
+            has_uncertainty = ds.RasterCount >= 5
+        finally:
+            ds = None
         
         height, width = labels.shape
         stride = self.tile_size - self.overlap
         
-        # Extract tiles
+        # Scan tiles and record only those that meet validity threshold
         for row_start in range(0, height - self.tile_size + 1, stride):
             for col_start in range(0, width - self.tile_size + 1, stride):
                 row_end = row_start + self.tile_size
                 col_end = col_start + self.tile_size
                 
-                # Extract tile data
                 tile_labels = labels[row_start:row_end, col_start:col_end]
-                tile_diff = difference[row_start:row_end, col_start:col_end]
-                tile_noisy = noisy_depth[row_start:row_end, col_start:col_end]
-                tile_clean = clean_depth[row_start:row_end, col_start:col_end]
-                tile_uncert = None
-                if uncertainty is not None:
-                    tile_uncert = uncertainty[row_start:row_end, col_start:col_end]
-                
-                # Valid mask (labels != -1)
                 valid_mask = tile_labels >= 0
                 valid_ratio = np.sum(valid_mask) / valid_mask.size
                 
                 if valid_ratio >= self.min_valid_ratio:
-                    self.tiles.append({
-                        'labels': tile_labels.copy(),
-                        'difference': tile_diff.copy(),
-                        'noisy_depth': tile_noisy.copy(),
-                        'clean_depth': tile_clean.copy(),
-                        'uncertainty': tile_uncert.copy() if tile_uncert is not None else None,
-                        'valid_mask': valid_mask.copy(),
-                        'resolution': resolution,
-                        'source': path.stem,
-                    })
+                    self._tile_specs.append((
+                        path, row_start, col_start, row_end, col_end,
+                        resolution, has_uncertainty,
+                    ))
+                    # Accumulate class counts for efficient stats computation
+                    for c in (0, 1, 2):
+                        self._class_counts[c] += int(np.sum(tile_labels[valid_mask] == c))
         
-        # Handle edge tiles if there's remaining data
-        if height % stride != 0 or width % stride != 0:
-            # Bottom-right corner tile
-            if height > self.tile_size and width > self.tile_size:
+        # Handle edge tile
+        if height > self.tile_size and width > self.tile_size:
+            if height % stride != 0 or width % stride != 0:
                 row_start = height - self.tile_size
                 col_start = width - self.tile_size
                 
                 tile_labels = labels[row_start:, col_start:]
-                tile_diff = difference[row_start:, col_start:]
-                tile_noisy = noisy_depth[row_start:, col_start:]
-                tile_clean = clean_depth[row_start:, col_start:]
-                tile_uncert = None
-                if uncertainty is not None:
-                    tile_uncert = uncertainty[row_start:, col_start:]
-                
                 valid_mask = tile_labels >= 0
                 valid_ratio = np.sum(valid_mask) / valid_mask.size
                 
                 if valid_ratio >= self.min_valid_ratio:
-                    self.tiles.append({
-                        'labels': tile_labels.copy(),
-                        'difference': tile_diff.copy(),
-                        'noisy_depth': tile_noisy.copy(),
-                        'clean_depth': tile_clean.copy(),
-                        'uncertainty': tile_uncert.copy() if tile_uncert is not None else None,
-                        'valid_mask': valid_mask.copy(),
-                        'resolution': resolution,
-                        'source': path.stem,
-                    })
+                    self._tile_specs.append((
+                        path, row_start, col_start, height, width,
+                        resolution, has_uncertainty,
+                    ))
+                    for c in (0, 1, 2):
+                        self._class_counts[c] += int(np.sum(tile_labels[valid_mask] == c))
+    
+    def _load_tile(self, idx: int) -> dict:
+        """Load a single tile from disk, with LRU caching."""
+        # Check cache first
+        if idx in self._cache:
+            # Move to end (most recently used)
+            self._cache_order.remove(idx)
+            self._cache_order.append(idx)
+            return self._cache[idx]
+        
+        path, row_start, col_start, row_end, col_end, resolution, has_uncertainty = self._tile_specs[idx]
+        
+        ds = gdal.Open(str(path))
+        if ds is None:
+            raise IOError(f"Failed to open ground truth file: {path}")
+        
+        try:
+            labels = ds.GetRasterBand(1).ReadAsArray(
+                col_start, row_start, col_end - col_start, row_end - row_start
+            ).astype(np.int32)
+            difference = ds.GetRasterBand(2).ReadAsArray(
+                col_start, row_start, col_end - col_start, row_end - row_start
+            ).astype(np.float32)
+            noisy_depth = ds.GetRasterBand(3).ReadAsArray(
+                col_start, row_start, col_end - col_start, row_end - row_start
+            ).astype(np.float32)
+            clean_depth = ds.GetRasterBand(4).ReadAsArray(
+                col_start, row_start, col_end - col_start, row_end - row_start
+            ).astype(np.float32)
+            
+            uncertainty = None
+            if has_uncertainty:
+                uncertainty = ds.GetRasterBand(5).ReadAsArray(
+                    col_start, row_start, col_end - col_start, row_end - row_start
+                ).astype(np.float32)
+        finally:
+            ds = None
+        
+        tile = {
+            'labels': labels,
+            'difference': difference,
+            'noisy_depth': noisy_depth,
+            'clean_depth': clean_depth,
+            'uncertainty': uncertainty,
+            'valid_mask': (labels >= 0),
+            'resolution': resolution,
+            'source': Path(path).stem,
+        }
+        
+        # Add to cache, evict oldest if full
+        self._cache[idx] = tile
+        self._cache_order.append(idx)
+        if len(self._cache_order) > self._cache_size:
+            evict_idx = self._cache_order.pop(0)
+            self._cache.pop(evict_idx, None)
+        
+        return tile
+    
+    # Keep backward-compatible .tiles property for any code that accesses it directly
+    @property
+    def tiles(self):
+        """Backward-compatible access. Prefer __len__/__getitem__ instead."""
+        return self._tile_specs
     
     def __len__(self) -> int:
-        return len(self.tiles)
+        return len(self._tile_specs)
     
     def __getitem__(self, idx: int) -> Data:
         """Get a single training sample."""
-        tile = self.tiles[idx]
+        tile = self._load_tile(idx)
         
         noisy_depth = tile['noisy_depth']
         valid_mask = tile['valid_mask']
@@ -291,6 +328,13 @@ class BathymetricGraphDataset(Dataset):
         self.graph_builder = graph_builder
         self.noise_augmentor = NoiseAugmentor(noise_generator) if augment else None
         self.noise_generator = noise_generator
+        self.cache_tiles = cache_tiles
+        
+        if not cache_tiles:
+            raise NotImplementedError(
+                "On-demand tile loading (cache_tiles=False) is not yet implemented. "
+                "Use cache_tiles=True or reduce tile count to fit in memory."
+            )
         
         self.loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
         
@@ -359,11 +403,9 @@ class BathymetricGraphDataset(Dataset):
             rows = graph.valid_rows.numpy()
             cols = graph.valid_cols.numpy()
             
-            # Classification labels (0=seafloor, 1=feature, 2=noise)
-            # For synthetic data, we only have noise vs non-noise
-            # Map to: 0=clean, 2=noise (no explicit features in synthetic data)
+            # Classification labels (0=seafloor, 2=noise)
+            # SyntheticNoiseGenerator outputs in model convention directly.
             class_labels = noise_result.classification[rows, cols]
-            class_labels = np.where(class_labels == 1, 2, 0)  # Map 1->2 (noise class)
             graph.y = torch.tensor(class_labels, dtype=torch.long)
             
             # Correction targets - local_std normalized (see GroundTruthDataset for details)
@@ -525,13 +567,10 @@ class Trainer:
         try:
             dataset = self.train_dataset
             
-            if hasattr(dataset, 'tiles'):
-                # Fast scan of tiles for class counts
-                for tile in dataset.tiles:
-                    labels = tile['labels']
-                    valid = labels >= 0
-                    for c in range(num_classes):
-                        counts[c] += int(np.sum(labels[valid] == c))
+            if hasattr(dataset, '_class_counts'):
+                # GroundTruthDataset: use pre-computed counts from scan phase
+                for c in range(num_classes):
+                    counts[c] = dataset._class_counts.get(c, 0)
                 
                 # Sample a subset of actual training items to get normalized
                 # corrections (requires graph construction for local_std)
@@ -777,6 +816,9 @@ class Trainer:
             'config': self.config,
             'in_channels': self.model.feature_extractor.mlp[0].in_features,
             'edge_dim': 3,  # Default
+            # Store normalization constants so inference uses matching values
+            'correction_norm_floor': CORRECTION_NORM_FLOOR,
+            'correction_norm_cap': CORRECTION_NORM_CAP,
         }
         
         if self.scheduler is not None:

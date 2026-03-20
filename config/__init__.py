@@ -7,6 +7,7 @@ from .config import (
     SyntheticNoiseConfig,
     InferenceConfig,
 )
+from .constants import CORRECTION_NORM_FLOOR, CORRECTION_NORM_CAP
 
 __all__ = [
     "Config",
@@ -16,4 +17,6 @@ __all__ = [
     "TrainingConfig",
     "SyntheticNoiseConfig",
     "InferenceConfig",
+    "CORRECTION_NORM_FLOOR",
+    "CORRECTION_NORM_CAP",
 ]

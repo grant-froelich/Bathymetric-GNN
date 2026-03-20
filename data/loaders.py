@@ -57,9 +57,14 @@ class BathymetricGrid:
     
     @property
     def valid_mask(self) -> np.ndarray:
-        """Return boolean mask of valid (non-nodata) cells."""
+        """Return boolean mask of valid (non-nodata) cells.
+        
+        This is the canonical valid mask computation. All downstream code
+        should use this property (or call grid.valid_mask) rather than
+        recomputing the mask independently.
+        """
         mask = np.isfinite(self.depth)
-        if self.nodata_value is not None:
+        if self.nodata_value is not None and not np.isnan(self.nodata_value):
             mask &= (self.depth != self.nodata_value)
         return mask
     
@@ -163,7 +168,10 @@ class BathymetricLoader:
             ds = gdal.Open(str(path), gdal.GA_ReadOnly)
             if ds is None:
                 raise IOError(f"Failed to open BAG file: {path}")
-            return self._load_sr_bag(path, ds)
+            try:
+                return self._load_sr_bag(path, ds)
+            finally:
+                ds = None
         
         # For VR BAGs, use the specified mode
         if self.vr_bag_mode == 'resampled':
