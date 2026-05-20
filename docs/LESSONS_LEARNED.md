@@ -301,6 +301,27 @@ python scripts/prepare_ground_truth.py \
 
 ---
 
+### 14. Classification Metrics Don't Fit Regression Output
+
+**Problem Identified (May 2026):** Tempting to apply accuracy, precision, recall, and F1 to V10 by post-hoc thresholding the predicted corrections and comparing against thresholded ground truth.
+
+**Why This Doesn't Work:** It reintroduces exactly the threshold problem V10 was designed to avoid. A cell with a 0.14m predicted correction and one with 0.16m are nearly identical predictions, but a 0.15m threshold classifies them differently. The arbitrary threshold determines whether the model "looks good" on classification metrics, so those metrics don't actually measure model quality.
+
+**Metrics V10 Uses Instead:**
+- **MAE and RMSE** in meters: standard regression accuracy
+- **MAE normalized by local_std**: comparable across depth regimes
+- **Per-magnitude-bucket MAE**: separates performance on small vs large corrections
+- **Hazardous error rate**: safety-critical (fraction of cells where predicted < target, meaning corrected depth ends up deeper than reality)
+- **Recovery RMSE**: how close the corrected surface gets to the clean reference (single-number operational summary)
+
+**What Stays Outside the Model's Metrics:**
+- IHO order compliance is determined by the uncertainty layer in the BAG, not the model
+- Charted feature preservation is enforced by operational thresholds and human QC, not by training metrics
+
+Implementation: `training/metrics.py` defines `V10Metrics` dataclass and `compute_v10_metrics()` function. See HOW_IT_WORKS.md for the full rationale per metric.
+
+---
+
 ## Recommended Training Workflow
 
 ### Classification Mode (V9, existing approach)

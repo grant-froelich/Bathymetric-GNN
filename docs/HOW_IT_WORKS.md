@@ -616,6 +616,89 @@ The same model architecture supports both modes. The choice depends on what kind
 
 ---
 
+## Evaluation Metrics
+
+Different training modes need different evaluation metrics. V1-V9 used classification metrics; V10 uses regression metrics. Understanding why matters because the wrong metric can hide real problems or invent fake ones.
+
+### Why Classification Metrics Don't Fit V10
+
+Accuracy, precision, recall, and F1 score all assume the model outputs class labels. They count true positives, false positives, true negatives, and false negatives against a binary ground truth.
+
+- **Accuracy** = (TP + TN) / total. Meaningful when each cell has a true label.
+- **Precision** = TP / (TP + FP). What fraction of cells the model flagged as noise are actually noise?
+- **Recall** = TP / (TP + FN). What fraction of actual noise cells did the model catch?
+- **F1** = harmonic mean of precision and recall.
+
+V10 doesn't output class labels. It outputs a continuous correction magnitude at every cell. There are no true/false positives to count because there is no binary classification happening. The model's predictions live on a spectrum from "essentially zero correction needed" to "tens of meters of correction needed."
+
+Forcing classification metrics onto V10 by post-hoc thresholding the predictions reintroduces the same threshold problem that V10 was designed to avoid. A cell with a 0.14m predicted correction and a cell with a 0.16m predicted correction are nearly identical predictions, but a 0.15m threshold would classify one as noise and the other as seafloor. The arbitrary threshold determines whether the model "looks good" or "looks bad" on precision/recall, which means the metrics don't reflect actual model quality.
+
+### What V10 Measures Instead
+
+Three metric families, each answering a different operational question.
+
+**1. Regression accuracy at the cell level**
+
+MAE (mean absolute error) and RMSE (root mean squared error) in meters answer "on average, how close are the predicted corrections to the true corrections?" MAE treats all errors equally; RMSE penalizes large errors more heavily. Used together, they reveal whether the model has a few large outlier errors (RMSE much greater than MAE) or consistently small errors (RMSE close to MAE).
+
+MAE normalized by local_std answers the same question but in std-dev units, making it comparable across depth regimes. A 1m error in 20m water is more serious than a 1m error in 2000m water; the normalized metric reflects this automatically.
+
+**2. Per-magnitude-bucket performance**
+
+The cells with large true corrections are the cells that matter operationally. A model with 0.2m overall MAE might have 0.1m MAE on small corrections (cells that barely needed cleaning) and 5m MAE on large corrections (the actual noise spikes). The overall MAE would look good, but the model would fail at its actual job.
+
+Per-magnitude-bucket MAE splits cells by true correction size and computes MAE within each bucket:
+
+| Bucket | Meaning |
+|--------|---------|
+| < 0.1m | CUBE run-to-run variability, essentially unchanged seafloor |
+| 0.1-1m | Small noise corrections, minor cleaning |
+| 1-10m | Real noise spikes |
+| > 10m | Major noise (deep water outliers, refraction artifacts) |
+
+The buckets reveal where the model is strong and weak. A good V10 model should have low MAE in all buckets, with special attention to the 1-10m and >10m buckets where mistakes affect navigation.
+
+**3. Hazardous error rate**
+
+Sign convention: `corrected_depth = noisy_depth - predicted_correction`. The error is `predicted - target`.
+
+- `error > 0`: predicted correction is larger than true; corrected depth is shallower than reality. SAFE for navigation (we say there is less water than there actually is; mariners stay in deeper water than necessary).
+- `error < 0`: predicted correction is smaller than true; corrected depth is deeper than reality. DANGEROUS (we say there is more water than there actually is; mariners may transit areas where there is less water than the chart shows).
+
+The hazardous error rate is the fraction of cells where the error is negative. It's reported overall, and separately for cells with shoal-direction targets (where target < 0) and deep-direction targets (where target > 0). Both directions can produce hazardous errors, but a model that systematically under-corrects shoal-direction noise is the worst case for navigation safety.
+
+The asymmetric loss penalty (3x weight on hazardous errors) is designed to drive this metric down. Tracking it explicitly tells us whether the asymmetry is working.
+
+**4. Recovery error**
+
+The most direct measure of operational performance: how close does the corrected surface get to the clean reference?
+
+`recovery_error = corrected_depth - clean_depth = (noisy_depth - predicted_correction) - clean_depth`
+
+Recovery RMSE is the RMS of this residual across all valid cells. It collapses everything (prediction accuracy, magnitude bias, sign errors) into a single number that's directly comparable across model versions on the same survey.
+
+Recovery mean error (signed) shows whether the model has a systematic bias: positive means the corrected surface is on average shallower than the clean reference (conservative bias, safe direction); negative means on average deeper than reference (aggressive bias, dangerous direction).
+
+### What V10 Does NOT Measure
+
+Notably absent from this list:
+
+- **IHO order compliance**: This is determined by the uncertainty layer in the BAG, which is a property of the data, not the model. Conflating model performance with data uncertainty would mislead users about what the model is actually doing.
+- **Charted feature preservation**: V10 predicts corrections regardless of whether a cell sits on a charted feature. Feature preservation is enforced upstream (the operational threshold decides which corrections to apply) and downstream (human QC review), not by the model itself.
+- **Classification accuracy**: As discussed, this would require post-hoc thresholding that defeats the purpose of regression.
+
+### How to Use These Metrics
+
+For tracking V10 development progress over time: focus on MAE (overall and normalized), per-bucket MAE on 1-10m and >10m buckets, and hazardous error rate (especially for shoal targets). Improvement in these is improvement in the model.
+
+For comparing V10 against V9 on the same validation data: recovery RMSE is the most direct apples-to-apples comparison, since both models produce a corrected surface that can be differenced against the clean reference. Lower recovery RMSE is unambiguously better.
+
+For operational deployment decisions: the hazardous error rate dominates. A model with slightly worse overall MAE but a much lower hazardous error rate is the better operational choice.
+
+Implementation lives in `training/metrics.py` (the `V10Metrics` dataclass and `compute_v10_metrics()` function).
+
+---
+
 ## Summary
 
 **Graph Neural Networks work for bathymetric noise detection because:**

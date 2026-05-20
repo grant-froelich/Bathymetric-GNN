@@ -162,6 +162,19 @@ Correction magnitudes scale with resolution and water depth, as expected. The lo
 
 H13739 (Pacific Islands VR, deep water trackline) processed separately with classification adaptive threshold (`--adaptive-threshold --no-offset`). Will be reprocessed in regression mode for V10 training.
 
+### V10 Evaluation Metrics
+
+Classification metrics (accuracy, precision, recall, F1) do not apply to V10 because the model outputs continuous corrections, not class labels. Post-hoc thresholding to compute classification metrics would reintroduce the arbitrary-threshold problem that V10 was designed to avoid.
+
+V10 uses regression metrics defined in `training/metrics.py`:
+
+- **MAE and RMSE** in meters and normalized to local_std units
+- **Per-magnitude-bucket MAE** (< 0.1m, 0.1-1m, 1-10m, > 10m): separates small-correction performance from large-correction performance, where the large buckets are operationally critical
+- **Hazardous error rate**: fraction of cells where the predicted correction is smaller than the true correction (which would leave the corrected depth deeper than reality, a navigation hazard). Tracked overall and separately for shoal-direction and deep-direction targets.
+- **Recovery RMSE**: RMS of (corrected surface - clean surface) across valid cells. Single-number operational summary that allows direct comparison against V9.
+
+See HOW_IT_WORKS.md for the full rationale behind each metric and what stays outside the model's responsibility (IHO compliance, charted feature preservation).
+
 ### V10 Next Validation
 
 The 5-epoch initial run validated the pipeline. The next training run should:
