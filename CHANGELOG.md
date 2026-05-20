@@ -1,5 +1,128 @@
 # Changelog
 
+## 2026-05-20 - V10 First Training Run Operational
+
+### First V10 Training Run on Regression-Mode Data
+- Trained V10 on E00269 sub-file 1of6 (regression-mode ground truth)
+- Parameters: 5 epochs, batch size 2, tile size 256, 91 tiles from 1 survey
+- Training loss decreased steadily: 0.79 -> 0.74 -> 0.71 -> 0.70 -> 0.69
+- MAE (normalized std-dev units) stabilized at ~0.83
+- No NaN values, no divergence, gradient flow healthy
+- Pipeline confirmed working end-to-end in regression mode
+
+### E00269 Sub-Files Processed (Regression Mode)
+| Sub-file | Resolution | Valid Cells | Mean Correction | Max Correction | Offset Removed |
+|----------|------------|-------------|-----------------|----------------|----------------|
+| 1of6 | 4m SR | 918,831 | 0.30m | 16.49m | -0.51m |
+| 2of6 | 8m SR | 356,601 | 0.53m | 88.00m | -0.20m |
+| 3of6 | 8m SR | 3,214,339 | 0.50m | 605.64m | -0.41m |
+| 4of6 | 128m SR | 11,390,629 | 83.84m | 4934.40m | +5.91m |
+| 5of6 | 128m SR | 1,118,639 | 6.77m | 775.70m | +0.42m |
+| 6of6 | 256m SR | 59,793 | 17.97m | 552.44m | -0.15m |
+
+- Correction magnitudes scale with resolution as expected; local_std normalization handles cross-regime training
+- Variable offsets across sub-files were initially flagged as datum issues; confirmed all are MLLW; offsets are real signal in survey datum vs MLLW separation
+- 50/50 shoal/deep split is normal for CUBE re-grid differences (not a quality warning, contrary to earlier interpretation)
+
+### V10 Architecture Shift: Regression Mode
+- Added `--regression-mode` flag to `prepare_ground_truth.py`
+- Output bands changed in regression mode: band 1 = valid_mask (1=valid, 0=invalid), band 2 = correction target (meters, continuous, no threshold applied)
+- Output file naming: `{survey}_regression.tif` (vs `{survey}_ground_truth.tif`) so both modes can coexist
+- Added `RegressionLoss` class to `losses.py` with asymmetric Huber penalty
+  - Shoal safety baked into loss direction: predictions leaving the corrected surface deeper than reality penalized 3x
+  - Sign math: `corrected = noisy - predicted_correction`; error < 0 means corrected depth > true depth = navigation hazard
+  - Applies to every valid cell, not just cells flagged as noise
+- `BathymetricGNNLoss.forward()` dispatches on `targets['mode']`; existing classification path unchanged
+- `GroundTruthDataset` auto-detects mode from band 1 description; tiles carry mode flag
+- Training loop tracks MAE in regression mode, accuracy in classification mode
+- Backwards compatible: existing classification workflow works exactly as before
+
+### Code Changes
+- `scripts/prepare_ground_truth.py`: +312/-77 lines
+  - `--adaptive-threshold` flag (Otsu's method on log-scaled absolute differences)
+  - `--no-offset` flag (skip median offset removal when both surfaces share a datum)
+  - `--regression-mode` flag (skip thresholding, emit continuous correction targets)
+  - GDAL warp for resolution mismatch between VR BAGs with different refinement structures
+  - Nodata fix: read actual `grid.nodata_value` plus `abs(depth) < 1e5` safety check (catches both +/-1e6 sentinels)
+- `training/losses.py`: Added `RegressionLoss` class, dispatched forward by mode, restored `compute_correction_delta` and `correction_delta` parameter from V8
+- `training/trainer.py`:
+  - Mode-aware dataset (auto-detect from band 1 description)
+  - V9 local_std normalization preserved for both modes
+  - `_compute_training_stats` now handles both modes
+  - MAE metric for regression mode; history tracking handles both
+  - `CORRECTION_NORM_FLOOR` and `CORRECTION_NORM_CAP` constants made explicit
+- `scripts/train.py`: Picks up both `_ground_truth.tif` and `_regression.tif` files
+
+---
+
+## 2026-05-19 - V10 Regression Mode Design
+
+### Architectural Rationale
+- Identified structural problem with classification approach: forces binary decision on continuous signal
+- Cells near threshold boundary get inconsistent labels for nearly identical real-world cases
+- Correction head only trains on cells labeled noise, never learns to predict near-zero corrections
+- Threshold value determines what model learns, but threshold is arbitrary even when adaptive
+- Mixed depth regimes (shallow vs deep water) need different threshold values, creating inconsistent labeling across the training set
+
+### Key Insight
+- The difference between the clean and dirty CUBE surfaces IS the training signal at every cell
+- A cell with a 0.01m difference and a cell with a 30m difference are both informative
+- Regression preserves the full continuous signal; classification discards it
+- Navigation safety use case is better served by predicting magnitudes than by binary classification
+- Hydrographers want to know "how wrong is this cell" not "is this cell noise"
+
+### Decision
+- Pursue regression as parallel implementation (V10) while keeping V9 classification working
+- Build on existing model architecture (still outputs correction head); change only what's needed in dataset, loss, and training loop
+- Validate on E00269 first since data is available locally
+- Defer model architecture simplification (removing unused classification head) until V10 proven
+
+---
+
+## 2026-05-18 - Ground Truth Preparation for New Survey Pairs
+
+### H13739 Processed (Pacific Islands VR)
+- Clean and noisy BAGs both at 16m resolution after VR resampling (different refinement structures: 16.078m vs 16.001m finest)
+- Required GDAL warp to align grids before differencing
+- Mean correction 32.7m, max 1304m (deep water Pacific)
+- Both surfaces in MLLW; `--no-offset` flag used
+- 61% noise cells / 39% seafloor at 6.73m adaptive threshold
+- Noise concentrated along sparse trackline coverage, as expected for deep water surveys
+
+### E00269 1of6 Processed (Pacific Islands SR, Northern Mariana Islands)
+- 4m resolution single-resolution BAG
+- Initially produced high noise percentages (67-99%) with fixed 0.15m threshold
+- Investigation revealed variable systematic offsets (-0.51m to +5.91m) across sub-files
+- Clean BAGs explicitly labeled MLLW; dirty BAGs in survey datum
+- 4m sub-file with offset removal enabled: 75% noise at 0.117m adaptive threshold, seafloor mean diff = 0.000m (offset removal worked correctly)
+
+### Diagnostic Script Developed (check_pair.py)
+- Quick pre-check for clean/noisy BAG pair quality
+- Loads both surfaces, computes difference, runs noise statistics
+- Initially used too-rigid pass/fail logic from Seward assumptions; lessons led to insight that classification thresholds don't generalize across depth regimes
+- Script abandoned in favor of running `prepare_ground_truth.py` directly with appropriate flags
+
+### Adaptive Threshold Development
+- Otsu's method applied to log-scaled absolute differences
+- Adapts naturally across depth regimes (0.12m in shallow Pacific, 6.73m in deep Pacific)
+- Replaces the requirement to pick a fixed threshold per survey
+- Implementation in `compute_adaptive_threshold()` in `prepare_ground_truth.py`
+
+### Datum Diagnostic Insights
+- Variable median offsets across sub-files of the same survey indicates datum mismatch, not simple processing offset
+- Survey datum to MLLW separation varies spatially with geoid model and tidal zoning
+- Different sub-files cover different areas, so each gets a different offset
+- This isn't a bug in the data; it's why the offset removal flag is needed
+
+### CUBE Re-Grid Behavior Documented
+- When the clean and noisy point clouds differ (noise cleaning removes outliers), CUBE re-gridding produces pervasive cell-to-cell differences, not just isolated spikes
+- Every cell that had any outlier sounding in its weighted contribution changes
+- Cell-to-cell differences are the training signal, not an artifact to filter out
+- The Seward training data worked differently because manual edits were applied directly to the grid surface after CUBE ran, leaving unchanged cells identical
+- 50/50 shoal/deep split is normal for re-grid differences; not a quality warning
+
+---
+
 ## 2026-03-04 - Data Acquisition Plan for Geographic Diversity
 
 ### Survey Identification

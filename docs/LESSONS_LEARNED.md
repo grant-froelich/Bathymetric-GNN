@@ -1,10 +1,10 @@
 # Lessons Learned: Real-World Training with Clean/Noisy Survey Pairs
 
-This document captures practical lessons from training the Bathymetric GNN on real survey data (Seward, Alaska multibeam surveys). It complements the theoretical documentation in HOW_IT_WORKS.md and TRAINING_PLAN.md.
+This document captures practical lessons from training the Bathymetric GNN on real survey data (Seward, Alaska multibeam surveys and Pacific Islands surveys). It complements the theoretical documentation in HOW_IT_WORKS.md and TRAINING_PLAN.md.
 
-*Document Version: 2.0*
-*Updated: March 2026*
-*Based on: Seward, Alaska training data, V1-V9 training runs*
+*Document Version: 3.0*
+*Updated: May 2026*
+*Based on: Seward, Alaska training data, V1-V9 training runs, Pacific Islands ground truth processing, V10 regression mode design*
 
 ---
 
@@ -198,7 +198,112 @@ python scripts/prepare_ground_truth.py \
 
 ---
 
+### 8. Different CUBE Runs Produce Pervasive Cell-to-Cell Differences
+
+**Problem Discovered (May 2026):** When processing E00269 and H13739 with `prepare_ground_truth.py`, noise percentages came out at 60-99% across all sub-files, far higher than Seward's 16-34%. Initial assumption was a datum mismatch or processing error.
+
+**Symptoms:**
+- 50/50 shoal/deep split in difference distribution (Seward typically has directional bias)
+- Pervasive cell-to-cell differences across the entire surface
+- Differences scale with depth (deeper water = larger differences)
+- Variable median offset across sub-files of the same survey
+
+**Root Cause:** Seward training pairs were produced by running CUBE once, then applying manual grid edits to the surface after the fact. Cells that weren't edited remained identical between clean and noisy versions. Other survey pairs (E00269, H13739) are produced by running CUBE twice on different point clouds (with and without outliers). When the input point cloud differs, the weighted CUBE estimate changes at every cell that had any noisy sounding contribute to it. Most cells differ slightly; cells affected by significant outliers differ a lot.
+
+**Implication:** The difference distribution between two CUBE runs is a continuous signal. The "noise threshold" approach assumes a clean separation between "unchanged seafloor" and "noise" cells, but with re-gridded data there's no such separation. The threshold becomes arbitrary.
+
+**Solution:** Either use an adaptive threshold (Otsu's method on log-scaled absolute differences) for classification mode, or shift to regression mode entirely. The regression approach uses the continuous difference as the training target directly, without any threshold.
+
+**The 50/50 shoal/deep split is NOT a quality warning** for CUBE re-grid differences. Symmetric error distributions are expected when removing outlier soundings affects estimates in both directions equally. A directional bias only appears when the outliers have a consistent sign (refraction, multipath, etc.) AND when the cleaning method preserves that bias in the surface.
+
+---
+
+### 9. Datum Mismatches Manifest as Variable Offsets Across Sub-Files
+
+**Problem Discovered (May 2026):** E00269 sub-files showed offsets ranging from -0.51m to +5.91m across the six sub-files. A simple datum offset should be constant.
+
+**Root Cause:** The separation between survey datum and MLLW is not constant across a large survey area. It varies spatially with the geoid model and tidal zoning. Different sub-files cover different geographic areas, so each gets a different median offset.
+
+**Symptoms:**
+- Different sub-files of the same survey have systematically different offsets
+- Median and mean offsets diverge (mean is much larger when there are extreme noise outliers)
+- The offset is real and removal works correctly (seafloor mean diff is exactly 0.000m after removal)
+
+**Solution:** The `--no-offset` flag was added to skip offset removal when both surfaces are confirmed in the same datum. When datums differ, the existing median-subtraction approach works for each sub-file individually. For a survey with sub-files in different geographic locations, you may need to apply a proper datum transformation rather than a single offset removal.
+
+---
+
+### 10. Classification Thresholds Don't Generalize Across Depth Regimes
+
+**Problem Discovered (May 2026):** A fixed 0.15m noise threshold works for Seward (shallow water, ~20-200m) but is meaningless for deep water surveys. At 2000m depth, 0.15m is well within normal CUBE run-to-run variability.
+
+**Symptoms:**
+- Shallow water (Seward, 4m E00269): adaptive threshold settles at 0.12-0.20m
+- Deep water (H13739): adaptive threshold settles at 6.73m
+- Very deep water (128m E00269): mean correction is 84m, with the 99th percentile at 685m
+- Using a single fixed threshold across surveys produces inconsistent labels for similar physical situations
+
+**Root Cause:** The magnitude of CUBE run-to-run variability scales with depth and resolution. Cells with larger uncertainty have larger possible variation when their input soundings change. A 1m difference in 20m water means something completely different than a 1m difference in 2000m water.
+
+**Implication for Classification Mode:** Each pair needs its own threshold. The `--adaptive-threshold` flag handles this automatically via Otsu's method. But mixing different-threshold pairs in one training set creates inconsistent labels.
+
+**Implication for Regression Mode:** The local_std normalization (V9) and adaptive threshold concept converge to the same insight. Regression with local_std normalization expresses every correction in units of local variability, which is naturally consistent across depth regimes.
+
+---
+
+### 11. Binary Classification Loses Information
+
+**Problem Identified (May 2026):** Reviewing V7/V9 over-prediction rates (34.8% detection vs 18.8% ground truth) led to a deeper question: is classification the right framework at all?
+
+**Structural Problems with Classification Approach:**
+- Forces a binary decision on a continuous signal
+- Cells with 0.14m and 0.16m corrections get different labels when threshold is 0.15m, but they're nearly identical physically
+- Correction head only trains on cells labeled noise, never sees small or zero corrections
+- Threshold value determines what the model learns
+- False positives concentrate near threshold boundary because no real boundary exists there
+
+**The Continuous Reality:** When a hydrographer cleans a survey, the difference between the dirty and clean surfaces at every cell is the total correction needed. Some cells need 0.001m, some need 0.5m, some need 30m. It's a spectrum, not two categories.
+
+**The Regression Insight:** The model should learn to predict the correction at every cell, including near-zero corrections for cells where cleaning barely changed anything. This:
+- Preserves the full continuous signal
+- Eliminates threshold dependence
+- Handles mixed depth regimes naturally (with local_std normalization)
+- Maps directly to what hydrographers actually need to know
+- Allows the inference threshold to move from training time to inference time (more flexible)
+
+**The V10 Architecture Shift:** Use the raw difference (offset-corrected if needed) as the regression target. Apply asymmetric Huber loss with shoal-safety asymmetry baked into the loss direction. Skip the binary classification step entirely.
+
+---
+
+### 12. Shoal Safety in Regression Mode
+
+**Sign Convention (depths positive down, correction = noisy - clean):**
+- `corrected_depth = noisy_depth - predicted_correction`
+- `error = predicted_correction - target_correction`
+- `error > 0`: corrected depth is shallower than reality (SAFE for navigation - we say there is less water than there really is)
+- `error < 0`: corrected depth is deeper than reality (DANGEROUS - we say there is more water than there really is)
+
+**Loss Implementation:** Asymmetric Huber penalty weights `error < 0` cases by `dangerous_weight` (default 3.0) and `error >= 0` cases by `safe_weight` (default 1.0). The penalty is on the depth error direction, not the correction error direction. Both shoal-direction (target < 0) and deep-direction (target > 0) corrections are subject to this same asymmetry.
+
+**Comparison to Classification Mode:** In classification, shoal safety was an asymmetric penalty on false positives that removed real shoals (`ShoalSafetyLoss`). In regression, shoal safety is built directly into the primary loss function via the sign of the error.
+
+---
+
+### 13. The Difference Layer Has No Single Right Threshold
+
+**Problem Identified (May 2026):** Even within a single deep water survey, the appropriate "noise threshold" varies spatially. Cells in flat areas have small natural variability, so a 1m difference is suspicious. Cells in rugged terrain have large natural variability, so a 1m difference may be normal.
+
+**Why Adaptive Thresholds Help (Partially):** Otsu's method finds a global break point in the difference distribution for the whole survey. This is better than a fixed threshold across surveys, but still imposes a single break point on data that may have different appropriate cutoffs in different regions.
+
+**Why Regression is Better:** The model learns from features (local depth, gradient, curvature, uncertainty) which cells need large corrections and which need small ones. The decision is per-cell, contextual, and continuous. No global threshold is needed at all during training.
+
+**At Inference Time:** A threshold reappears, but as an operational choice: "apply automatic corrections where the predicted magnitude exceeds X meters." This threshold can be tuned per survey, per region, or per use case without retraining.
+
+---
+
 ## Recommended Training Workflow
+
+### Classification Mode (V9, existing approach)
 
 ```bash
 # Use class weighting (automatic in updated trainer.py)
@@ -214,6 +319,33 @@ python scripts/train.py \
 #    - "Class distribution: seafloor=X, feature=Y, noise=Z"
 #    - "Using class weights: [w0, w1, w2]" - noise weight should be highest
 #    - Noise percentage should be 10-40%
+```
+
+### Regression Mode (V10, new approach)
+
+```bash
+# Generate ground truth in regression mode
+python scripts/prepare_ground_truth.py \
+    --clean "clean_survey.bag" \
+    --noisy "noisy_survey.bag" \
+    --output-dir "ground_truth/" \
+    --regression-mode \
+    --no-offset   # only if both surfaces share the same vertical datum
+
+# Train with regression-mode files
+python scripts/train.py \
+    --ground-truth-dir "ground_truth/" \
+    --output-dir "model_output/" \
+    --epochs 30 \
+    --device cuda \
+    --tile-size 256 \
+    --batch-size 2
+
+# Verify in output:
+#    - "Loaded {survey}_regression.tif in regression mode"
+#    - "Training mode: regression"
+#    - Progress bar shows MAE instead of accuracy
+#    - Training loss should decrease over epochs
 ```
 
 ---
@@ -250,9 +382,14 @@ After any training run, validate in QGIS before trusting metrics:
 | No class weights | <1% noise classification | Use updated trainer.py (auto-weights) |
 | Wrong feature count | Dimension mismatch error | Regenerate ground truth with uncertainty |
 | Config overlap mismatch | "Tile size must be larger than 2x overlap" | Edit config.yaml: overlap: 64 |
-| CUDA OOM | Out of memory error | Reduce batch-size to 2 |
+| CUDA OOM | Out of memory error | Reduce batch-size to 2 or reduce tile-size |
 | Boundary contamination | Classifications follow tile edges | Use boundary-aware feature computation (V7+) |
 | Low correction magnitudes | Model flags noise but corrections too small | Use local_std correction normalization (V9+) |
 | Near-zero noise in GT | Noise doesn't propagate to grid surface | Verify noise visible in gridded BAG, not just point cloud |
-| All-seafloor training data | Pushes model toward majority-class collapse | Only use pairs with 10-40% noise in gridded surface |
+| All-seafloor training data | Pushes model toward majority-class collapse | Only use pairs with 10-40% noise in gridded surface (classification mode) |
 | Noise over-prediction | Detection rate (~35%) far exceeds ground truth (~19%) | Add geographically diverse training data; track precision/recall separately; tune classification threshold |
+| Pervasive cell-to-cell differences | 60-99% noise percentage from `prepare_ground_truth.py` | Expected behavior for CUBE re-grid pairs; use `--adaptive-threshold` or `--regression-mode` |
+| Variable offsets across sub-files | Different median offsets in different sub-files of same survey | Datum mismatch with spatial variation; check whether sub-files are in same datum |
+| 50/50 shoal/deep split | Not actually a problem | Expected for CUBE re-grid differences; only a quality signal for surfaces produced by post-grid editing |
+| Fixed threshold doesn't fit | Adaptive threshold varies widely across surveys (0.12m to 6.73m) | Use `--adaptive-threshold` per pair, or shift to regression mode for consistency |
+| Classification head over-predicts | False positives near threshold boundary | Consider regression mode; eliminates threshold-induced false positives |

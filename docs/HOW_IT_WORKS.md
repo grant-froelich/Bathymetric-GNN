@@ -568,6 +568,54 @@ The "right" thresholds depend on operational risk tolerance. A 95% confidence be
 
 ---
 
+## Two Training Modes (Classification vs Regression)
+
+As of V10 (May 2026), the codebase supports two training approaches that use the same model architecture but different loss functions and training data formats.
+
+### Classification Mode (V1-V9)
+
+Each cell is labeled as seafloor or noise based on a threshold applied to the difference between clean and noisy surfaces. The model has three output heads:
+
+- **Class logits:** Predicted class probabilities (seafloor, feature, noise)
+- **Confidence:** How sure the model is about its classification (0-1)
+- **Correction:** Predicted depth correction in meters (only used for cells classified as noise)
+
+The loss combines weighted cross-entropy on classification, asymmetric shoal-safety penalty on false positives, Huber loss on corrections for noise cells, and a feature preservation term.
+
+This approach works but has structural limitations: cells near the threshold boundary get inconsistent labels, the correction head only sees noise cells during training, and the threshold value determines what the model learns.
+
+### Regression Mode (V10+)
+
+Each cell's target is the continuous difference between clean and noisy surfaces at that cell. No threshold is applied. The model still has three output heads, but only the correction head's output drives the loss in regression mode. The loss is a single asymmetric Huber penalty applied to every valid cell.
+
+**Why regression is appropriate:**
+
+The fundamental signal in a clean/noisy pair is the depth difference at every cell. Some cells have 0.001m differences (CUBE run-to-run noise on essentially unchanged seafloor); others have 30m differences (real noise spikes that were cleaned). It's a spectrum, not two categories. Forcing a binary classification on this continuous signal loses information.
+
+**How regression handles shoal safety:**
+
+The asymmetric loss penalizes predictions that would leave the corrected surface deeper than reality (more water shown than actually exists) by 3x compared to predictions that leave it shallower (less water shown). The sign math:
+
+- `corrected_depth = noisy_depth - predicted_correction`
+- `error = predicted_correction - target_correction`
+- `error > 0`: corrected depth is shallower than reality (SAFE)
+- `error < 0`: corrected depth is deeper than reality (DANGEROUS)
+
+The 3x penalty on `error < 0` reflects the navigation safety priority. This works for both shoal-direction noise (where the noisy surface shows a false shallow spike that needs removing) and deep-direction noise (where the noisy surface shows a false deep value that needs lifting back up).
+
+**At inference time:**
+
+Run the model, get a predicted correction at every cell. Multiply by local_std to denormalize. Apply where the magnitude exceeds an operational threshold (which can be tuned per use case without retraining).
+
+### Mode Selection
+
+The same model architecture supports both modes. The choice depends on what kind of training data you have:
+
+- Surfaces produced by manual grid edits after CUBE (e.g., Seward): either mode works; classification provides a richer multi-task signal
+- Surfaces produced by re-running CUBE on cleaned vs uncleaned point clouds (e.g., E00269, H13739): regression handles the pervasive cell-to-cell differences naturally; classification requires careful adaptive thresholding
+
+---
+
 ## Summary
 
 **Graph Neural Networks work for bathymetric noise detection because:**
@@ -582,11 +630,11 @@ The "right" thresholds depend on operational risk tolerance. A 95% confidence be
 
 ```
 Input: Noisy survey with ambiguous points
-       ↓
+       |
        GNN analyzes spatial context
-       ↓
-Output: Classification + Confidence + Correction
-        (noise vs feature vs seafloor)
+       |
+Output (classification mode): Classification + Confidence + Correction
+Output (regression mode): Per-cell correction prediction
 ```
 
 Human reviewers focus on uncertain regions. The model improves with feedback. Quality increases over time.

@@ -8,23 +8,38 @@ Detailed plan for training a production-quality model for bathymetric noise dete
 
 | Milestone | Status | Notes |
 |-----------|--------|-------|
-| Core architecture | ✓ Complete | GNN with 4 attention heads, 3-way classification |
-| SR BAG support | ✓ Complete | Read/write single-resolution BAGs |
-| VR BAG support | ✓ Complete | Native processing preserves multi-resolution structure |
-| Synthetic noise training | ✓ Complete | Proof-of-concept, scripts validated |
-| Real data training | **In Progress** | Need clean/noisy survey pairs |
-| Production deployment | Pending | Awaiting real-data validation |
+| Core architecture | Complete | GNN with 4 attention heads, 3-way classification + correction head |
+| SR BAG support | Complete | Read/write single-resolution BAGs |
+| VR BAG support | Complete | Native processing preserves multi-resolution structure |
+| Synthetic noise training (V1-V2) | Complete | Proof-of-concept, did not learn real noise patterns |
+| Real data training (V3-V9, classification) | Complete | Trained on Seward, Alaska VR pairs; V9 is current best classification model |
+| Regression mode (V10) | Pipeline operational | First training run successful on E00269; needs more data and longer runs |
+| Geographic diversity expansion | In Progress | E00269 (Pacific Islands) processed; 21 NCEI archive requests pending |
+| Production deployment | Pending | Awaiting validation across multiple regions |
 
-**Current model performance** (trained on synthetic noise only):
-- 50 epochs, 5 clean VR BAGs, 100 tiles
-- Accuracy on synthetic data: 63.2%
-- Real-world performance: Unknown (needs real data validation)
+**Current classification model (V9) performance:**
+- Trained on 4 Seward VR pairs, 30 epochs, batch size 4
+- Validation accuracy ~72% (against 75% seafloor proportion)
+- Noise detection rate 34.8% on validation (vs 18.8% ground truth = significant over-prediction)
+- Mean confidence 0.825 on noise predictions
+- Known issue: Seward-specific overfitting; geographic diversity needed
 
-**What "trained on synthetic noise only" means:**
+**Current regression model (V10) status:**
+- Initial 5-epoch training run on E00269 1of6 completed successfully
+- Training loss decreased from 0.79 to 0.69
+- Pipeline validated end-to-end (dataset, loss, training loop, history)
+- Needs: more ground truth files in regression mode, longer training, proper train/val split
+- Not yet compared against V9 on common validation data
 
-The current model was trained using artificially generated noise (gaussian, spikes, blobs, systematic patterns) added to clean surveys. This was primarily to validate that the code works end-to-end - the scripts run, process SR and VR BAGs correctly, and don't flatten the seafloor like the previous CAE approach did.
+## Two Training Modes
 
-**Next step:** Train on real clean/noisy survey pairs to learn actual noise patterns.
+The codebase supports two parallel training approaches as of May 2026:
+
+**Classification mode (V9):** The model labels each cell as seafloor or noise based on a threshold, then predicts a correction magnitude only for noise cells. This is the original approach validated through V1-V9. Outputs class_logits, predicted_class, confidence, and correction.
+
+**Regression mode (V10):** The model predicts a continuous correction magnitude at every cell, with no thresholding. Cells where cleaning barely changed the depth get near-zero predictions; cells with real noise get larger predictions. Shoal safety is baked into an asymmetric Huber loss. Uses the same model architecture but only the correction head's output drives the loss.
+
+Both modes coexist in the codebase. `prepare_ground_truth.py --regression-mode` produces files for V10 training; without the flag it produces V9-style files. The training script auto-detects which mode each ground truth file uses.
 
 ## Training Terminology
 

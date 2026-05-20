@@ -27,6 +27,10 @@ The tool does NOT replace human review - it focuses attention on areas that need
 
 - [Training Plan](docs/TRAINING_PLAN.md) - Detailed training phases, ground truth acquisition, and timeline
 - [How It Works](docs/HOW_IT_WORKS.md) - Technical deep-dive on GNN architecture and attention mechanisms
+- [Training Dashboard](docs/TRAINING_DASHBOARD.md) - Per-version training results and metrics
+- [Lessons Learned](docs/LESSONS_LEARNED.md) - Practical lessons from training on real survey data
+- [Quick Reference](docs/QUICK_REFERENCE.md) - Commands cheat sheet and troubleshooting
+- [Changelog](CHANGELOG.md) - Project history
 
 ## Core Concept
 
@@ -61,6 +65,16 @@ The model classifies each depth point into one of three categories. The model le
 | Noise | 2 | Inconsistent with context, likely artifact | Learn what noise looks like |
 
 **Important**: All three classes contribute to training. The model needs to see examples of clean seafloor (0), real features (1), and actual noise (2) to learn the differences between them.
+
+### Two Training Modes
+
+As of V10, the model supports two training approaches:
+
+**Classification mode (V1-V9):** Each cell is labeled noise or seafloor based on a threshold. The model learns to classify cells and predict corrections only for cells flagged as noise. Works well for surfaces produced by manual grid editing where most cells are identical between clean and noisy versions.
+
+**Regression mode (V10+):** The model predicts a continuous depth correction at every cell, with no thresholding step. Shoal safety is built into the loss function via an asymmetric penalty on predictions that would leave the corrected surface deeper than reality. Works well for surfaces produced by running CUBE on cleaned vs uncleaned point clouds, where cell-to-cell differences are pervasive but mostly small.
+
+Both modes use the same model architecture. The choice is made when preparing ground truth (`--regression-mode` flag) and detected automatically by the training script.
 
 ### How ENC Features Help
 

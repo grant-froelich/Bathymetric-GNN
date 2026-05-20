@@ -1,6 +1,6 @@
 # Bathymetric GNN - Quick Reference Guide
 
-*Updated: March 2026 (V9)*
+*Updated: May 2026 (V10 regression mode added; V9 classification mode still supported)*
 
 ## Commands Cheat Sheet
 
@@ -12,21 +12,61 @@
 ```
 
 ### 2. Prepare Ground Truth (Training Data)
+
+Three modes available, all backwards compatible:
+
 ```bash
-# Works with both VR and SR BAGs (auto-detected)
+# Classification mode, fixed threshold (original V9 behavior)
 python scripts/prepare_ground_truth.py \
     --clean "path/to/clean_survey.bag" \
     --noisy "path/to/noisy_survey.bag" \
     --output-dir "path/to/ground_truth"
 
-# Verify output:
+# Classification mode, adaptive threshold via Otsu's method
+# Use when one threshold doesn't fit across depth regimes
+python scripts/prepare_ground_truth.py \
+    --clean "clean.bag" \
+    --noisy "noisy.bag" \
+    --output-dir "ground_truth/" \
+    --adaptive-threshold
+
+# Regression mode (V10) -- continuous correction targets, no threshold
+# Use --no-offset when both surfaces are in the same vertical datum
+python scripts/prepare_ground_truth.py \
+    --clean "clean.bag" \
+    --noisy "noisy.bag" \
+    --output-dir "ground_truth/" \
+    --regression-mode \
+    --no-offset
+
+# Verify output (classification mode):
 #   Noise percentage should be 10-40%
 #   Systematic offset should be small (<0.2m)
 #   Seafloor mean diff should be ~0
+
+# Verify output (regression mode):
+#   "Training mode: regression" appears in logs at training time
+#   Output file is named _regression.tif instead of _ground_truth.tif
+#   Mean / median / 90th / 99th percentile correction magnitudes logged
 ```
 
+Additional flags:
+
+| Flag | Purpose |
+|------|---------|
+| `--noise-threshold X` | Fixed threshold in meters (classification mode, default 0.15) |
+| `--adaptive-threshold` | Compute threshold from data via Otsu's method |
+| `--no-offset` | Skip median offset removal (use when datums match) |
+| `--regression-mode` | Continuous correction targets, no thresholding |
+| `--vr-bag-mode {resampled,base,refinements}` | VR BAG load mode (default: resampled) |
+
 ### 3. Train Model
+
+Auto-detects mode from ground truth files (band 1 description).
+
 ```bash
+# Mode is auto-detected. Drop both _ground_truth.tif and _regression.tif
+# files in the same directory if you want; the loader picks up both.
 python scripts/train.py \
     --ground-truth-dir "path/to/ground_truth" \
     --output-dir "path/to/model_output" \
@@ -35,7 +75,10 @@ python scripts/train.py \
     --tile-size 256 \
     --batch-size 4
 
-# If CUDA out of memory, use batch-size 2
+# Output indicates which mode is in use:
+#   "Training mode: classification" or "Training mode: regression"
+# In regression mode, progress bar shows MAE instead of accuracy.
+# If CUDA out of memory, use --batch-size 2 or smaller --tile-size
 ```
 
 ### 4. Run Inference
@@ -111,6 +154,26 @@ powershell -Command "(Get-Content 'path/to/model_output/config.yaml') -replace '
 ### Issue: Model over-predicts noise (detection rate >> ground truth noise %)
 **Cause:** Model learned location-specific seafloor patterns as noise-like from limited geographic training data
 **Fix:** Add geographically diverse training data. Also consider tracking precision/recall separately and tuning the classification threshold to reduce false positives.
+
+### Issue: Pervasive cell-to-cell differences (60-99% noise) in prepare_ground_truth output
+**Cause:** Survey pairs produced by running CUBE twice on different point clouds (with/without outliers), as opposed to Seward where manual grid edits were applied after a single CUBE run
+**Fix:** This is expected behavior, not a quality problem. Use `--adaptive-threshold` for classification mode or `--regression-mode` for continuous targets.
+
+### Issue: Variable offsets across sub-files of the same survey
+**Cause:** Datum mismatch with spatial variation (e.g., survey datum vs MLLW separation varies geographically across the survey extent)
+**Fix:** Apply offset removal per sub-file (the default behavior). Each sub-file gets its own median offset computed independently. For better accuracy, apply a proper datum transformation upstream.
+
+### Issue: 50/50 shoal/deep split in difference distribution
+**Cause:** Normal for CUBE re-grid differences (removing outliers shifts the weighted estimate symmetrically in both directions)
+**Fix:** Not actually a problem. This is only a quality signal for surfaces produced by post-grid manual editing (where the cleanup direction biases toward shoals or deeps based on which type of noise the hydrographer targeted).
+
+### Issue: Adaptive threshold varies widely across surveys (0.12m to 6.73m)
+**Cause:** CUBE run-to-run variability scales with depth and resolution
+**Fix:** Either accept different thresholds per pair (works for individual surveys), or use regression mode for a unified treatment across depth regimes.
+
+### Issue: Pipeline crashes when loading regression-mode and classification-mode files together
+**Cause:** Should not crash; both file types should coexist in the same directory
+**Fix:** Verify each file's mode in startup logs ("Loaded X in regression mode" / "Loaded X in classification mode"). Mode is per-file, not global.
 
 ---
 
@@ -209,4 +272,4 @@ Before adding a survey pair to training data:
 
 ---
 
-*Quick Reference v2.1 | March 2026*
+*Quick Reference v3.0 | May 2026*

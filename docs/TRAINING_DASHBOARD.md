@@ -1,6 +1,6 @@
 # Bathymetric GNN -- Training Performance Tracker
 
-**V1-V9 | Seward, Alaska | VR BAG Noise Detection | Updated 2026-03-02**
+**V1-V10 | Seward, Alaska + Pacific Islands | VR/SR BAG Noise Detection | Updated 2026-05-20**
 
 ---
 
@@ -14,9 +14,12 @@
 | V4 | Manual 2x noise weight | -- | 96.8% | 0.455 | 4,612 | :x: All-noise |
 | V5 | No class weights (bug) | ~67% | 0.0% | 0.967 | 0 | :x: All-seafloor |
 | V6 | Auto class weights | ~61% | 3.3% | 0.713 | 0 | :warning: Boundary bug |
-| **V7** | **Boundary-aware features** | **~72%** | **34.8%** | **0.825** | **11,790** | :star: Best detection |
+| **V7** | **Boundary-aware features** | **~72%** | **34.8%** | **0.825** | **11,790** | :star: Best classification detection |
 | V8 | Dynamic Huber delta | = V7 | = V7 | = V7 | = V7 | No change |
-| **V9** | **local_std correction norm** | **~72%** | **34.8%** | **0.825** | **12,823** | :star: Best corrections |
+| **V9** | **local_std correction norm** | **~72%** | **34.8%** | **0.825** | **12,823** | :star: Best classification corrections |
+| **V10** | **Regression mode** | N/A (MAE 0.83 std-dev) | N/A | N/A | per cell | :test_tube: Initial run successful (5 epochs, 1 survey) |
+
+V10 uses regression instead of classification. Metrics are not directly comparable to V1-V9: the model predicts a continuous correction at every cell rather than a class label. MAE replaces accuracy as the primary metric.
 
 ---
 
@@ -106,6 +109,70 @@ V9 normalizes correction targets by per-node local surface variability (local_st
 
 ---
 
+## Phase 3: Regression Mode (V10)
+
+V10 is a structural shift away from binary classification toward continuous regression. The model now predicts the depth correction at every cell rather than classifying cells into noise/seafloor buckets and then predicting corrections only for noise cells.
+
+### Why Regression
+
+Classification forces a binary decision on a continuous signal. Cells near the threshold boundary get inconsistent labels for nearly identical real-world cases, and the correction head only trains on cells labeled noise, so it never learns to predict near-zero corrections for cells that don't need them. The threshold value also determines what the model learns, but the threshold is arbitrary even when computed adaptively.
+
+Regression preserves the full continuous signal. Every valid cell contributes to the loss with its raw difference as the target. The model learns to predict small corrections for cells that barely changed between clean and noisy surfaces, and large corrections for cells that changed significantly. At inference, the operational threshold moves to a decision about which predicted corrections are worth applying, rather than a training-time decision about which cells count as noise.
+
+### Architecture Changes
+
+The model architecture is unchanged. It still outputs class_logits, predicted_class, confidence, and correction. In regression mode, only the correction head's output drives the loss. The classification head still computes outputs but they don't contribute to gradients.
+
+- `prepare_ground_truth.py --regression-mode`: produces files with band 1 = valid_mask, band 2 = correction target (continuous, no threshold), bands 3-5 unchanged
+- Output filename suffix: `_regression.tif` (vs `_ground_truth.tif`) so both modes coexist
+- `RegressionLoss`: asymmetric Huber penalty on every valid cell, with shoal safety baked into the loss direction (predictions leaving the corrected surface deeper than reality get 3x penalty)
+- `BathymetricGNNLoss` dispatches on `targets['mode']`
+- `GroundTruthDataset` auto-detects mode from band 1 description
+- Training tracks MAE instead of accuracy in regression mode
+
+### V10 Initial Training Run (2026-05-20)
+
+| Metric | Value |
+|--------|-------|
+| Training data | E00269 sub-file 1of6 (1 survey, 4m SR) |
+| Tile size | 256 x 256 |
+| Batch size | 2 |
+| Tiles | 91 |
+| Epochs | 5 |
+| Train loss curve | 0.787 -> 0.735 -> 0.712 -> 0.699 -> 0.686 |
+| MAE (normalized) | ~0.83 std-dev units |
+| Validation | None (only 1 file available) |
+
+The loss decreased steadily across all 5 epochs with no signs of divergence or instability. MAE stayed flat at ~0.83 std-dev units, which is expected over so few epochs on a single survey. The pipeline ran end-to-end without error, confirming the regression-mode architecture, dataset, and training loop are correctly wired.
+
+### V10 Ground Truth Generation
+
+All six E00269 sub-files processed in regression mode:
+
+| Sub-file | Resolution | Valid Cells | Mean Correction | Max Correction | Offset Removed |
+|----------|------------|-------------|-----------------|----------------|----------------|
+| 1of6 | 4m SR | 918,831 | 0.30m | 16.49m | -0.51m |
+| 2of6 | 8m SR | 356,601 | 0.53m | 88.00m | -0.20m |
+| 3of6 | 8m SR | 3,214,339 | 0.50m | 605.64m | -0.41m |
+| 4of6 | 128m SR | 11,390,629 | 83.84m | 4934.40m | +5.91m |
+| 5of6 | 128m SR | 1,118,639 | 6.77m | 775.70m | +0.42m |
+| 6of6 | 256m SR | 59,793 | 17.97m | 552.44m | -0.15m |
+
+Correction magnitudes scale with resolution and water depth, as expected. The local_std normalization (carried over from V9) handles this scaling automatically during training: each cell's correction target is divided by its local depth variability, so the model learns in std-dev units across all depth regimes.
+
+H13739 (Pacific Islands VR, deep water trackline) processed separately with classification adaptive threshold (`--adaptive-threshold --no-offset`). Will be reprocessed in regression mode for V10 training.
+
+### V10 Next Validation
+
+The 5-epoch initial run validated the pipeline. The next training run should:
+
+1. Process more E00269 sub-files (2-6) in regression mode for 6 total files
+2. Add H13739 in regression mode for cross-geography diversity
+3. Run 50-100 epochs with train/val split (multi-file requirement met)
+4. Compare V10 performance against V9 on the Seward validation set after V10 trains on regression-mode Seward data
+
+---
+
 ## Training Data
 
 ### Noise Percentage by Survey Pair
@@ -177,7 +244,8 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 |--------|---------|--------|
 | NCEI archive (clean BAGs) | 21 | Download directly |
 | NCEI archive (processed data) | 21 | Requested, awaiting delivery (days to weeks) |
-| Local data (E00269, N. Mariana Islands) | 1 | Available now, ready to process |
+| Local data (E00269, N. Mariana Islands) | 1 | :white_check_mark: All 6 sub-files processed in both classification and regression modes |
+| Pacific Islands (H13739) | 1 | :white_check_mark: Processed in classification mode; needs reprocessing in regression mode |
 
 ### Processing Plan
 
@@ -215,14 +283,17 @@ The gridded BAG surfaces are nearly identical between clean and dirty versions. 
 
 ## Next Steps
 
-1. :star: **Process E00269 (N. Mariana Islands)** -- Available locally. Run QGIS difference check, then `prepare_ground_truth.py` if viable. First non-Seward training pair.
-2. **Process archive data as it arrives** -- One per region first, QGIS pre-check on each, reject pairs with <1% noise.
-3. **Train V10 with multi-region data** -- Incorporate ShoalSafetyLoss, local_std correction normalization, and geographic diversity.
-4. **Add precision/recall metrics** -- Current 34.8% detection rate vs 18.8% ground truth indicates significant false positives. Track precision (what fraction of flagged cells are actually noise) and recall (what fraction of actual noise cells are detected) separately to diagnose whether the priority is reducing false positives or improving true positive detection.
-5. **Sounding density feature** -- Per-cell sounding count from point cloud data would be the strongest noise discriminator. Single-hit cells in the surface are almost certainly noise.
-6. **Validate V9 corrections** -- Quantify how close V9 corrections come to recovering the clean surface at known noise locations.
-7. **Adaptive Huber delta** -- Options documented in `training/losses.py` for future implementation once diverse data is available.
+1. :white_check_mark: **Process E00269 (N. Mariana Islands)** -- Done. All 6 sub-files processed in classification (adaptive threshold) and regression modes.
+2. :white_check_mark: **First V10 training run** -- Done. Pipeline validated end-to-end on E00269 1of6.
+3. :star: **Convert H13739 to regression mode** -- Already processed in classification mode; rerun with `--regression-mode --no-offset` for V10 training.
+4. **Process archive data as it arrives** -- One per region first, run QGIS difference-layer pre-check on each. Use `--regression-mode --no-offset` for V10 training data when both surfaces are in the same datum.
+5. **Train V10 on multi-region data** -- Once 6+ regression-mode files exist (covering Seward + E00269 + H13739 + new pairs), run 50-100 epoch training with proper train/val split. Compare against V9 on Seward validation set.
+6. **Reprocess Seward pairs in regression mode** -- The existing 4 Seward classification-mode files can be regenerated with `--regression-mode` to integrate into the V10 training set. This is fast since the BAGs are already on disk.
+7. **Update inference pipeline for V10** -- `inference_native.py` currently uses classification + confidence thresholding. Add a regression-mode inference path: predict correction at every cell, denormalize by local_std, apply where magnitude exceeds an operational threshold.
+8. **Add precision/recall metrics (V9 classification mode)** -- Track precision and recall separately to diagnose false positive vs false negative balance, useful even alongside V10 development.
+9. **Sounding density feature** -- Per-cell sounding count from point cloud data would be the strongest noise discriminator. Single-hit cells in the surface are almost certainly noise.
+10. **Validate corrections in QGIS** -- Quantify how close V9 and V10 corrections come to recovering the clean surface at known noise locations. Build a side-by-side comparison once V10 has a trained model worth evaluating.
 
 ---
 
-*Dashboard v2.1 | March 2026*
+*Dashboard v3.0 | May 2026*
