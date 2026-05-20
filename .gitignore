@@ -1,0 +1,18 @@
+# Generated training data
+ground-truth/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Model checkpoints
+*.pt
+*.pth
+
+# Conda environments
+.conda/
+
+# IDE
+.vscode/
+.idea/
