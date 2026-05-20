@@ -232,6 +232,81 @@ class ShoalSafetyLoss(nn.Module):
         return penalty
 
 
+class RegressionLoss(nn.Module):
+    """
+    Asymmetric Huber loss for regression-mode training.
+    
+    Applies to every valid cell, not just cells flagged as noise. Bakes
+    shoal-safety asymmetry directly into the correction loss: predictions
+    that leave the corrected surface deeper than reality are penalized
+    more heavily than predictions that leave it shallower.
+    
+    Sign math (depths positive down, correction = noisy - clean):
+        corrected_depth = noisy - predicted_correction
+        error = predicted_correction - target_correction
+        
+        error > 0  -> corrected depth is shallower than reality (SAFE)
+        error < 0  -> corrected depth is deeper than reality (DANGEROUS)
+    
+    The dangerous direction always means "we are saying there is more
+    water than there really is," which is the case mariners need to
+    be protected against.
+    """
+    
+    def __init__(
+        self,
+        delta: float = 1.0,
+        safe_weight: float = 1.0,
+        dangerous_weight: float = 3.0,
+    ):
+        super().__init__()
+        self.delta = delta
+        self.safe_weight = safe_weight
+        self.dangerous_weight = dangerous_weight
+    
+    def forward(
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute asymmetric Huber loss on correction predictions.
+        
+        Args:
+            predicted: [num_nodes] predicted corrections
+            target: [num_nodes] true corrections (noisy - clean)
+            valid_mask: Optional [num_nodes] mask of cells to include
+        
+        Returns:
+            Scalar loss
+        """
+        if valid_mask is not None:
+            predicted = predicted[valid_mask]
+            target = target[valid_mask]
+        
+        if predicted.numel() == 0:
+            return torch.tensor(0.0, device=predicted.device, requires_grad=True)
+        
+        error = predicted - target  # signed
+        abs_error = torch.abs(error)
+        
+        # Huber: quadratic for |e| <= delta, linear above
+        delta_t = torch.tensor(self.delta, device=abs_error.device, dtype=abs_error.dtype)
+        quadratic = torch.minimum(abs_error, delta_t)
+        linear = abs_error - quadratic
+        base_loss = 0.5 * quadratic.pow(2) + self.delta * linear
+        
+        # Asymmetric weighting: error < 0 = predicted under target = dangerous
+        weight = torch.where(
+            error >= 0,
+            torch.full_like(error, self.safe_weight),
+            torch.full_like(error, self.dangerous_weight),
+        )
+        
+        return (weight * base_loss).mean()
+
+
 class BathymetricGNNLoss(nn.Module):
     """
     Combined multi-task loss for bathymetric GNN training.
@@ -254,6 +329,9 @@ class BathymetricGNNLoss(nn.Module):
         shoal_safety_weight: float = 0.5,
         label_smoothing: float = 0.0,
         correction_delta: float = 1.0,
+        regression_delta: float = 1.0,
+        regression_safe_weight: float = 1.0,
+        regression_dangerous_weight: float = 3.0,
     ):
         """
         Initialize combined loss.
@@ -266,12 +344,11 @@ class BathymetricGNNLoss(nn.Module):
             feature_preservation_weight: Weight for feature preservation penalty
             shoal_safety_weight: Weight for shoal safety penalty
             label_smoothing: Label smoothing for classification
-            correction_delta: Huber loss delta for correction head. Controls
-                the transition point between quadratic (MSE-like) and linear
-                (MAE-like) loss. Errors below delta get proportional gradients;
-                errors above delta get constant gradients. Should be set to
-                cover the typical range of correction magnitudes in the
-                training data (e.g. 95th percentile of |corrections|).
+            correction_delta: Huber delta for classification-mode correction loss
+                             (typically derived from training data via compute_correction_delta)
+            regression_delta: Huber delta for regression mode
+            regression_safe_weight: Weight for safe-direction errors (regression mode)
+            regression_dangerous_weight: Weight for dangerous-direction errors (regression mode)
         """
         super().__init__()
         
@@ -283,6 +360,11 @@ class BathymetricGNNLoss(nn.Module):
         self.confidence_loss = ConfidenceCalibrationLoss()
         self.feature_preservation_loss = FeaturePreservationLoss()
         self.shoal_safety_loss = ShoalSafetyLoss()
+        self.regression_loss = RegressionLoss(
+            delta=regression_delta,
+            safe_weight=regression_safe_weight,
+            dangerous_weight=regression_dangerous_weight,
+        )
         
         self.classification_weight = classification_weight
         self.correction_weight = correction_weight
@@ -296,7 +378,7 @@ class BathymetricGNNLoss(nn.Module):
         targets: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute combined loss.
+        Compute combined loss. Dispatches based on targets['mode'].
         
         Args:
             outputs: Model outputs dictionary containing:
@@ -305,13 +387,61 @@ class BathymetricGNNLoss(nn.Module):
                 - confidence: [num_nodes]
                 - correction: [num_nodes] (optional)
             targets: Target values dictionary containing:
-                - class_labels: [num_nodes]
-                - correction_targets: [num_nodes] (optional)
-                - noise_mask: [num_nodes] (optional)
+                - mode: 'classification' or 'regression' (default 'classification')
+                - class_labels: [num_nodes] (classification mode)
+                - correction_targets: [num_nodes]
+                - noise_mask: [num_nodes] (classification mode)
+                - valid_mask: [num_nodes] (regression mode)
                 
         Returns:
             Dictionary with individual losses and total loss
         """
+        mode = targets.get('mode', 'classification')
+        
+        if mode == 'regression':
+            return self._forward_regression(outputs, targets)
+        return self._forward_classification(outputs, targets)
+    
+    def _forward_regression(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Regression-mode loss: asymmetric Huber on all valid cells."""
+        losses = {}
+        device = outputs['correction'].device if 'correction' in outputs else None
+        
+        if 'correction' not in outputs or 'correction_targets' not in targets:
+            raise ValueError(
+                "Regression mode requires 'correction' in outputs and "
+                "'correction_targets' in targets"
+            )
+        
+        valid_mask = targets.get('valid_mask', None)
+        reg_loss = self.regression_loss(
+            outputs['correction'],
+            targets['correction_targets'],
+            valid_mask=valid_mask,
+        )
+        losses['regression'] = reg_loss
+        
+        # Inactive losses in regression mode (filled in for consistent dict shape)
+        zero = torch.tensor(0.0, device=device)
+        losses['classification'] = zero
+        losses['correction'] = zero
+        losses['confidence'] = zero
+        losses['feature_preservation'] = zero
+        losses['shoal_safety'] = zero
+        
+        losses['total'] = reg_loss
+        return losses
+    
+    def _forward_classification(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Classification-mode loss: existing multi-task combination."""
         losses = {}
         
         # Classification loss
@@ -358,6 +488,9 @@ class BathymetricGNNLoss(nn.Module):
             losses['shoal_safety'] = shoal_loss
         else:
             losses['shoal_safety'] = torch.tensor(0.0, device=class_loss.device)
+        
+        # Regression loss inactive in classification mode
+        losses['regression'] = torch.tensor(0.0, device=class_loss.device)
         
         # Total weighted loss
         total = (
@@ -410,41 +543,12 @@ def compute_correction_delta(
     gradient) regime of the Huber loss. Only the extreme tail beyond this
     percentile gets capped gradients.
     
-    This is Option 1 (data-derived, compute-once) of three approaches:
-    
-    Option 1 (CURRENT): Compute delta once from training data at startup.
-        Pros: Simple, deterministic, no risk of instability.
-        Cons: Fixed for entire training run. If the model improves and
-        errors shrink, the quadratic regime is wider than necessary.
-    
-    Option 2 (FUTURE): Adapt delta during training based on prediction error.
-        Track the running distribution of the model's actual correction
-        errors each epoch. Set delta to a percentile of recent errors.
-        Early in training when errors are large, delta is large. As the
-        model improves, delta shrinks to keep the quadratic regime focused
-        on the range where the model is still learning.
-        Implementation notes:
-        - Compute percentile of |predicted - target| at end of each epoch
-        - Use exponential moving average (momentum ~0.9) to smooth updates
-        - Set a floor value (e.g. min_delta) to prevent collapse
-        - Risk: if delta drops too fast, large corrections that the model
-          hasn't learned yet get constant gradients again
-    
-    Option 3 (FUTURE): Combine Options 1 and 2.
-        Use the data-derived delta (Option 1) as a ceiling. Allow the
-        error-derived delta (Option 2) to decay below this ceiling with
-        momentum, but never exceed it. This gives the adaptive benefits
-        of Option 2 with a safety bound from Option 1.
-        Implementation notes:
-        - ceiling = data-derived delta (computed once)
-        - running_delta = EMA of per-epoch error percentile
-        - effective_delta = min(running_delta, ceiling)
-        - Provides best of both: adapts as model learns, but can't
-          exceed the data-justified range
+    This is the V8 data-derived approach. Future options documented inline.
     
     Args:
         corrections: Array of correction magnitudes from training data
-            (absolute values of noisy - clean for noise-labeled cells)
+            (absolute values of noisy - clean for noise-labeled cells, or
+            absolute values of NORMALIZED corrections in V9+)
         percentile: Percentile to use for delta (default 95th)
         min_delta: Minimum delta to prevent degenerate behavior
         
