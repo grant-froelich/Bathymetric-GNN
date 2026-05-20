@@ -48,26 +48,34 @@ from .losses import BathymetricGNNLoss, compute_class_weights, compute_correctio
 
 logger = logging.getLogger(__name__)
 
-# Floor value for local_std normalization to prevent division by near-zero
-# in perfectly flat areas. 0.01m is well below any real bathymetric variability.
-CORRECTION_NORM_FLOOR = 0.01
-
-# Maximum allowed normalized correction magnitude (in local_std units).
-# Corrections beyond this are clamped to prevent extreme outliers from
-# dominating training. 50 std devs is well beyond any legitimate noise
-# pattern while still allowing the model to learn large corrections.
-CORRECTION_NORM_CAP = 50.0
+# V9 correction normalization constants
+CORRECTION_NORM_FLOOR = 0.01  # minimum local_std to avoid division by near-zero
+CORRECTION_NORM_CAP = 50.0    # cap normalized corrections to +/- this many std devs
 
 
 class GroundTruthDataset(Dataset):
     """
     Dataset that loads training samples from prepared ground truth files.
     
-    Ground truth files are GeoTIFFs with 4 bands:
+    Supports two file types, auto-detected from band 1 description:
+    
+    Classification mode (band 1 = 'labels'):
     - Band 1: Labels (0=seafloor, 2=noise, -1=nodata)
     - Band 2: Difference (noisy - clean = correction target)
     - Band 3: Noisy depth
     - Band 4: Clean depth
+    - Band 5: Uncertainty (optional)
+    
+    Regression mode (band 1 = 'valid_mask'):
+    - Band 1: Valid mask (1=valid, 0=invalid)
+    - Band 2: Correction target in meters (continuous, no thresholding)
+    - Band 3: Noisy depth
+    - Band 4: Clean depth
+    - Band 5: Uncertainty (optional)
+    
+    Tiles store a 'mode' field indicating which type they came from.
+    Mixing modes in one dataset is allowed but discouraged; the model
+    and loss function need to handle both consistently.
     """
     
     def __init__(
@@ -110,13 +118,23 @@ class GroundTruthDataset(Dataset):
         logger.info(f"Dataset contains {len(self.tiles)} tiles from {len(ground_truth_paths)} ground truth files")
     
     def _load_ground_truth(self, path: Path):
-        """Load a ground truth file and extract tiles."""
+        """Load a ground truth file and extract tiles. Auto-detects mode."""
         ds = gdal.Open(str(path))
         if ds is None:
             raise IOError(f"Failed to open ground truth file: {path}")
         
+        # Detect mode from band 1 description
+        band1 = ds.GetRasterBand(1)
+        band1_desc = (band1.GetDescription() or '').strip().lower()
+        
+        if band1_desc == 'valid_mask':
+            mode = 'regression'
+        else:
+            # Default to classification for unlabeled bands or 'labels' description
+            mode = 'classification'
+        
         # Read bands
-        labels = ds.GetRasterBand(1).ReadAsArray().astype(np.int32)
+        band1_data = band1.ReadAsArray()
         difference = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
         noisy_depth = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
         clean_depth = ds.GetRasterBand(4).ReadAsArray().astype(np.float32)
@@ -132,69 +150,58 @@ class GroundTruthDataset(Dataset):
         
         ds = None
         
-        height, width = labels.shape
+        # Build labels and valid_mask depending on mode
+        if mode == 'classification':
+            labels_full = band1_data.astype(np.int32)
+            valid_full = labels_full >= 0
+        else:  # regression
+            valid_full = band1_data.astype(np.int32) == 1
+            # Placeholder labels (not used in regression training, but kept
+            # for consistency in the data structure). -1 for invalid cells.
+            labels_full = np.where(valid_full, 0, -1).astype(np.int32)
+        
+        logger.info(f"  Loaded {path.name} in {mode} mode")
+        
+        height, width = band1_data.shape
         stride = self.tile_size - self.overlap
+        
+        def _maybe_add_tile(rs, re, cs, ce):
+            tile_labels = labels_full[rs:re, cs:ce]
+            tile_diff = difference[rs:re, cs:ce]
+            tile_noisy = noisy_depth[rs:re, cs:ce]
+            tile_clean = clean_depth[rs:re, cs:ce]
+            tile_valid = valid_full[rs:re, cs:ce]
+            tile_uncert = uncertainty[rs:re, cs:ce] if uncertainty is not None else None
+            
+            valid_ratio = np.sum(tile_valid) / tile_valid.size
+            if valid_ratio >= self.min_valid_ratio:
+                self.tiles.append({
+                    'mode': mode,
+                    'labels': tile_labels.copy(),
+                    'difference': tile_diff.copy(),
+                    'noisy_depth': tile_noisy.copy(),
+                    'clean_depth': tile_clean.copy(),
+                    'uncertainty': tile_uncert.copy() if tile_uncert is not None else None,
+                    'valid_mask': tile_valid.copy(),
+                    'resolution': resolution,
+                    'source': path.stem,
+                })
         
         # Extract tiles
         for row_start in range(0, height - self.tile_size + 1, stride):
             for col_start in range(0, width - self.tile_size + 1, stride):
-                row_end = row_start + self.tile_size
-                col_end = col_start + self.tile_size
-                
-                # Extract tile data
-                tile_labels = labels[row_start:row_end, col_start:col_end]
-                tile_diff = difference[row_start:row_end, col_start:col_end]
-                tile_noisy = noisy_depth[row_start:row_end, col_start:col_end]
-                tile_clean = clean_depth[row_start:row_end, col_start:col_end]
-                tile_uncert = None
-                if uncertainty is not None:
-                    tile_uncert = uncertainty[row_start:row_end, col_start:col_end]
-                
-                # Valid mask (labels != -1)
-                valid_mask = tile_labels >= 0
-                valid_ratio = np.sum(valid_mask) / valid_mask.size
-                
-                if valid_ratio >= self.min_valid_ratio:
-                    self.tiles.append({
-                        'labels': tile_labels.copy(),
-                        'difference': tile_diff.copy(),
-                        'noisy_depth': tile_noisy.copy(),
-                        'clean_depth': tile_clean.copy(),
-                        'uncertainty': tile_uncert.copy() if tile_uncert is not None else None,
-                        'valid_mask': valid_mask.copy(),
-                        'resolution': resolution,
-                        'source': path.stem,
-                    })
+                _maybe_add_tile(
+                    row_start, row_start + self.tile_size,
+                    col_start, col_start + self.tile_size,
+                )
         
-        # Handle edge tiles if there's remaining data
-        if height % stride != 0 or width % stride != 0:
-            # Bottom-right corner tile
-            if height > self.tile_size and width > self.tile_size:
-                row_start = height - self.tile_size
-                col_start = width - self.tile_size
-                
-                tile_labels = labels[row_start:, col_start:]
-                tile_diff = difference[row_start:, col_start:]
-                tile_noisy = noisy_depth[row_start:, col_start:]
-                tile_clean = clean_depth[row_start:, col_start:]
-                tile_uncert = None
-                if uncertainty is not None:
-                    tile_uncert = uncertainty[row_start:, col_start:]
-                
-                valid_mask = tile_labels >= 0
-                valid_ratio = np.sum(valid_mask) / valid_mask.size
-                
-                if valid_ratio >= self.min_valid_ratio:
-                    self.tiles.append({
-                        'labels': tile_labels.copy(),
-                        'difference': tile_diff.copy(),
-                        'noisy_depth': tile_noisy.copy(),
-                        'clean_depth': tile_clean.copy(),
-                        'uncertainty': tile_uncert.copy() if tile_uncert is not None else None,
-                        'valid_mask': valid_mask.copy(),
-                        'resolution': resolution,
-                        'source': path.stem,
-                    })
+        # Handle edge tile (bottom-right corner)
+        if (height % stride != 0 or width % stride != 0) and \
+           height > self.tile_size and width > self.tile_size:
+            _maybe_add_tile(
+                height - self.tile_size, height,
+                width - self.tile_size, width,
+            )
     
     def __len__(self) -> int:
         return len(self.tiles)
@@ -209,8 +216,9 @@ class GroundTruthDataset(Dataset):
         difference = tile['difference']
         resolution = tile['resolution']
         uncertainty = tile.get('uncertainty', None)
+        mode = tile.get('mode', 'classification')
         
-        # Build graph from noisy data
+        # Build graph from noisy data (provides local_std for normalization)
         graph = self.graph_builder.build_graph(
             depth=noisy_depth,
             valid_mask=valid_mask,
@@ -218,36 +226,45 @@ class GroundTruthDataset(Dataset):
             resolution=resolution,
         )
         
-        # Add labels to graph
+        # Attach training targets to the graph
         if graph.num_nodes > 0:
             rows = graph.valid_rows.numpy()
             cols = graph.valid_cols.numpy()
             
-            # Classification labels
-            graph.y = torch.tensor(labels[rows, cols], dtype=torch.long)
+            # Raw correction in meters
+            raw_correction = difference[rows, cols].astype(np.float32)
             
-            # Correction targets normalized by local surface variability.
-            # Raw correction = noisy - clean (meters). We normalize by the
-            # local standard deviation of the surface so the model learns
-            # corrections in units of local variability rather than raw meters.
-            # This makes corrections comparable across depth regimes:
-            #   - 0.3m spike in flat area (local_std=0.05m) -> 6.0 std devs
-            #   - 70m spike in variable area (local_std=5m) -> 14.0 std devs
-            # CORRECTION_NORM_FLOOR prevents division by near-zero in
-            # perfectly flat areas.
-            raw_corrections = difference[rows, cols]
-            norm_scale = torch.clamp(graph.local_std, min=CORRECTION_NORM_FLOOR)
-            graph.correction_target = torch.clamp(
-                torch.tensor(raw_corrections, dtype=torch.float32) / norm_scale,
-                min=-CORRECTION_NORM_CAP,
-                max=CORRECTION_NORM_CAP,
-            )
+            # V9 normalization: divide by per-node local_std so the model learns
+            # corrections in std-dev units. Floor at 0.01m to avoid division by
+            # near-zero in flat areas; cap at +/-50 std-devs to bound outliers.
+            if hasattr(graph, 'local_std') and graph.local_std is not None:
+                local_std = graph.local_std.detach().cpu().numpy()
+                denom = np.maximum(local_std, CORRECTION_NORM_FLOOR)
+                normalized = raw_correction / denom
+                normalized = np.clip(normalized, -CORRECTION_NORM_CAP, CORRECTION_NORM_CAP)
+                graph.correction_target = torch.tensor(normalized, dtype=torch.float32)
+            else:
+                graph.correction_target = torch.tensor(raw_correction, dtype=torch.float32)
             
-            # Noise mask (where labels == 2)
-            graph.noise_mask = torch.tensor(labels[rows, cols] == 2, dtype=torch.bool)
+            # Mode flag so the loss function knows what to compute
+            graph.mode = mode
+            
+            if mode == 'classification':
+                # Classification labels (0=seafloor, 2=noise)
+                graph.y = torch.tensor(labels[rows, cols], dtype=torch.long)
+                # Noise mask used by correction-on-noise-only logic
+                graph.noise_mask = torch.tensor(labels[rows, cols] == 2, dtype=torch.bool)
+            else:
+                # Regression mode: no classification labels
+                # Provide empty placeholder for graph.y so downstream code that
+                # accesses it doesn't crash; loss function should check graph.mode.
+                graph.y = torch.full((graph.num_nodes,), -1, dtype=torch.long)
+                # In regression mode every valid cell contributes to the correction loss
+                graph.noise_mask = torch.ones(graph.num_nodes, dtype=torch.bool)
         else:
-            graph.y = torch.tensor([], dtype=torch.long)
             graph.correction_target = torch.tensor([], dtype=torch.float32)
+            graph.mode = mode
+            graph.y = torch.tensor([], dtype=torch.long)
             graph.noise_mask = torch.tensor([], dtype=torch.bool)
         
         return graph
@@ -366,14 +383,9 @@ class BathymetricGraphDataset(Dataset):
             class_labels = np.where(class_labels == 1, 2, 0)  # Map 1->2 (noise class)
             graph.y = torch.tensor(class_labels, dtype=torch.long)
             
-            # Correction targets - local_std normalized (see GroundTruthDataset for details)
-            raw_corrections = noise_result.noisy_depth[rows, cols] - clean_depth[rows, cols]
-            norm_scale = torch.clamp(graph.local_std, min=CORRECTION_NORM_FLOOR)
-            graph.correction_target = torch.clamp(
-                torch.tensor(raw_corrections, dtype=torch.float32) / norm_scale,
-                min=-CORRECTION_NORM_CAP,
-                max=CORRECTION_NORM_CAP,
-            )
+            # Correction targets (how much the depth was changed)
+            corrections = noise_result.noisy_depth[rows, cols] - clean_depth[rows, cols]
+            graph.correction_target = torch.tensor(corrections, dtype=torch.float32)
             
             # Noise mask for loss computation
             graph.noise_mask = torch.tensor(
@@ -483,11 +495,12 @@ class Trainer:
             self.scheduler = None
         
         # Setup loss with class weights and correction delta computed from training data
-        class_weights, correction_delta = self._compute_training_stats()
+        class_weights, correction_delta, training_mode = self._compute_training_stats()
         if class_weights is not None:
             class_weights = class_weights.to(self.device)
             logger.info(f"Class weights: {class_weights.tolist()}")
         logger.info(f"Correction Huber delta: {correction_delta:.3f}")
+        logger.info(f"Training mode: {training_mode}")
         
         self.criterion = BathymetricGNNLoss(
             class_weights=class_weights,
@@ -495,6 +508,7 @@ class Trainer:
             correction_weight=config.training.correction_weight,
             confidence_weight=config.training.confidence_weight,
             correction_delta=correction_delta,
+            regression_delta=correction_delta,
         )
         
         # Training state
@@ -504,121 +518,63 @@ class Trainer:
         
         logger.info(f"Trainer initialized, device: {self.device}")
     
-    def _compute_training_stats(self) -> Tuple[Optional[torch.Tensor], float]:
+    def _compute_training_stats(self) -> Tuple[Optional[torch.Tensor], float, str]:
         """
         Compute class weights and correction Huber delta from training dataset.
         
         Scans all tiles in the training dataset to:
-        1. Count per-class samples for inverse-frequency class weights
-        2. Collect NORMALIZED correction magnitudes for noise cells to set
-           Huber delta. Since corrections are normalized by local_std during
-           training, the delta must be computed in the same normalized space.
+        1. Count per-class samples for inverse-frequency class weights (classification only)
+        2. Collect NORMALIZED correction magnitudes to set Huber delta
+        3. Detect dominant mode (classification or regression) across the dataset
         
         Returns:
-            Tuple of (class_weights tensor or None, correction_delta float)
+            (class_weights, correction_delta, mode)
+            class_weights is None if dataset is regression-only.
         """
-        num_classes = self.config.model.num_classes
-        counts = torch.zeros(num_classes, dtype=torch.long)
-        all_raw_corrections = []
-        all_normalized_corrections = []
+        all_labels = []
+        all_corrections = []
+        mode_counts = {'classification': 0, 'regression': 0}
         
-        try:
-            dataset = self.train_dataset
+        # Re-create the normalization logic used in the dataset __getitem__
+        for tile in self.train_dataset.tiles:
+            mode = tile.get('mode', 'classification')
+            mode_counts[mode] += 1
             
-            if hasattr(dataset, 'tiles'):
-                # Fast scan of tiles for class counts
-                for tile in dataset.tiles:
-                    labels = tile['labels']
-                    valid = labels >= 0
-                    for c in range(num_classes):
-                        counts[c] += int(np.sum(labels[valid] == c))
-                
-                # Sample a subset of actual training items to get normalized
-                # corrections (requires graph construction for local_std)
-                num_samples = min(len(dataset), 100)
-                logger.info(f"Sampling {num_samples} tiles for correction statistics...")
-                sample_indices = np.linspace(0, len(dataset) - 1, num_samples, dtype=int)
-                for idx in sample_indices:
-                    graph = dataset[int(idx)]
-                    if hasattr(graph, 'noise_mask') and graph.noise_mask.any():
-                        # correction_target is already normalized by local_std
-                        norm_corr = graph.correction_target[graph.noise_mask].numpy()
-                        norm_corr = norm_corr[np.isfinite(norm_corr)]
-                        if len(norm_corr) > 0:
-                            all_normalized_corrections.append(norm_corr)
-                        
-                        # Also collect raw corrections for logging
-                        local_std = graph.local_std[graph.noise_mask].numpy()
-                        local_std = np.maximum(local_std, CORRECTION_NORM_FLOOR)
-                        raw_corr = norm_corr * local_std
-                        all_raw_corrections.append(raw_corr)
-                        
+            valid_mask = tile['valid_mask']
+            difference = tile['difference']
+            
+            if mode == 'classification':
+                labels = tile['labels']
+                # Collect labels for class weights
+                all_labels.append(labels[valid_mask].flatten())
+                # Collect corrections for noise cells (those above threshold)
+                noise_mask = labels == 2
+                if np.any(noise_mask):
+                    all_corrections.append(np.abs(difference[noise_mask]))
             else:
-                # For BathymetricGraphDataset, sample a subset
-                num_samples = min(len(dataset), 50)
-                for i in range(num_samples):
-                    graph = dataset[i]
-                    if hasattr(graph, 'y') and graph.y.numel() > 0:
-                        for c in range(num_classes):
-                            counts[c] += (graph.y == c).sum().item()
-                    if hasattr(graph, 'noise_mask') and hasattr(graph, 'correction_target'):
-                        if graph.noise_mask.any():
-                            norm_corr = graph.correction_target[graph.noise_mask].numpy()
-                            norm_corr = norm_corr[np.isfinite(norm_corr)]
-                            if len(norm_corr) > 0:
-                                all_normalized_corrections.append(norm_corr)
-            
-            # Compute class weights
-            class_weights = None
-            if counts.sum() > 0:
-                logger.info(f"Class distribution: {dict(enumerate(counts.tolist()))}")
-                class_weights = compute_class_weights(
-                    torch.arange(num_classes).repeat_interleave(counts.clamp(min=1)),
-                    num_classes=num_classes,
-                    smoothing=0.1,
-                )
-            else:
-                logger.warning("No valid labels found, skipping class weights")
-            
-            # Compute correction delta from normalized distribution
-            if all_normalized_corrections:
-                combined_norm = np.concatenate(all_normalized_corrections)
-                
-                # Compute delta from capped values since that's what the model sees
-                capped_norm = np.clip(combined_norm, -CORRECTION_NORM_CAP, CORRECTION_NORM_CAP)
-                correction_delta = compute_correction_delta(
-                    capped_norm, percentile=95.0, min_delta=1.0
-                )
-                
-                # Log both raw and normalized stats
-                if all_raw_corrections:
-                    combined_raw = np.concatenate(all_raw_corrections)
-                    logger.info(
-                        f"Correction stats (raw meters): {len(combined_raw):,} noise cells, "
-                        f"mean |correction|={np.mean(np.abs(combined_raw)):.3f}m, "
-                        f"max |correction|={np.max(np.abs(combined_raw)):.3f}m"
-                    )
-                logger.info(
-                    f"Correction stats (normalized by local_std): "
-                    f"mean |correction|={np.mean(np.abs(combined_norm)):.3f}, "
-                    f"max |correction|={np.max(np.abs(combined_norm)):.3f}, "
-                    f"95th percentile={np.percentile(np.abs(combined_norm), 95):.3f}"
-                )
-                num_capped = np.sum(np.abs(combined_norm) > CORRECTION_NORM_CAP)
-                if num_capped > 0:
-                    logger.info(
-                        f"Corrections capped to +/-{CORRECTION_NORM_CAP}: "
-                        f"{num_capped:,} cells ({100*num_capped/len(combined_norm):.2f}%)"
-                    )
-            else:
-                correction_delta = 1.0
-                logger.warning("No noise corrections found, using default delta=1.0")
-            
-            return class_weights, correction_delta
-            
-        except Exception as e:
-            logger.warning(f"Failed to compute training stats: {e}")
-            return None, 1.0
+                # Regression mode: collect all valid corrections
+                if np.any(valid_mask):
+                    all_corrections.append(np.abs(difference[valid_mask]))
+        
+        # Determine dominant mode
+        dominant_mode = max(mode_counts, key=mode_counts.get)
+        
+        # Class weights (classification mode only)
+        class_weights = None
+        if all_labels:
+            labels_tensor = torch.tensor(np.concatenate(all_labels), dtype=torch.long)
+            class_weights = compute_class_weights(labels_tensor, num_classes=3)
+        
+        # Correction Huber delta from raw (un-normalized) corrections.
+        # Note: in V9+ the dataset also normalizes by local_std at runtime,
+        # but for delta we use raw magnitudes as a stable reference.
+        if all_corrections:
+            corrections_arr = np.concatenate(all_corrections)
+            correction_delta = compute_correction_delta(corrections_arr, percentile=95.0, min_delta=1.0)
+        else:
+            correction_delta = 1.0
+        
+        return class_weights, correction_delta, dominant_mode
     
     def train(self) -> Dict[str, List[float]]:
         """
@@ -640,13 +596,17 @@ class Trainer:
             # Training epoch
             train_metrics = self._train_epoch()
             history['train_loss'].append(train_metrics['loss'])
-            history['train_acc'].append(train_metrics['accuracy'])
+            # Metric key differs by mode: 'accuracy' (classification) or 'mae' (regression)
+            train_metric_key = 'accuracy' if 'accuracy' in train_metrics else 'mae'
+            train_metric_label = 'Acc' if train_metric_key == 'accuracy' else 'MAE'
+            history['train_acc'].append(train_metrics.get(train_metric_key, 0.0))
             
             # Validation epoch
             if self.val_loader is not None:
                 val_metrics = self._validate_epoch()
                 history['val_loss'].append(val_metrics['loss'])
-                history['val_acc'].append(val_metrics['accuracy'])
+                val_metric_key = 'accuracy' if 'accuracy' in val_metrics else 'mae'
+                history['val_acc'].append(val_metrics.get(val_metric_key, 0.0))
                 
                 # Learning rate scheduling
                 if self.scheduler is not None:
@@ -670,13 +630,13 @@ class Trainer:
                     f"Epoch {epoch+1}/{self.config.training.epochs} - "
                     f"Train Loss: {train_metrics['loss']:.4f}, "
                     f"Val Loss: {val_metrics['loss']:.4f}, "
-                    f"Val Acc: {val_metrics['accuracy']:.4f}"
+                    f"Val {train_metric_label}: {val_metrics.get(val_metric_key, 0.0):.4f}"
                 )
             else:
                 logger.info(
                     f"Epoch {epoch+1}/{self.config.training.epochs} - "
                     f"Train Loss: {train_metrics['loss']:.4f}, "
-                    f"Train Acc: {train_metrics['accuracy']:.4f}"
+                    f"Train {train_metric_label}: {train_metrics.get(train_metric_key, 0.0):.4f}"
                 )
             
             # Periodic checkpoint
@@ -705,12 +665,23 @@ class Trainer:
             self.optimizer.zero_grad()
             outputs = self.model(batch)
             
-            # Compute loss
+            # Detect mode (PyG batches string attrs as lists, one per graph)
+            batch_mode = getattr(batch, 'mode', 'classification')
+            if isinstance(batch_mode, list):
+                batch_mode = batch_mode[0] if batch_mode else 'classification'
+            
+            # Build targets dict
             targets = {
+                'mode': batch_mode,
                 'class_labels': batch.y,
                 'correction_targets': batch.correction_target,
                 'noise_mask': batch.noise_mask,
             }
+            if batch_mode == 'regression':
+                # In regression mode, every node in the graph is a valid cell
+                # (the dataset already filtered to valid cells before building the graph)
+                targets['valid_mask'] = torch.ones(batch.num_nodes, dtype=torch.bool, device=self.device)
+            
             losses = self.criterion(outputs, targets)
             
             # Backward pass
@@ -723,19 +694,34 @@ class Trainer:
             
             # Track metrics
             total_loss += losses['total'].item() * batch.num_nodes
-            correct = (outputs['predicted_class'] == batch.y).sum().item()
-            total_correct += correct
             total_samples += batch.num_nodes
             
-            pbar.set_postfix({
-                'loss': losses['total'].item(),
-                'acc': correct / batch.num_nodes if batch.num_nodes > 0 else 0,
-            })
+            if batch_mode == 'regression':
+                # Track mean absolute correction error instead of classification accuracy
+                with torch.no_grad():
+                    if 'correction' in outputs:
+                        mae = torch.abs(outputs['correction'] - batch.correction_target).mean().item()
+                    else:
+                        mae = 0.0
+                total_correct += mae * batch.num_nodes  # store sum, divide later
+                pbar.set_postfix({'loss': losses['total'].item(), 'mae': mae})
+            else:
+                correct = (outputs['predicted_class'] == batch.y).sum().item()
+                total_correct += correct
+                pbar.set_postfix({
+                    'loss': losses['total'].item(),
+                    'acc': correct / batch.num_nodes if batch.num_nodes > 0 else 0,
+                })
         
-        return {
+        metrics = {
             'loss': total_loss / total_samples if total_samples > 0 else 0,
-            'accuracy': total_correct / total_samples if total_samples > 0 else 0,
         }
+        if total_samples > 0:
+            # In regression mode this is MAE; in classification mode it's accuracy
+            metrics['accuracy' if batch_mode == 'classification' else 'mae'] = (
+                total_correct / total_samples
+            )
+        return metrics
     
     def _validate_epoch(self) -> Dict[str, float]:
         """Run one validation epoch."""
@@ -744,6 +730,7 @@ class Trainer:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        batch_mode = 'classification'
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc=f"Epoch {self.current_epoch+1} [Val]"):
@@ -751,21 +738,41 @@ class Trainer:
                 
                 outputs = self.model(batch)
                 
+                batch_mode = getattr(batch, 'mode', 'classification')
+                if isinstance(batch_mode, list):
+                    batch_mode = batch_mode[0] if batch_mode else 'classification'
+                
                 targets = {
+                    'mode': batch_mode,
                     'class_labels': batch.y,
                     'correction_targets': batch.correction_target,
                     'noise_mask': batch.noise_mask,
                 }
+                if batch_mode == 'regression':
+                    targets['valid_mask'] = torch.ones(batch.num_nodes, dtype=torch.bool, device=self.device)
+                
                 losses = self.criterion(outputs, targets)
                 
                 total_loss += losses['total'].item() * batch.num_nodes
-                total_correct += (outputs['predicted_class'] == batch.y).sum().item()
                 total_samples += batch.num_nodes
+                
+                if batch_mode == 'regression':
+                    if 'correction' in outputs:
+                        mae = torch.abs(outputs['correction'] - batch.correction_target).mean().item()
+                    else:
+                        mae = 0.0
+                    total_correct += mae * batch.num_nodes
+                else:
+                    total_correct += (outputs['predicted_class'] == batch.y).sum().item()
         
-        return {
+        metrics = {
             'loss': total_loss / total_samples if total_samples > 0 else 0,
-            'accuracy': total_correct / total_samples if total_samples > 0 else 0,
         }
+        if total_samples > 0:
+            metrics['accuracy' if batch_mode == 'classification' else 'mae'] = (
+                total_correct / total_samples
+            )
+        return metrics
     
     def _save_checkpoint(self, filename: str):
         """Save model checkpoint."""

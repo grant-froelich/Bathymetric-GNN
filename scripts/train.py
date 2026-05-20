@@ -174,7 +174,12 @@ def main():
         # Use real ground truth data
         logger.info("Using GROUND TRUTH mode (real noise from clean/noisy pairs)")
         
-        gt_files = list(args.ground_truth_dir.glob("*_ground_truth.tif"))
+        # Pick up both classification (_ground_truth.tif) and regression
+        # (_regression.tif) files. GroundTruthDataset auto-detects the mode.
+        gt_files = sorted(
+            list(args.ground_truth_dir.glob("*_ground_truth.tif")) +
+            list(args.ground_truth_dir.glob("*_regression.tif"))
+        )
         if not gt_files:
             logger.error(f"No ground truth files found in {args.ground_truth_dir}")
             sys.exit(1)
@@ -182,7 +187,10 @@ def main():
         
         # Split into train/val if no separate val set provided
         if args.val_surveys:
-            val_gt_files = list(args.val_surveys.glob("*_ground_truth.tif"))
+            val_gt_files = sorted(
+                list(args.val_surveys.glob("*_ground_truth.tif")) +
+                list(args.val_surveys.glob("*_regression.tif"))
+            )
             train_gt_files = gt_files
         elif len(gt_files) > 1:
             # Use last file for validation
