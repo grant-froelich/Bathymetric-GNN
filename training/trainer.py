@@ -524,37 +524,30 @@ class Trainer:
         
         Scans all tiles in the training dataset to:
         1. Count per-class samples for inverse-frequency class weights (classification only)
-        2. Collect NORMALIZED correction magnitudes to set Huber delta
+        2. Sample actual normalized corrections from the dataset to set Huber delta
         3. Detect dominant mode (classification or regression) across the dataset
+        
+        For the Huber delta, this method samples real graphs from the dataset
+        and collects the NORMALIZED correction targets the model actually sees
+        during training. Using raw correction magnitudes here would set delta
+        to a value far larger than any prediction error, putting the Huber
+        loss in pure linear mode and defeating its purpose.
         
         Returns:
             (class_weights, correction_delta, mode)
             class_weights is None if dataset is regression-only.
         """
         all_labels = []
-        all_corrections = []
         mode_counts = {'classification': 0, 'regression': 0}
         
-        # Re-create the normalization logic used in the dataset __getitem__
         for tile in self.train_dataset.tiles:
             mode = tile.get('mode', 'classification')
             mode_counts[mode] += 1
             
-            valid_mask = tile['valid_mask']
-            difference = tile['difference']
-            
             if mode == 'classification':
                 labels = tile['labels']
-                # Collect labels for class weights
+                valid_mask = tile['valid_mask']
                 all_labels.append(labels[valid_mask].flatten())
-                # Collect corrections for noise cells (those above threshold)
-                noise_mask = labels == 2
-                if np.any(noise_mask):
-                    all_corrections.append(np.abs(difference[noise_mask]))
-            else:
-                # Regression mode: collect all valid corrections
-                if np.any(valid_mask):
-                    all_corrections.append(np.abs(difference[valid_mask]))
         
         # Determine dominant mode
         dominant_mode = max(mode_counts, key=mode_counts.get)
@@ -565,12 +558,33 @@ class Trainer:
             labels_tensor = torch.tensor(np.concatenate(all_labels), dtype=torch.long)
             class_weights = compute_class_weights(labels_tensor, num_classes=3)
         
-        # Correction Huber delta from raw (un-normalized) corrections.
-        # Note: in V9+ the dataset also normalizes by local_std at runtime,
-        # but for delta we use raw magnitudes as a stable reference.
-        if all_corrections:
-            corrections_arr = np.concatenate(all_corrections)
-            correction_delta = compute_correction_delta(corrections_arr, percentile=95.0, min_delta=1.0)
+        # Sample normalized corrections from the dataset to compute Huber delta.
+        # Building graphs is expensive, so we sample a subset of tiles.
+        n_tiles = len(self.train_dataset)
+        sample_size = min(50, n_tiles)
+        if sample_size > 0:
+            rng = np.random.default_rng(seed=42)
+            sample_indices = rng.choice(n_tiles, size=sample_size, replace=False)
+            
+            normalized_corrections = []
+            logger.info(f"Sampling {sample_size} tiles to compute Huber delta from normalized corrections...")
+            for idx in sample_indices:
+                try:
+                    graph = self.train_dataset[int(idx)]
+                    if graph.num_nodes > 0 and hasattr(graph, 'correction_target'):
+                        ct = graph.correction_target.detach().cpu().numpy()
+                        if ct.size > 0:
+                            normalized_corrections.append(np.abs(ct))
+                except Exception as e:
+                    logger.warning(f"Skipping tile {idx} during delta computation: {e}")
+            
+            if normalized_corrections:
+                corrections_arr = np.concatenate(normalized_corrections)
+                correction_delta = compute_correction_delta(
+                    corrections_arr, percentile=95.0, min_delta=1.0
+                )
+            else:
+                correction_delta = 1.0
         else:
             correction_delta = 1.0
         
