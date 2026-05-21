@@ -175,6 +175,14 @@ powershell -Command "(Get-Content 'path/to/model_output/config.yaml') -replace '
 **Cause:** Should not crash; both file types should coexist in the same directory
 **Fix:** Verify each file's mode in startup logs ("Loaded X in regression mode" / "Loaded X in classification mode"). Mode is per-file, not global.
 
+### Issue: Huber delta is very large (>50) or training loss plateaus
+**Cause:** Delta computed from raw correction magnitudes instead of normalized values, putting Huber loss in pure linear mode (effectively MAE)
+**Fix:** Verify startup log shows "Sampling 50 tiles to compute Huber delta from normalized corrections..." followed by a delta value typically in the 1-10 range. If delta is much larger, check that `_compute_training_stats` is using the dataset-sample approach rather than raw correction magnitudes.
+
+### Issue: Validation loss bounces wildly between epochs
+**Cause:** Training and validation distributions don't match (e.g., training on mixed depth regimes but validating on only one)
+**Fix:** Use `--val-surveys` flag pointing at a folder with multiple files covering the same regimes as training. Alternative is tile-based split (not currently supported by train.py).
+
 ---
 
 ## Output Files Explained

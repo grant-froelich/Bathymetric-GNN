@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-05-21 - Huber Delta Computation Fixed for Normalized Corrections
+
+### Bug Identified in V10 Multi-File Training
+- First V10 training run on 5 E00269 sub-files reported Huber delta of 281.7m
+- Training proceeded but with erratic validation loss (range 5.98 to 18.71 across 9 epochs)
+- Root cause: `_compute_training_stats` was computing delta from raw correction magnitudes in meters
+- Model trains on normalized corrections (divided by local_std, clipped to +/-50 std-devs)
+- A delta of 281 put the Huber loss in pure linear mode for the entire run, effectively becoming MAE
+- The quadratic gradient signal that Huber provides for small errors was completely absent
+
+### Fix
+- Updated `_compute_training_stats` to sample 50 random tiles from the dataset
+- Builds graphs for sampled tiles and collects normalized correction targets
+- Computes 95th percentile from the same normalized values the model sees during training
+- Adds 99-second startup cost but eliminates unit-mismatch risk
+- Typical post-fix delta on E00269 data: 3-10 std-devs
+
+### Validation Strategy Improvement
+- Previous runs used single-file validation (sub-file 3of6 alone), which only validated shallow water performance
+- New approach uses `--val-surveys` flag to point at a separate folder with multiple files
+- Current recommended split: train on 1of6 + 3of6 + 4of6 + 6of6; validate on 2of6 (shallow) + 5of6 (deep)
+- Validation now spans both shallow and deep regimes, giving a more honest signal about generalization
+
+### Documentation Updates
+- New "Huber Loss and the Delta Parameter" section in HOW_IT_WORKS.md
+- Lesson 15 added to LESSONS_LEARNED.md
+- Troubleshooting entries added to QUICK_REFERENCE.md
+
+---
+
 ## 2026-05-20 - V10 First Training Run Operational
 
 ### First V10 Training Run on Regression-Mode Data

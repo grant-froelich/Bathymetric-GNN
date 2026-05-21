@@ -322,6 +322,28 @@ Implementation: `training/metrics.py` defines `V10Metrics` dataclass and `comput
 
 ---
 
+### 15. Huber Delta Must Match the Scale of Predictions
+
+**Problem Discovered (May 2026):** V10's first multi-file training run reported a Huber delta of 281.7m. Training proceeded but with erratic validation loss curves and weak convergence.
+
+**Root Cause:** `_compute_training_stats` was computing the 95th percentile of *raw* correction magnitudes in meters, while the model was training on *normalized* corrections (raw divided by local_std, then clipped to ±50 std-devs). The delta of 281 was orders of magnitude larger than any prediction error the model could produce, putting the Huber loss in pure linear mode for the entire training run. Effectively, Huber became MAE, losing the precise gradient signal it was supposed to provide for small errors.
+
+**Diagnostic Symptoms:**
+- Delta value much larger than the correction normalization cap (±50)
+- Training loss decreases but plateaus far from zero
+- Validation MAE stays high without strong overfitting signal (train and val loss similar)
+- Loss curve looks "stuck" rather than improving steadily
+
+**Fix:** Compute delta from the actual normalized correction targets the model sees during training. The updated `_compute_training_stats` samples 50 random tiles from the dataset, builds their graphs, and collects the normalized correction targets, then computes the 95th percentile of those.
+
+**After Fix:** Delta typically lands in the range of 3-10 std-devs for E00269 data. The Huber loss now operates in the quadratic regime for most prediction errors, with the linear regime reserved for the actual tail of outlier errors.
+
+**General Principle:** Any loss parameter that depends on the scale of model outputs must be computed in the same units as those outputs. Normalization is invisible at this level of code, so it's easy to mix units. Sampling actual graphs (rather than computing from raw data) eliminates the unit-mismatch risk entirely.
+
+See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter, and the loss shape.
+
+---
+
 ## Recommended Training Workflow
 
 ### Classification Mode (V9, existing approach)

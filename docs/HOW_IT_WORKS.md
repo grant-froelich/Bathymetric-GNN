@@ -616,6 +616,88 @@ The same model architecture supports both modes. The choice depends on what kind
 
 ---
 
+## The Huber Loss and the Delta Parameter
+
+The correction prediction in both V9 (classification mode) and V10 (regression mode) is trained with Huber loss. The Huber delta controls how the loss treats large errors versus small ones, and getting it wrong silently breaks training.
+
+### What Huber Loss Does
+
+Mean Squared Error (MSE) and Mean Absolute Error (MAE) are the two standard regression losses. They behave differently:
+
+- **MSE** squares the error. A 2-meter error contributes 4 to the loss; a 10-meter error contributes 100. Large errors dominate the gradient, so the model learns aggressively from them. The downside is that a single bad outlier in the training data can pull the model away from fitting the bulk of the data correctly.
+
+- **MAE** takes the absolute value. A 2-meter error contributes 2; a 10-meter error contributes 10. The relationship is linear, so outliers don't dominate. The downside is that the gradient magnitude is constant (always 1, in the right direction), so the model has no incentive to push small errors all the way to zero. Optimization plateaus on the small-error regime.
+
+Huber loss splits the difference. It behaves like MSE for small errors and like MAE for large errors. The transition point between the two regimes is controlled by the delta parameter.
+
+### The Loss Shape
+
+For an error `e` (predicted minus target):
+
+```
+If |e| <= delta:
+    loss = 0.5 * e^2                  (quadratic regime, like MSE)
+
+If |e| > delta:
+    loss = delta * (|e| - 0.5 * delta)  (linear regime, like MAE)
+```
+
+Visualized:
+
+```
+    loss
+     |
+     |          .       <- linear regime (slope = delta)
+     |        .
+     |      .
+     |    .
+     | _.    
+     |    \           <- quadratic regime (slope = e)
+     |     \    
+     |______\________ |e|
+            delta
+```
+
+The two regimes meet smoothly at `|e| = delta`. Below delta, the gradient is proportional to the error (small errors get small gradients, large errors get larger gradients). Above delta, the gradient is constant at delta (cap on how aggressively the loss pulls).
+
+### Why This Shape Helps
+
+In hydrographic data, the correction targets have a heavy-tailed distribution. Most cells need tiny corrections (under 1m) because the noisy and clean surfaces are nearly identical there. A small population of cells need large corrections (10m, 100m, occasionally 1000m+) because they sit on real noise artifacts.
+
+If you use pure MSE, those few extreme corrections dominate the loss. The model spends all its capacity trying to predict the 1000m outliers and learns nothing useful about the 0.1m cells that actually represent typical conditions.
+
+If you use pure MAE, the model has no incentive to drive small errors below ~1m. The bulk of cells get approximate predictions and the model stops improving.
+
+Huber with a well-chosen delta gives you both: precision on the small errors (where most cells live) and bounded influence from the outliers (so they don't ruin everything).
+
+### Choosing Delta
+
+Delta should be near the boundary between "typical error" and "outlier error" in the training data. A common heuristic is the 95th percentile of absolute correction magnitudes: this puts most cells in the quadratic regime and only the extreme tail in the linear regime.
+
+For this project, delta is computed automatically by `compute_correction_delta()` in `training/losses.py`. The function takes the 95th percentile of correction magnitudes and clips it to a minimum of 1.0 to prevent degenerate behavior on uniformly small datasets.
+
+### The V9 Normalization and Delta
+
+V9 introduced local_std normalization for correction targets. Before normalization, corrections are in meters: ranging from millimeters in shallow flat water to thousands of meters in deep noisy areas. After normalization, every correction is expressed in units of local depth variability (std-devs), with a hard cap at ±50 std-devs.
+
+This normalization solves a separate problem from delta: it makes corrections comparable across depth regimes. A 0.1m correction in 20m water and a 100m correction in 2000m water might both be roughly 0.5 std-devs locally; the model learns one consistent target across both situations.
+
+Because the model trains on normalized corrections, the delta should also be computed in normalized units. This is the subtle point that was easy to get wrong: if delta is computed from raw meters, it ends up being orders of magnitude larger than any prediction error the model could possibly make (since predictions are bounded by ±50 std-devs while raw corrections can hit 4000m+). The Huber loss then operates in pure linear mode for the entire training run, effectively becoming MAE.
+
+The current implementation samples actual graphs from the training dataset and collects the normalized correction targets, then computes the 95th percentile of those normalized values. For E00269 data this typically produces a delta in the range of 3-10 std-devs, which is the right scale.
+
+### Diagnosing Delta Problems
+
+If you suspect the delta is wrong, the symptoms are:
+
+- **Delta is much larger than 50.** The clipping in `correction_target` is at ±50 std-devs, so any delta beyond that puts the loss in linear mode for every cell. This was the original V10 bug: delta of 281 with normalized corrections capped at 50.
+- **Train loss decreases steadily but plateaus far from zero.** Pure linear loss has constant gradient magnitude regardless of error size, so the model loses incentive to refine small errors.
+- **Validation MAE matches training MAE closely with both staying high.** Both metrics report cell-level error and both should improve as the model learns. A high stable MAE with no overfitting gap suggests the training signal is too weak.
+
+Typical healthy values for delta on this project are 1-10 (in normalized std-dev units). Anything much larger should be investigated.
+
+---
+
 ## Evaluation Metrics
 
 Different training modes need different evaluation metrics. V1-V9 used classification metrics; V10 uses regression metrics. Understanding why matters because the wrong metric can hide real problems or invent fake ones.
