@@ -642,23 +642,11 @@ If |e| > delta:
     loss = delta * (|e| - 0.5 * delta)  (linear regime, like MAE)
 ```
 
-Visualized:
-
-```
-    loss
-     |
-     |          .       <- linear regime (slope = delta)
-     |        .
-     |      .
-     |    .
-     | _.    
-     |    \           <- quadratic regime (slope = e)
-     |     \    
-     |______\________ |e|
-            delta
-```
-
 The two regimes meet smoothly at `|e| = delta`. Below delta, the gradient is proportional to the error (small errors get small gradients, large errors get larger gradients). Above delta, the gradient is constant at delta (cap on how aggressively the loss pulls).
+
+![Huber loss shape and gradient behavior compared to MSE and MAE](images/huber_loss_shape.png)
+
+The left panel shows the loss values: Huber matches MSE inside the quadratic regime (shaded) and matches MAE outside it (offset slightly because of the smoothness requirement at the boundary). The right panel shows the gradient magnitude: MSE grows without bound for large errors, MAE is constant, Huber transitions smoothly from one to the other at delta.
 
 ### Why This Shape Helps
 
@@ -673,6 +661,10 @@ Huber with a well-chosen delta gives you both: precision on the small errors (wh
 ### Choosing Delta
 
 Delta should be near the boundary between "typical error" and "outlier error" in the training data. A common heuristic is the 95th percentile of absolute correction magnitudes: this puts most cells in the quadratic regime and only the extreme tail in the linear regime.
+
+![Loss shape for different values of delta](images/huber_delta_comparison.png)
+
+Smaller delta puts the loss in linear mode for more of the error range, making it more robust to outliers but weakening the gradient signal for small errors. Larger delta approaches MSE behavior, with more aggressive penalties on large errors. As `delta` approaches infinity, Huber becomes MSE exactly.
 
 For this project, delta is computed automatically by `compute_correction_delta()` in `training/losses.py`. The function takes the 95th percentile of correction magnitudes and clips it to a minimum of 1.0 to prevent degenerate behavior on uniformly small datasets.
 
