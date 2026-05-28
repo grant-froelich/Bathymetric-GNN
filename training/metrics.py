@@ -70,6 +70,8 @@ class V10Metrics:
         return asdict(self)
     
     def save_json(self, path: Path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
             json.dump(self.to_dict(), f, indent=2)
     
