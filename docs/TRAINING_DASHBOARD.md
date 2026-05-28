@@ -175,6 +175,42 @@ V10 uses regression metrics defined in `training/metrics.py`:
 
 See HOW_IT_WORKS.md for the full rationale behind each metric and what stays outside the model's responsibility (IHO compliance, charted feature preservation).
 
+### V10 Multi-File Training and Resolution Feature (2026-05-27/28)
+
+First full multi-file V10 run used 4 E00269 sub-files for training (1of6, 3of6, 4of6, 6of6) and 2 for validation (2of6 shallow + 5of6 deep). Best model at epoch 4, early stopping at epoch 18 (overfitting, expected with one geographic location).
+
+Two model versions were trained on identical data and split, differing only in the presence of the `log_footprint` resolution feature:
+
+**Best validation loss:** 1.64 (baseline) -> 1.31 (with resolution feature)
+
+Evaluation split by regime (using `scripts/evaluate_v10.py` on each validation file separately):
+
+Shallow water (2of6, 8m):
+
+| Metric | Baseline | With resolution feature |
+|--------|----------|------------------------|
+| Overall MAE | 1.99m | 0.87m |
+| MAE <0.1m bucket | 1.39m | 0.52m |
+| MAE 0.1-1m bucket | 1.86m | 0.79m |
+| MAE 1-10m bucket | 3.53m | 1.74m |
+| Recovery RMSE | 3.40m | 1.56m |
+| Recovery mean error | -2.16m | -0.94m |
+| Hazardous rate (shoal) | 0.00% | 0.00% |
+
+Deep water (5of6, 128m):
+
+| Metric | Baseline | With resolution feature |
+|--------|----------|------------------------|
+| Overall MAE | 28.09m | 26.59m |
+| MAE <0.1m bucket | 27.35m | 24.44m |
+| MAE >10m bucket | 37.69m | 35.92m |
+| Recovery RMSE | 46.81m | 40.05m |
+| Recovery mean error | -23.76m | -23.53m |
+
+Shallow water error roughly halved with no cost to shoal safety. Deep water improved only marginally, with per-bucket MAE remaining flat (~24m across all magnitude buckets), indicating the model still outputs a default magnitude rather than discriminating by need. The deep regime is data-limited (one 128m survey), not architecture-limited.
+
+The split-by-regime evaluation was essential here. The blended overall MAE (21.7m baseline) was dominated by deep water and masked the genuinely good shallow performance. Evaluating each regime separately revealed that the model is operationally promising in shallow water and not yet working in deep water, which a single aggregate number could not show.
+
 ### V10 Next Validation
 
 The 5-epoch initial run validated the pipeline. The next training run should:

@@ -344,6 +344,29 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 
 ---
 
+### 16. Per-Cell Resolution as a Conditioning Feature
+
+**Problem Addressed (May 2026):** The single model handled shallow water reasonably but failed in deep water, predicting a roughly constant correction magnitude regardless of what each cell needed (flat per-bucket MAE). One hypothesis was that shallow and deep water are different enough to need separate models.
+
+**Why Not Separate Models:** VR BAGs vary resolution within a single surface, so per-survey model routing is impossible (a VR surface has no single resolution to route on). Any regime conditioning must be per-cell, not per-survey. This pushed toward a single model conditioned on each cell's resolution rather than multiple models.
+
+**The Feature:** Added `log_footprint` as a node feature: log2 of the cell footprint in meters. For SR surveys it is constant per file; for VR it will vary per cell once native resolution is preserved through loading. log2 is used so that equal resolution ratios map to equal feature distances (4m to 8m is the same step as 128m to 256m), matching the multiplicative nature of resolution effects.
+
+**Result (controlled comparison on E00269, same split):**
+- Best validation loss improved from 1.64 to 1.31
+- Shallow water overall MAE roughly halved (1.99m to 0.87m)
+- The <0.1m bucket (clean seafloor that should barely move) improved from 1.39m to 0.52m
+- Shoal hazard rate stayed at 0.00%
+- Deep water improved only marginally and stayed flat per-bucket
+
+**Interpretation:** Resolution conditioning helps a single model handle multiple regimes, and it helped most in the regime with enough training signal (shallow). Deep water staying flat confirms the deep failure is a data limitation (one 128m survey), not something the feature can fix alone. This supports a single conditioned model over separate per-regime models.
+
+**Caveat to Watch:** Deep-direction hazard rate in shallow water rose (7.32% to 31.28%) even as overall accuracy improved. Shoal protection was unaffected (0.00%). Worth monitoring as more data is added.
+
+**Forward Note:** For VR surfaces, the per-cell resolution is lost during GDAL resampled loading (`MODE=RESAMPLED_GRID` collapses to uniform resolution). To make this feature vary per cell on VR data, the native refinement resolution must be carried through the resampling step. Until then, VR surveys get a constant log_footprint equal to their resampled resolution.
+
+---
+
 ## Recommended Training Workflow
 
 ### Classification Mode (V9, existing approach)

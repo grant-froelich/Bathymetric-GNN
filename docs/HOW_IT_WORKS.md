@@ -101,7 +101,7 @@ Each grid cell becomes a **node**. Connections between neighbors become **edges*
 |-----------|-------------------|---------------------|
 | **Nodes** | Individual data points | Grid cells with depth values |
 | **Edges** | Connections between points | Spatial adjacency (neighbors) |
-| **Node features** | Properties of each point | Depth, local statistics, gradients, curvature |
+| **Node features** | Properties of each point | Depth, local statistics, gradients, curvature, log_footprint (resolution) |
 | **Edge features** | Properties of connections | Distance, depth difference, slope angle |
 
 ### Message Passing
@@ -687,6 +687,28 @@ If you suspect the delta is wrong, the symptoms are:
 - **Validation MAE matches training MAE closely with both staying high.** Both metrics report cell-level error and both should improve as the model learns. A high stable MAE with no overfitting gap suggests the training signal is too weak.
 
 Typical healthy values for delta on this project are 1-10 (in normalized std-dev units). Anything much larger should be investigated.
+
+---
+
+## Resolution Conditioning (the log_footprint feature)
+
+A single survey can contain cells at very different resolutions, and different surveys operate at completely different scales (4m harbor surveys vs 256m reconnaissance grids). The correction magnitudes scale dramatically with resolution: a 4m survey has typical corrections under a meter, while a 128m survey can have corrections of tens to hundreds of meters. A model that does not know what scale it is looking at has to guess, and the failure mode is predicting a roughly constant correction everywhere regardless of what each cell actually needs.
+
+The `log_footprint` node feature gives the model this missing context. Each node carries the log2 of its cell footprint in meters. The model can then learn that a cell with log_footprint 2 (a 4m cell) should expect small corrections while a cell with log_footprint 7 (a 128m cell) operates in a regime of much larger corrections.
+
+### Why log2
+
+Resolution effects are multiplicative, not additive. Going from 4m to 8m changes what a cell represents by the same factor as going from 128m to 256m: each is one refinement level coarser. In raw meters those steps are 4 and 128 respectively, which would tell the network the second step is 32 times more significant. Taking log2 makes equal ratios into equal distances: 4m to 8m is a step of 1 (2 to 3), and 128m to 256m is also a step of 1 (7 to 8). This matches the underlying physics and makes the relationship the model needs to learn roughly linear in the feature, which is easier to fit. It is the same reasoning behind normalizing corrections by local_std rather than feeding raw meters.
+
+### SR vs VR
+
+For single-resolution surveys, log_footprint is constant across the whole surface (every cell has the same footprint). The feature still helps because it varies across surveys, letting one model trained on mixed-resolution data calibrate its behavior per survey.
+
+For variable-resolution surveys, the footprint genuinely varies cell to cell, which is exactly the case where per-survey model routing would be impossible and per-cell conditioning is necessary. There is an important caveat: the current VR loading path resamples to a uniform grid via GDAL, which collapses the native per-cell resolution before the feature is computed. Until the native refinement resolution is preserved through resampling, VR surfaces receive a constant log_footprint equal to their resampled resolution. Making the feature truly per-cell on VR data requires carrying the native refinement level through the loading step.
+
+### Measured effect
+
+In a controlled comparison on E00269 (identical data and train/val split, only the feature added), adding log_footprint roughly halved shallow-water MAE (1.99m to 0.87m) and improved the model's ability to leave clean seafloor alone (the <0.1m correction bucket improved from 1.39m to 0.52m error). Shoal safety was unaffected (0.00% shoal hazard rate in both). Deep water improved only marginally, because a single 128m survey does not provide enough examples for the model to learn that regime regardless of whether it knows the scale. The feature gives the model the ability to condition on resolution; it still needs sufficient training data in each regime to learn what to do there.
 
 ---
 

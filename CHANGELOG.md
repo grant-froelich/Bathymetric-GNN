@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-05-28 - Per-Cell Resolution Feature (log_footprint)
+
+### Added Resolution Conditioning Feature
+- Added `log_footprint` node feature to `data/graph_construction.py`
+- Encodes each cell's resolution (footprint) as log2 of the footprint in meters
+- For SR surveys: constant per file (log2(4)=2, log2(8)=3, log2(128)=7, log2(256)=8)
+- For VR surveys: will vary per cell once native resolution is preserved through loading (future work)
+- Rationale: lets a single model condition its correction behavior on scale rather than needing separate models per resolution regime
+- log2 chosen so equal resolution ratios map to equal feature distances (4->8 is the same step as 128->256)
+- `FOOTPRINT_FLOOR = 0.1` guards against log of zero on malformed resolution values
+- Input channels increased from 8 to 9; existing checkpoints not loadable (retrain required)
+
+### Controlled Comparison Result (E00269, same train/val split)
+Same data and split as the prior baseline; only the resolution feature was added.
+
+Best validation loss improved from 1.64 to 1.31.
+
+Shallow water (2of6, 8m) showed large improvement:
+| Metric | Baseline | With feature |
+|--------|----------|--------------|
+| Overall MAE | 1.99m | 0.87m |
+| MAE <0.1m bucket | 1.39m | 0.52m |
+| MAE 0.1-1m bucket | 1.86m | 0.79m |
+| MAE 1-10m bucket | 3.53m | 1.74m |
+| Recovery RMSE | 3.40m | 1.56m |
+| Recovery mean error | -2.16m | -0.94m |
+| Hazardous (shoal) | 0.00% | 0.00% |
+
+Deep water (5of6, 128m) showed marginal improvement only:
+| Metric | Baseline | With feature |
+|--------|----------|--------------|
+| Overall MAE | 28.09m | 26.59m |
+| Recovery RMSE | 46.81m | 40.05m |
+| Recovery mean error | -23.76m | -23.53m |
+
+Deep water per-bucket MAE remained flat (~24m across all magnitude buckets), indicating the model still outputs a default magnitude rather than discriminating. This points to deep water being a data limitation (one 128m survey) rather than something the feature alone can fix.
+
+### Interpretation
+- The feature helped where the hypothesis predicted: the shallow regime with enough signal to learn from
+- Shallow MAE roughly halved with no cost to shoal safety (still 0.00% shoal hazard)
+- Deep water still needs more training examples, not architecture changes
+- Supports staying with a single conditioned model rather than splitting by regime
+- One side effect to watch: deep-direction hazard rate in shallow water rose (7.32% to 31.28%); shoal protection unaffected
+
+---
+
 ## 2026-05-21 - Huber Delta Computation Fixed for Normalized Corrections
 
 ### Bug Identified in V10 Multi-File Training
