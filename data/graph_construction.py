@@ -25,6 +25,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Minimum cell footprint (meters) used as a floor before taking the log,
+# to guard against zero or malformed resolution values producing -inf.
+FOOTPRINT_FLOOR = 0.1
+
 
 class GraphBuilder:
     """
@@ -65,6 +69,7 @@ class GraphBuilder:
             "gradient_y",
             "gradient_magnitude",
             "curvature",
+            "log_footprint",
         ]
         
         # Default edge features
@@ -132,7 +137,7 @@ class GraphBuilder:
         
         # Compute node features (also returns per-node local_std for correction normalization)
         node_features, node_local_std = self._compute_node_features(
-            depth, valid_rows, valid_cols, uncertainty, valid_mask
+            depth, valid_rows, valid_cols, uncertainty, valid_mask, resolution
         )
         
         # Compute edge features
@@ -221,6 +226,7 @@ class GraphBuilder:
         valid_cols: np.ndarray,
         uncertainty: Optional[np.ndarray] = None,
         valid_mask: Optional[np.ndarray] = None,
+        resolution: Tuple[float, float] = (1.0, 1.0),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute features for each node using boundary-aware operations.
         
@@ -228,6 +234,12 @@ class GraphBuilder:
         using only valid neighbors. This prevents nodata values (1e6, NaN)
         from contaminating features near survey boundaries, which would
         otherwise create artificial signals the model mistakes for noise.
+        
+        The log_footprint feature encodes the cell resolution (footprint) so
+        the model can condition its behavior on scale. For SR surveys this is
+        constant across all nodes; for VR surveys (once per-cell resolution is
+        preserved through loading) it varies per node. Expressed as log2 of the
+        footprint in meters so that equal resolution ratios are equal distances.
         
         Returns:
             Tuple of (node_features tensor, local_std tensor).
@@ -272,6 +284,13 @@ class GraphBuilder:
                 feat = grad_mag[valid_rows, valid_cols]
             elif feature_name == "curvature":
                 feat = curvature[valid_rows, valid_cols]
+            elif feature_name == "log_footprint":
+                # Cell footprint in meters (use the coarser of x/y resolution).
+                # Constant per SR survey; per-node once VR resolution is preserved.
+                # log2 so equal resolution ratios map to equal feature distances.
+                footprint = max(abs(resolution[0]), abs(resolution[1]))
+                log_fp = float(np.log2(max(footprint, FOOTPRINT_FLOOR)))
+                feat = np.full(num_nodes, log_fp, dtype=np.float32)
             elif feature_name == "uncertainty" and uncertainty is not None:
                 feat = uncertainty[valid_rows, valid_cols]
             else:
