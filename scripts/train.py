@@ -34,7 +34,7 @@ from training import BathymetricGraphDataset, GroundTruthDataset, Trainer
 
 
 def setup_logging(log_level: str = "INFO"):
-    """Configure logging."""
+    """Configure console logging."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -42,6 +42,26 @@ def setup_logging(log_level: str = "INFO"):
             logging.StreamHandler(),
         ]
     )
+
+
+def attach_log_file(output_dir: Path) -> Path:
+    """
+    Add a timestamped file handler to the root logger so all subsequent
+    log lines are written to disk in addition to the console. Survives
+    crashes, reboots, and lost terminal windows; the only thing missed
+    is tqdm progress bars (those use direct stderr writes, not logging).
+    """
+    from datetime import datetime
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / f"training_{datetime.now():%Y%m%d_%H%M%S}.log"
+    
+    file_handler = logging.FileHandler(log_path, mode='a')
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logging.getLogger().addHandler(file_handler)
+    
+    return log_path
 
 
 def parse_args():
@@ -159,6 +179,11 @@ def main():
     
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Attach a log file in the output directory so progress survives
+    # terminal crashes, reboots, and power loss.
+    log_path = attach_log_file(args.output_dir)
+    logger.info(f"Logging to file: {log_path}")
     
     # Save config
     config.save(args.output_dir / "config.yaml")

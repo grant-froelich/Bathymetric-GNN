@@ -79,50 +79,90 @@ def compute_adaptive_threshold(abs_differences):
     return threshold
 
 
-def warp_noisy_to_clean(noisy_path, clean_grid):
+def warp_grid_to_reference(source_grid, reference_grid):
     """
-    Use GDAL Warp to resample the noisy BAG onto the clean grid's
-    pixel grid (same resolution, same extent, same CRS).
+    Warp an already-loaded BathymetricGrid onto a reference grid's pixel
+    grid (same resolution, extent, and CRS).
+
+    This operates on the source grid's in-memory array, which was loaded
+    via the resampled-mode loader, NOT on the raw BAG file. Re-opening the
+    raw VR BAG with gdal.Warp would invoke GDAL's default VR interpretation
+    (e.g. the low-resolution base grid), which is a different surface than
+    the resampled refinements. Differencing two different interpretations
+    produces large systematic offsets and one-sided direction splits.
+    By warping the already-resampled in-memory grid, both surfaces stay in
+    the same resampled interpretation and the difference is meaningful.
 
     Args:
-        noisy_path: Path to the noisy BAG file
-        clean_grid: BathymetricGrid of the clean surface
+        source_grid: BathymetricGrid to warp (already loaded, resampled)
+        reference_grid: BathymetricGrid whose grid to match
 
     Returns:
-        Tuple of (noisy_depth, noisy_uncertainty) arrays aligned to clean grid
+        Tuple of (warped_depth, warped_uncertainty) aligned to reference grid
     """
     import tempfile
     import os as _os
 
-    bounds = clean_grid.bounds
-    x_res = clean_grid.resolution[0]
-    y_res = clean_grid.resolution[1]
+    bounds = reference_grid.bounds
+    x_res = reference_grid.resolution[0]
+    y_res = reference_grid.resolution[1]
 
-    with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
-        tmp_path = tmp.name
+    NODATA = 1.0e6
 
+    # Write the source grid's in-memory arrays to a temporary GeoTIFF so
+    # GDAL Warp operates on the correct (resampled) surface, not the raw BAG.
+    src_tmp = None
+    dst_tmp = None
     try:
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as t:
+            src_tmp = t.name
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as t:
+            dst_tmp = t.name
+
+        depth = source_grid.depth
+        n_bands = 2 if source_grid.uncertainty is not None else 1
+        driver = gdal.GetDriverByName('GTiff')
+        src_ds = driver.Create(src_tmp, depth.shape[1], depth.shape[0], n_bands, gdal.GDT_Float32)
+        src_ds.SetGeoTransform(source_grid.transform)
+        if source_grid.crs:
+            src_ds.SetProjection(source_grid.crs)
+
+        # Replace non-finite and sentinel values with a consistent nodata
+        depth_out = np.where(np.isfinite(depth) & (np.abs(depth) < 1.0e5), depth, NODATA).astype(np.float32)
+        b1 = src_ds.GetRasterBand(1)
+        b1.WriteArray(depth_out)
+        b1.SetNoDataValue(NODATA)
+        if source_grid.uncertainty is not None:
+            unc = source_grid.uncertainty
+            unc_out = np.where(np.isfinite(unc), unc, NODATA).astype(np.float32)
+            b2 = src_ds.GetRasterBand(2)
+            b2.WriteArray(unc_out)
+            b2.SetNoDataValue(NODATA)
+        src_ds = None  # flush to disk
+
         warp_opts = gdal.WarpOptions(
             format='GTiff',
             outputBounds=(bounds[0], bounds[1], bounds[2], bounds[3]),
             xRes=x_res,
             yRes=y_res,
             resampleAlg='bilinear',
-            dstNodata=1.0e6,
+            srcNodata=NODATA,
+            dstNodata=NODATA,
         )
-        gdal.Warp(tmp_path, str(noisy_path), options=warp_opts)
+        gdal.Warp(dst_tmp, src_tmp, options=warp_opts)
 
-        warped_ds = gdal.Open(tmp_path)
-        noisy_depth = warped_ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
-        noisy_uncert = None
+        warped_ds = gdal.Open(dst_tmp)
+        warped_depth = warped_ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+        warped_uncert = None
         if warped_ds.RasterCount >= 2:
-            noisy_uncert = warped_ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
+            warped_uncert = warped_ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
         warped_ds = None
     finally:
-        if _os.path.exists(tmp_path):
-            _os.remove(tmp_path)
+        for p in (src_tmp, dst_tmp):
+            if p and _os.path.exists(p):
+                _os.remove(p)
 
-    return noisy_depth, noisy_uncert
+    return warped_depth, warped_uncert
 
 
 def load_survey(path: Path, vr_bag_mode: str = 'resampled'):
@@ -252,12 +292,15 @@ def compute_ground_truth(
     res_mismatch = abs(clean_res[0] - noisy_res[0]) > 0.01 or abs(clean_res[1] - noisy_res[1]) > 0.01
     
     if res_mismatch:
-        # Warp noisy grid to match clean grid's resolution and extent
+        # Warp the already-loaded (resampled) noisy grid to match the clean
+        # grid. We pass the loaded grid object, NOT the raw BAG path, so both
+        # surfaces stay in the resampled interpretation. See
+        # warp_grid_to_reference for why this matters.
         logger.info(
             f"Resolution mismatch: clean={clean_res[0]:.3f}m, noisy={noisy_res[0]:.3f}m. "
             f"Warping noisy grid to match clean grid."
         )
-        noisy_depth, noisy_uncert = warp_noisy_to_clean(noisy_path, clean_grid)
+        noisy_depth, noisy_uncert = warp_grid_to_reference(noisy_grid, clean_grid)
         clean_depth = clean_grid.depth
         clean_uncert = clean_grid.uncertainty
         transform = clean_grid.transform

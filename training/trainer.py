@@ -656,12 +656,25 @@ class Trainer:
             # Periodic checkpoint
             if (epoch + 1) % 10 == 0:
                 self._save_checkpoint(f'checkpoint_epoch_{epoch+1}.pt')
+            
+            # Persist per-epoch history so progress survives interruption
+            self._save_history(history)
         
         # Final save
         self._save_checkpoint('final_model.pt')
+        self._save_history(history)
         
         return history
     
+    def _save_history(self, history):
+        """Write the training history dict to JSON, overwriting each epoch."""
+        import json
+        history_path = self.output_dir / 'training_history.json'
+        try:
+            with open(history_path, 'w') as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save training history: {e}")
     def _train_epoch(self) -> Dict[str, float]:
         """Run one training epoch."""
         self.model.train()
