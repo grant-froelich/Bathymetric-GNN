@@ -2,9 +2,9 @@
 
 This document captures practical lessons from training the Bathymetric GNN on real survey data (Seward, Alaska multibeam surveys and Pacific Islands surveys). It complements the theoretical documentation in HOW_IT_WORKS.md and TRAINING_PLAN.md.
 
-*Document Version: 3.0*
-*Updated: May 2026*
-*Based on: Seward, Alaska training data, V1-V9 training runs, Pacific Islands ground truth processing, V10 regression mode design*
+*Document Version: 3.1*
+*Updated: June 2026*
+*Based on: Seward, Alaska training data, V1-V9 training runs, Pacific Islands and Alaska ground truth processing, V10 regression mode, VR warp bug fix*
 
 ---
 
@@ -367,6 +367,28 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 
 ---
 
+### 17. Difference Two Surfaces Only After Loading Them the Same Way
+
+**Problem Discovered (June 2026):** Ground truth for VR survey pairs was systematically wrong whenever the clean and noisy surveys had different resolutions. H14070 showed a 78m phantom offset with 99% one-sided direction; H14116 showed 43m and 99.7% one-sided. H13739 was mildly wrong (correct direction, 3x inflated magnitudes). The source data was fine in all cases.
+
+**Root Cause:** When resolutions differed, `prepare_ground_truth.py` loaded the noisy surface twice. First correctly via the resampled-mode loader (`MODE=RESAMPLED_GRID`), then it discarded that and re-opened the raw BAG with `gdal.Warp(tmp, str(noisy_path), ...)` to align it to the clean grid. But `gdal.Warp` on a raw VR BAG path does not use `MODE=RESAMPLED_GRID`; it falls back to GDAL's default VR interpretation (the low-resolution base grid). The clean surface was the resampled refinements; the noisy surface was the base grid. These are different surfaces, so the difference was meaningless.
+
+**Why Severity Varied:** The discrepancy between the base grid and the resampled refinements depends on the VR structure. When clean and noisy structures are similar (H13739), the error is small. When they differ a lot (H14116: clean 64m base vs noisy 32.73m base), the error is large. This is why one survey looked "mostly fine" and masked the bug for weeks.
+
+**How It Was Caught:** CARIS-derived difference exports (computed at native resolution by purpose-built hydrographic software) showed normal symmetric noise (median ~0, ~50/50 direction split, sub-meter typical magnitudes) for all three surveys. The BAG pipeline showed offsets of tens of meters and 99% one-sided splits. The mismatch between the two was the signal that the pipeline, not the data, was broken.
+
+**The Diagnostic That Isolated It:** A separate script compared the resampled noisy surface alone against a CARIS export of the same surface. They matched with correlation -0.9999 (differing only by sign convention). This proved the resampling was correct and the bug was specifically in the warp re-opening the raw BAG.
+
+**The Fix:** Warp the already-loaded, correctly-resampled in-memory grid instead of re-opening the raw BAG. Write the loaded grid to a temporary GeoTIFF, warp that, so both surfaces stay in the same interpretation through the difference.
+
+**General Principle:** When differencing two surfaces, both must be loaded through the exact same path with the exact same options. Any divergence in how the two are read (resampling mode, interpolation, datum handling, sign convention) shows up as fake signal in the difference. The safest pattern is: load both with one function, confirm they are in the same representation, and only then subtract. If alignment or resampling is needed, operate on the already-loaded arrays rather than re-reading the source files with different settings.
+
+**Validation Practice Worth Keeping:** When an external tool (CARIS here) can produce the same quantity, use it as ground truth to validate the pipeline. The discrepancy between pipeline output and CARIS output is what made this bug visible. A single-source pipeline with no external check would have trained on corrupted targets indefinitely. The 50/50 vs 99/1 direction split was the most diagnostic single number; a healthy noise-removal difference is close to symmetric, and a wildly asymmetric split is a red flag for a systematic processing problem rather than real noise.
+
+**Note on Sign Convention:** This investigation incidentally revealed that GDAL reads these BAG depths as negative-down while CARIS exports positive-down. This does not affect the pipeline because both surfaces are loaded through the same GDAL path and the sign cancels in the subtraction. But it is worth knowing when comparing pipeline values against CARIS values directly: a near-perfect negative correlation between two surfaces that should be identical means a sign convention difference, not a data problem.
+
+---
+
 ## Recommended Training Workflow
 
 ### Classification Mode (V9, existing approach)
@@ -459,3 +481,6 @@ After any training run, validate in QGIS before trusting metrics:
 | 50/50 shoal/deep split | Not actually a problem | Expected for CUBE re-grid differences; only a quality signal for surfaces produced by post-grid editing |
 | Fixed threshold doesn't fit | Adaptive threshold varies widely across surveys (0.12m to 6.73m) | Use `--adaptive-threshold` per pair, or shift to regression mode for consistency |
 | Classification head over-predicts | False positives near threshold boundary | Consider regression mode; eliminates threshold-induced false positives |
+| Huge one-sided difference in VR pair | 99% deep (or shoal) direction, tens-of-meters phantom offset | Warp re-opened raw BAG with wrong VR interpretation; fixed in `warp_grid_to_reference` (warp the loaded resampled grid, not the raw file) |
+| VR difference magnitudes inflated | Mean correction several times larger than CARIS | Same root cause as above; severity is small when clean/noisy VR structures are similar, large when they differ |
+| Pipeline difference disagrees with CARIS | Pipeline median offset tens of meters, CARIS near zero | Validate against CARIS export; near-perfect negative correlation between surfaces means a sign convention difference, not a data problem |

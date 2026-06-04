@@ -183,6 +183,17 @@ powershell -Command "(Get-Content 'path/to/model_output/config.yaml') -replace '
 **Cause:** Training and validation distributions don't match (e.g., training on mixed depth regimes but validating on only one)
 **Fix:** Use `--val-surveys` flag pointing at a folder with multiple files covering the same regimes as training. Alternative is tile-based split (not currently supported by train.py).
 
+### Issue: VR survey pair shows huge one-sided difference (e.g. 99% deep, tens-of-meters offset)
+**Cause:** Historic bug where the warp step re-opened the raw BAG with GDAL's default VR interpretation instead of the resampled surface. Fixed in `warp_grid_to_reference`.
+**Fix:** Ensure you are on the fixed `prepare_ground_truth.py`. Validate against a CARIS difference export: a healthy noise-removal difference has a near-zero median and roughly symmetric (~50/50) direction split. A wildly asymmetric split signals a processing problem, not real noise.
+
+### Diagnostic: Verify a resampled surface matches CARIS
+Use `scripts/check_resampled_surface.py` to compare a resampled BAG surface against a CARIS XYZ export at matching locations:
+```
+python scripts/check_resampled_surface.py --bag "survey.bag" --caris "survey_caris.txt"
+```
+A near-1.0 correlation with small mean |diff| means the surface is correct. A near -1.0 correlation means the surfaces match but use opposite sign conventions (GDAL negative-down vs CARIS positive-down), which is expected and harmless within the pipeline.
+
 ---
 
 ## Output Files Explained
@@ -280,4 +291,4 @@ Before adding a survey pair to training data:
 
 ---
 
-*Quick Reference v3.0 | May 2026*
+*Quick Reference v3.1 | June 2026*

@@ -211,14 +211,30 @@ Shallow water error roughly halved with no cost to shoal safety. Deep water impr
 
 The split-by-regime evaluation was essential here. The blended overall MAE (21.7m baseline) was dominated by deep water and masked the genuinely good shallow performance. Evaluating each regime separately revealed that the model is operationally promising in shallow water and not yet working in deep water, which a single aggregate number could not show.
 
+### VR Ground Truth Fix (2026-06-03) and Corrected Data
+
+The H13739 training run above used corrupted ground truth. A bug in `prepare_ground_truth.py` caused VR survey pairs with mismatched resolutions to be differenced against the wrong surface interpretation (the warp re-opened the raw BAG instead of using the loaded resampled grid). H13739's targets were inflated roughly 3x. See CHANGELOG and LESSONS_LEARNED lesson 17 for the full diagnosis.
+
+Consequence: the "Resolution feature + H13739" results above are invalid as a measure of whether H13739 helped. The E00269-only resolution-feature results remain valid (SR surveys never triggered the buggy warp path).
+
+After the fix, three VR surveys reprocessed cleanly and now match CARIS-derived truth:
+
+| Survey | Region | Valid cells | Mean abs correction | Direction split |
+|--------|--------|-------------|---------------------|-----------------|
+| H13739 | Pacific Islands | 108K | 7.87m | 52.4/47.6 |
+| H14070 | Pacific NW | 264K | 2.14m | 52.6/47.4 |
+| H14116 | Alaska | 215K | 6.07m | 50.2/49.8 |
+
+This gives four geographic locations with correct targets (E00269 plus these three), the geographic diversity the project needed to move past E00269 specialization. The next training run should use the corrected VR data, with one of the new locations held out for cross-geography validation.
+
 ### V10 Next Validation
 
 The 5-epoch initial run validated the pipeline. The next training run should:
 
-1. Process more E00269 sub-files (2-6) in regression mode for 6 total files
-2. Add H13739 in regression mode for cross-geography diversity
-3. Run 50-100 epochs with train/val split (multi-file requirement met)
-4. Compare V10 performance against V9 on the Seward validation set after V10 trains on regression-mode Seward data
+1. Replace the corrupted H13739 ground truth with the corrected version
+2. Add H14070 and H14116 (corrected) for Alaska and Pacific NW diversity
+3. Hold one new location out as cross-geography validation (option B)
+4. Run 50-100 epochs with the resolution feature active
 
 ---
 
