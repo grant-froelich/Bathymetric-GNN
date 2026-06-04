@@ -1,5 +1,59 @@
 # Changelog
 
+## 2026-06-03 - Critical Fix: VR Ground Truth Warp Used Wrong Surface Interpretation
+
+### The Bug
+When clean and noisy surveys had different resolutions (which triggers the warp-to-align path in `prepare_ground_truth.py`), the noisy surface was loaded twice with inconsistent results:
+1. First correctly via `load_survey` using `MODE=RESAMPLED_GRID` (the resampled refinement surface)
+2. Then that result was discarded, and `warp_noisy_to_clean` re-opened the raw BAG with `gdal.Warp(tmp, str(noisy_path), ...)` which did NOT pass `MODE=RESAMPLED_GRID`
+
+`gdal.Warp` on the raw VR BAG path falls back to GDAL's default VR interpretation (e.g. the low-resolution base grid), which is a fundamentally different surface than the resampled refinements. Differencing this against the clean resampled surface produced systematic offsets and one-sided direction splits.
+
+### How It Was Found
+Comparison against CARIS-derived difference exports (CSAR) revealed the BAG pipeline produced wildly wrong values for VR survey pairs:
+
+| Survey | BAG pipeline median diff | CSAR median diff | BAG direction split | CSAR direction split |
+|--------|--------------------------|------------------|---------------------|----------------------|
+| H13739 | -0.34m (mean abs 21.25m) | -0.04m (mean abs 6.59m) | 51/49 | 51.8/48.2 |
+| H14070 | 78.17m (mean abs 102.62m) | -0.01m (mean abs 1.17m) | 1.1/98.9 | 51.7/48.3 |
+| H14116 | 43.62m (mean abs 61.03m) | -0.02m (mean abs 3.67m) | 0.3/99.7 | 51.1/48.9 |
+
+Severity tracked how much the clean and noisy VR refinement structures differed. H13739 (similar structures) was mildly wrong: correct direction, magnitudes inflated 3x. H14070 and H14116 (very different structures) were severely wrong: 78m and 43m phantom offsets, 99% one-sided.
+
+A separate diagnostic (`check_resampled_surface.py`) confirmed the resampled noisy surface alone matches CARIS perfectly (correlation -0.9999, differing only by sign convention: GDAL reads depth negative-down, CARIS positive-down). This proved the resampling itself was correct and isolated the bug to the warp re-opening the raw BAG.
+
+### The Fix
+Replaced `warp_noisy_to_clean(noisy_path, clean_grid)` with `warp_grid_to_reference(noisy_grid, clean_grid)`, which:
+- Operates on the already-loaded, correctly-resampled `noisy_grid` in-memory array
+- Writes it to a temporary GeoTIFF with its own geotransform
+- Warps that GeoTIFF onto the clean grid
+
+Both surfaces now stay in the resampled interpretation through the difference.
+
+### Verification After Fix
+All three VR surveys reprocessed and now match CSAR truth:
+
+| Survey | Fixed median diff | Fixed mean abs | Fixed direction split |
+|--------|-------------------|----------------|----------------------|
+| H13739 | -0.13m | 7.87m | 52.4/47.6 |
+| H14070 | -0.05m | 2.14m | 52.6/47.4 |
+| H14116 | -0.01m | 6.07m | 50.2/49.8 |
+
+Magnitudes run slightly above CSAR (GDAL vs CARIS resampling/gridding differ), but offsets are gone and direction splits are symmetric.
+
+### Note on Sign Convention
+GDAL reads these BAG depths as negative-down; CARIS exports positive-down. Because `prepare_ground_truth.py` loads both clean and noisy through the same GDAL path, the sign convention cancels in the subtraction. No sign flip is needed for the difference to be correct.
+
+### Impact on Prior Results
+- The earlier V10 training run that included H13739 used the corrupted (inflated) H13739 targets. That run's results are invalid as a measure of whether H13739 helped.
+- All E00269 SR results are unaffected: SR BAGs do not trigger the warp path and were always loaded consistently.
+- Three VR surveys (H13739 Pacific Islands, H14070 Pacific NW, H14116 Alaska) are now usable, providing the geographic diversity beyond E00269 that the project needed.
+
+### New Diagnostic Tool
+- `scripts/check_resampled_surface.py`: compares a resampled BAG surface against a CARIS XYZ export at matching locations. Useful for validating that a loaded surface matches the authoritative hydrographic software.
+
+---
+
 ## 2026-05-28 - Per-Cell Resolution Feature (log_footprint)
 
 ### Added Resolution Conditioning Feature
