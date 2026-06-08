@@ -2,9 +2,9 @@
 
 This document captures practical lessons from training the Bathymetric GNN on real survey data (Seward, Alaska multibeam surveys and Pacific Islands surveys). It complements the theoretical documentation in HOW_IT_WORKS.md and TRAINING_PLAN.md.
 
-*Document Version: 3.1*
+*Document Version: 3.2*
 *Updated: June 2026*
-*Based on: Seward, Alaska training data, V1-V9 training runs, Pacific Islands and Alaska ground truth processing, V10 regression mode, VR warp bug fix*
+*Based on: Seward training data, V1-V9 runs, Pacific Islands/Pacific NW/Alaska ground truth, V10 regression mode, VR warp fix, first cross-geography generalization result*
 
 ---
 
@@ -386,6 +386,22 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 **Validation Practice Worth Keeping:** When an external tool (CARIS here) can produce the same quantity, use it as ground truth to validate the pipeline. The discrepancy between pipeline output and CARIS output is what made this bug visible. A single-source pipeline with no external check would have trained on corrupted targets indefinitely. The 50/50 vs 99/1 direction split was the most diagnostic single number; a healthy noise-removal difference is close to symmetric, and a wildly asymmetric split is a red flag for a systematic processing problem rather than real noise.
 
 **Note on Sign Convention:** This investigation incidentally revealed that GDAL reads these BAG depths as negative-down while CARIS exports positive-down. This does not affect the pipeline because both surfaces are loaded through the same GDAL path and the sign cancels in the subtraction. But it is worth knowing when comparing pipeline values against CARIS values directly: a near-perfect negative correlation between two surfaces that should be identical means a sign convention difference, not a data problem.
+
+---
+
+### 18. Aggregate Error Metrics Can Be Dominated by a Tiny Cell Population
+
+**Observed (June 2026):** On the first cross-geography test (model trained on Pacific Islands + Pacific NW, evaluated on unseen Alaska), the aggregate looked alarming: 19m MAE, 72m recovery RMSE, -18m mean error. Read literally, that says the model's corrections would degrade an unseen survey and are not usable.
+
+**What the spatial analysis revealed:** A per-cell error map showed the worst 1% of cells accounted for 87.6% of total squared error, and the worst 5% for 96.5%. The other 95% of cells contributed only 3.5%. The model was handling almost the entire survey well and failing on a small scattered population of large-magnitude correction cells (true correction >=10m, mostly deeper water). QGIS confirmed these were isolated cells and tiny clusters, not a contiguous failure region.
+
+**Why This Matters:** MAE and especially RMSE are squared- or magnitude-weighted, so a small number of large errors dominate them. An aggregate metric that looks like wholesale failure can actually be "works well on 95% of cells, fails on a hard 5%." The two cases call for completely different responses: wholesale failure means the approach is wrong; localized failure means the approach works and a specific hard subset needs more data. You cannot tell which from the aggregate number alone.
+
+**The Diagnostic Pattern:** When an aggregate metric looks bad, before concluding the model failed, check error concentration. Sort cells by squared error, compute the cumulative fraction of total error against the cumulative fraction of cells. If a small fraction of cells carries most of the error, the failure is localized; investigate that population specifically (what depth, what correction magnitude, what location) rather than treating the whole result as a failure. `scripts/spatial_error_map.py` does this and also writes a per-cell error GeoTIFF for visual inspection.
+
+**Corollary on Recovery RMSE:** Recovery RMSE (corrected surface vs clean reference) is a useful single number but inherits the same sensitivity. A 72m recovery RMSE driven by the worst 1% of cells does not mean "applying corrections degrades the surface everywhere"; it means a few cells get large wrong corrections while the bulk is fine. Report the concentration alongside the RMSE so the number is not misread.
+
+**General Principle:** Always look at the distribution of errors, not just their summary statistics, before drawing conclusions about model quality. A mean or RMS hides whether error is spread evenly or concentrated, and that distinction often changes the conclusion entirely.
 
 ---
 

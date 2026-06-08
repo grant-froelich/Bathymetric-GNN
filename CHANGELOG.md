@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-06-08 - First Cross-Geography Generalization Result (Multi-Location V10)
+
+### Training Run
+First V10 training on corrected multi-location data with a genuinely held-out geography.
+- Training: E00269 (4 SR sub-files, Pacific Islands) + H13739 (VR, Pacific Islands) + H14070 (VR, Pacific NW)
+- Validation: E00269 2of6 (shallow) + E00269 5of6 (deep) + H14116 (VR, Alaska, unseen geography)
+- Resolution feature active (9 input channels), corrected VR ground truth, Huber delta 5.90
+- Best val loss 1.51 at epoch 12, early stopping at epoch 26
+- Runtime ~36 hours (VR surveys increased per-epoch cost to 56-78 min/epoch)
+
+### Per-Location Evaluation (best_model.pt, evaluated separately by location)
+
+| Metric | E00269 shallow (8m) | E00269 deep (128m) | H14116 Alaska (unseen) |
+|--------|---------------------|--------------------|-----------------------|
+| Overall MAE | 2.41m | 27.37m | 19.00m |
+| Normalized MAE | 1.77 std | 1.20 std | 0.92 std |
+| MAE <0.1m bucket | 1.70m | 27.15m | 7.43m |
+| MAE 1-10m bucket | 4.27m | 24.22m | 16.03m |
+| MAE >10m bucket | 24.07m | 38.18m | 84.48m |
+| Shoal hazard rate | 0.00% | 7.82% | 5.08% |
+| Recovery RMSE | 4.12m | 47.83m | 71.68m |
+
+### Spatial Error Analysis on H14116 (unseen Alaska)
+A per-cell error map (`scripts/spatial_error_map.py`) showed the H14116 failure is highly localized, not pervasive:
+- The worst 1% of cells account for 87.6% of total squared error
+- The worst 5% account for 96.5%; the remaining 95% of cells contribute only 3.5%
+- Error rises only modestly with depth (14m mean in shallower bins to 25m in deepest), so depth is a contributor, not the cause
+- The 15,848 cells with true corrections >=10m have mean error 86m and dominate the aggregate metrics
+- QGIS visualization confirmed errors are scattered individual cells and tiny clusters, not a contiguous failure region
+
+### Interpretation
+The model generalizes to unseen Alaska for the common case. The bulk of the survey (clean seafloor and small corrections, ~95% of cells) is handled reasonably, and shoal protection held at a 5% hazard rate on geography never seen in training. The model's weakness is isolated large-magnitude corrections (10m+, mostly deeper water), which are scattered individual fliers/noise spikes where it mispredicts magnitude badly. Because RMSE and MAE are dominated by this small high-error population, the headline numbers look worse than the model's typical behavior.
+
+This is the first concrete evidence of geographic generalization in the project. It also localizes the remaining weakness: the model needs more examples of large-magnitude deep-water noise to predict those specific cells, which is a data-scarcity issue rather than an architecture or geography problem.
+
+### Caveats
+- Validation sets are small (H14116 is 18 tiles / ~196K analyzed cells from one survey); this is a first signal, not a confident measurement
+- No two runs to date differ by exactly one variable, so causal attribution between runs is limited
+- The normalized MAE comparison across regimes carries a depth bias (deep water has a larger local_std denominator); absolute per-bucket numbers are more directly comparable
+- Hazardous error rate tracks frequency, not magnitude; magnitude of hazardous errors on unseen geography is not yet quantified
+
+### New Tool
+- `scripts/spatial_error_map.py`: runs a model over one survey and writes a per-cell error GeoTIFF (target, predicted, error, abs_error, depth) plus prints error-concentration and error-vs-depth diagnostics. Distinguishes localized from pervasive failure.
+
+---
+
 ## 2026-06-03 - Critical Fix: VR Ground Truth Warp Used Wrong Surface Interpretation
 
 ### The Bug

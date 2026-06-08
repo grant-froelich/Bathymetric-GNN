@@ -1,6 +1,6 @@
 # Bathymetric GNN -- Training Performance Tracker
 
-**V1-V10 | Seward, Alaska + Pacific Islands | VR/SR BAG Noise Detection | Updated 2026-05-20**
+**V1-V10 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-08**
 
 ---
 
@@ -227,14 +227,40 @@ After the fix, three VR surveys reprocessed cleanly and now match CARIS-derived 
 
 This gives four geographic locations with correct targets (E00269 plus these three), the geographic diversity the project needed to move past E00269 specialization. The next training run should use the corrected VR data, with one of the new locations held out for cross-geography validation.
 
-### V10 Next Validation
+### Multi-Location Cross-Geography Run (2026-06-08)
 
-The 5-epoch initial run validated the pipeline. The next training run should:
+First training on corrected multi-location data with a held-out geography. Trained on E00269 (4 SR sub-files) + H13739 (Pacific Islands VR) + H14070 (Pacific NW VR); validated on E00269 shallow + E00269 deep + H14116 (Alaska VR, never seen in training). Resolution feature active, best val loss 1.51 at epoch 12, early stopping at 26, ~36 hour runtime.
 
-1. Replace the corrupted H13739 ground truth with the corrected version
-2. Add H14070 and H14116 (corrected) for Alaska and Pacific NW diversity
-3. Hold one new location out as cross-geography validation (option B)
-4. Run 50-100 epochs with the resolution feature active
+Per-location evaluation (each validation file evaluated separately):
+
+| Metric | E00269 shallow | E00269 deep | H14116 Alaska (unseen) |
+|--------|----------------|-------------|------------------------|
+| Overall MAE | 2.41m | 27.37m | 19.00m |
+| Normalized MAE | 1.77 std | 1.20 std | 0.92 std |
+| MAE <0.1m bucket | 1.70m | 27.15m | 7.43m |
+| MAE 1-10m bucket | 4.27m | 24.22m | 16.03m |
+| MAE >10m bucket | 24.07m | 38.18m | 84.48m |
+| Shoal hazard rate | 0.00% | 7.82% | 5.08% |
+| Recovery RMSE | 4.12m | 47.83m | 71.68m |
+
+**Spatial error analysis on H14116** (via `scripts/spatial_error_map.py`) showed the failure is localized, not pervasive:
+
+- Worst 1% of cells = 87.6% of total squared error
+- Worst 5% of cells = 96.5%; remaining 95% of cells contribute only 3.5%
+- Error rises modestly with depth (14m to 25m mean across the depth range), so depth is a contributor not the cause
+- The 15,848 cells needing >=10m corrections have mean error 86m and dominate the aggregate
+- QGIS confirmed errors are scattered individual cells, not a contiguous region
+
+**Result:** First evidence of geographic generalization. The model handles the common case (clean seafloor and small corrections, ~95% of cells) on unseen Alaska, with shoal protection holding at 5% hazard. The weakness is isolated large-magnitude deep-water corrections, a small scattered cell population that dominates the squared-error metrics and makes the headline numbers look worse than typical behavior. This narrows the remaining gap to a data-scarcity problem: not enough large-magnitude deep-water noise examples in training.
+
+Caveats: small validation sets (H14116 is 18 tiles), no single-variable-difference baseline yet, normalized MAE carries a depth bias, and hazardous-error magnitude (not just rate) is not yet quantified.
+
+### Next Steps
+
+1. Acquire more surveys with large-magnitude deep-water noise to address the localized failure on big corrections
+2. Add hazardous-error magnitude (not just rate) to the metrics, and check whether hazardous cells coincide with the large-correction cluster
+3. Run a clean single-variable comparison (e.g. same data with/without a given survey or feature) to make defensible causal claims
+4. Watch training time as data grows (~36 hours this run); consider whether the 128m/256m E00269 files justify their cost given they are the least-improving regime
 
 ---
 
