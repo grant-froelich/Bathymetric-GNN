@@ -10,6 +10,7 @@ Includes:
 """
 
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -412,6 +413,7 @@ class Trainer:
         train_dataset: BathymetricGraphDataset,
         val_dataset: Optional[BathymetricGraphDataset] = None,
         output_dir: Optional[Path] = None,
+        use_amp: bool = False,
     ):
         """
         Initialize trainer.
@@ -422,6 +424,10 @@ class Trainer:
             train_dataset: Training dataset
             val_dataset: Validation dataset (optional)
             output_dir: Directory for checkpoints and logs
+            use_amp: If True, run the forward pass and loss under bf16 autocast
+                (mixed precision). Speeds up the GAT matmuls on CUDA; bf16 needs
+                no GradScaler. Defaults to False (full fp32, unchanged behavior)
+                so existing callers are unaffected.
         """
         self.config = config
         self.model = model
@@ -429,6 +435,10 @@ class Trainer:
         self.val_dataset = val_dataset
         self.output_dir = Path(output_dir) if output_dir else Path("./outputs")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Mixed-precision (bf16 autocast) setting
+        self.use_amp = use_amp
+        self.amp_dtype = torch.bfloat16
         
         # Setup device with Blackwell compatibility check
         if config.device == "cuda" and torch.cuda.is_available():
@@ -451,13 +461,23 @@ class Trainer:
         
         self.model.to(self.device)
         
-        # Setup data loaders
+        # Setup data loaders. When using worker processes, keep them alive across
+        # epochs (Windows uses spawn, so workers are otherwise recreated every
+        # epoch) and prefetch more batches per worker so the GPU waits less
+        # between iterations. Gated on num_workers > 0: with 0 workers these
+        # options are invalid, so the loaders fall back to default behavior.
+        loader_kwargs = {}
+        if config.num_workers > 0:
+            loader_kwargs['persistent_workers'] = True
+            loader_kwargs['prefetch_factor'] = 4
+        
         self.train_loader = GeometricDataLoader(
             train_dataset,
             batch_size=config.training.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
             pin_memory=config.pin_memory,
+            **loader_kwargs,
         )
         
         self.val_loader = None
@@ -468,6 +488,7 @@ class Trainer:
                 shuffle=False,
                 num_workers=config.num_workers,
                 pin_memory=config.pin_memory,
+                **loader_kwargs,
             )
         
         # Setup optimizer
@@ -517,6 +538,10 @@ class Trainer:
         self.patience_counter = 0
         
         logger.info(f"Trainer initialized, device: {self.device}")
+        if self.use_amp and self.device.type == 'cuda':
+            logger.info("Mixed precision enabled (bf16 autocast)")
+        elif self.use_amp:
+            logger.info("Mixed precision requested but device is not CUDA; running fp32")
     
     def _compute_training_stats(self) -> Tuple[Optional[torch.Tensor], float, str]:
         """
@@ -675,6 +700,17 @@ class Trainer:
                 json.dump(history, f, indent=2)
         except Exception as e:
             logger.warning(f"Failed to save training history: {e}")
+    def _autocast(self):
+        """bf16 autocast context when AMP is on and device is CUDA, else no-op.
+        
+        bf16 (not fp16) so no GradScaler is required: it shares fp32's exponent
+        range. Master weights stay fp32; only the matmuls inside the context run
+        in bf16, while reductions and softmax stay fp32.
+        """
+        if self.use_amp and self.device.type == 'cuda':
+            return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
+        return nullcontext()
+    
     def _train_epoch(self) -> Dict[str, float]:
         """Run one training epoch."""
         self.model.train()
@@ -688,30 +724,31 @@ class Trainer:
         for batch in pbar:
             batch = batch.to(self.device)
             
-            # Forward pass
+            # Forward pass (under bf16 autocast when AMP is enabled)
             self.optimizer.zero_grad()
-            outputs = self.model(batch)
+            with self._autocast():
+                outputs = self.model(batch)
+                
+                # Detect mode (PyG batches string attrs as lists, one per graph)
+                batch_mode = getattr(batch, 'mode', 'classification')
+                if isinstance(batch_mode, list):
+                    batch_mode = batch_mode[0] if batch_mode else 'classification'
+                
+                # Build targets dict
+                targets = {
+                    'mode': batch_mode,
+                    'class_labels': batch.y,
+                    'correction_targets': batch.correction_target,
+                    'noise_mask': batch.noise_mask,
+                }
+                if batch_mode == 'regression':
+                    # In regression mode, every node in the graph is a valid cell
+                    # (the dataset already filtered to valid cells before building the graph)
+                    targets['valid_mask'] = torch.ones(batch.num_nodes, dtype=torch.bool, device=self.device)
+                
+                losses = self.criterion(outputs, targets)
             
-            # Detect mode (PyG batches string attrs as lists, one per graph)
-            batch_mode = getattr(batch, 'mode', 'classification')
-            if isinstance(batch_mode, list):
-                batch_mode = batch_mode[0] if batch_mode else 'classification'
-            
-            # Build targets dict
-            targets = {
-                'mode': batch_mode,
-                'class_labels': batch.y,
-                'correction_targets': batch.correction_target,
-                'noise_mask': batch.noise_mask,
-            }
-            if batch_mode == 'regression':
-                # In regression mode, every node in the graph is a valid cell
-                # (the dataset already filtered to valid cells before building the graph)
-                targets['valid_mask'] = torch.ones(batch.num_nodes, dtype=torch.bool, device=self.device)
-            
-            losses = self.criterion(outputs, targets)
-            
-            # Backward pass
+            # Backward pass (outside autocast; bf16 needs no GradScaler)
             losses['total'].backward()
             
             # Gradient clipping
@@ -763,22 +800,23 @@ class Trainer:
             for batch in tqdm(self.val_loader, desc=f"Epoch {self.current_epoch+1} [Val]"):
                 batch = batch.to(self.device)
                 
-                outputs = self.model(batch)
-                
-                batch_mode = getattr(batch, 'mode', 'classification')
-                if isinstance(batch_mode, list):
-                    batch_mode = batch_mode[0] if batch_mode else 'classification'
-                
-                targets = {
-                    'mode': batch_mode,
-                    'class_labels': batch.y,
-                    'correction_targets': batch.correction_target,
-                    'noise_mask': batch.noise_mask,
-                }
-                if batch_mode == 'regression':
-                    targets['valid_mask'] = torch.ones(batch.num_nodes, dtype=torch.bool, device=self.device)
-                
-                losses = self.criterion(outputs, targets)
+                with self._autocast():
+                    outputs = self.model(batch)
+                    
+                    batch_mode = getattr(batch, 'mode', 'classification')
+                    if isinstance(batch_mode, list):
+                        batch_mode = batch_mode[0] if batch_mode else 'classification'
+                    
+                    targets = {
+                        'mode': batch_mode,
+                        'class_labels': batch.y,
+                        'correction_targets': batch.correction_target,
+                        'noise_mask': batch.noise_mask,
+                    }
+                    if batch_mode == 'regression':
+                        targets['valid_mask'] = torch.ones(batch.num_nodes, dtype=torch.bool, device=self.device)
+                    
+                    losses = self.criterion(outputs, targets)
                 
                 total_loss += losses['total'].item() * batch.num_nodes
                 total_samples += batch.num_nodes

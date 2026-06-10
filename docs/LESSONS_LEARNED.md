@@ -2,7 +2,7 @@
 
 This document captures practical lessons from training the Bathymetric GNN on real survey data (Seward, Alaska multibeam surveys and Pacific Islands surveys). It complements the theoretical documentation in HOW_IT_WORKS.md and TRAINING_PLAN.md.
 
-*Document Version: 3.2*
+*Document Version: 3.3*
 *Updated: June 2026*
 *Based on: Seward training data, V1-V9 runs, Pacific Islands/Pacific NW/Alaska ground truth, V10 regression mode, VR warp fix, first cross-geography generalization result*
 
@@ -405,6 +405,35 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 
 ---
 
+### 19. Judge Navigation Safety on a TVU-Budget Breach Rate, Not a Sign-Count Hazard Rate
+
+**Observed (June 2026):** bf16 mixed-precision training (a ~5x speedup, 5.51 -> 1.07 s/it) appeared to regress safety. On the raw `hazardous_error_rate`, the rate rose 2-3x on the deep and unseen surveys, including the shoal-target subset (Alaska shoal 5.08% -> 15.27%, deep E00269 shoal 7.82% -> 11.03%). Read literally, that blocks bf16 for a navigation-safety deliverable, even though bf16's MAE was better at all three locations.
+
+**What the budget-aware metric revealed:** `hazardous_error_rate` counts any dangerous-direction error (corrected deeper than truth) at any magnitude, with no reference to the uncertainty the survey is actually permitted. Re-counting a cell as a breach only when its dangerous-direction error exceeds the allowable TVU = sqrt(a^2 + (b*depth)^2) at that cell's depth (NOAA HSSD General 1 shallow, General 2 deep/Alaska) collapsed the alarm:
+
+| Survey | subset | raw hazard (fp32 -> bf16) | TVU breach (fp32 -> bf16) |
+|--------|--------|---------------------------|---------------------------|
+| Shallow E00269 | shoal-target | 0.00% -> 0.00% | 0.00% -> 0.00% |
+| Shallow E00269 | deep-target | 5.07% -> 31.10% | 0.07% -> 0.62% |
+| Deep E00269 | shoal-target | 7.82% -> 11.03% | 0.00% -> 0.01% |
+| Deep E00269 | deep-target | 28.96% -> 44.53% | 0.03% -> 0.12% |
+| Alaska H14116 | shoal-target | 5.08% -> 15.27% | 0.00% -> 0.00% |
+| Alaska H14116 | deep-target | 17.38% -> 48.82% | 0.05% -> 0.04% |
+
+The shoal-target dangerous-breach rate (the shoal-preservation number) stayed at ~0% for both precisions. The deep-target dangerous-breach rate rose with bf16 but stayed under 0.7% everywhere. The apparent 2-3x raw regression was almost entirely sub-budget noise.
+
+**Why This Matters:** Most cells have a near-zero true correction, so a sign-count hazard rate is dominated by sub-meter (often sub-decimeter) directional flips that are far smaller than the survey's own allowable TVU. The raw metric conflates "wrong direction" with "dangerously wrong," and once TVU is applied the two differ by one to two orders of magnitude. For a navigation-safety model, the metric that gates a go/no-go decision must be the one the deliverable is actually certified against.
+
+**Direction Semantics (stated precisely so this is not re-confused):** `hazardous` is `error < 0`, meaning the corrected surface is deeper than truth, i.e. less clearance than exists, i.e. dangerous. The `_shoal` and `_deep` breach fields partition by the *true correction's* direction, not the error's; both are dangerous-direction rates. The shoal-target subset is the one that bears on shoal preservation.
+
+**The Diagnostic Pattern:** When a single-run comparison shows aggregate error (MAE) and a thresholded safety metric moving in *opposite* directions, suspect the threshold/metric definition before concluding a real regression. Here bf16 improved MAE everywhere while the raw hazard rate worsened; the budget-aware metric resolved the contradiction.
+
+**Coefficients:** Use what the survey is certified to. NOAA HSSD rounds S-44's depth term (General 1 uses b=0.01 vs S-44 1a's 0.013; General 2/3 uses b=0.02 vs S-44 Order 2's 0.023), so using S-44 values for a NOAA survey makes the budget slightly too generous, materially so in deep water. The applicable OCS Quality Metric is set in the Project Instructions, not derived from depth.
+
+**General Principle:** A sign-count safety metric over-reports because it ignores the allowed uncertainty. bf16 is defensible on this evidence (shoal-critical breaches ~0, deep-target breaches sub-0.7%), but this is one paired run; confirm with two or three paired bf16/fp32 runs that the shoal-target breach stays at zero before making bf16 permanent on the deliverable path.
+
+---
+
 ## Recommended Training Workflow
 
 ### Classification Mode (V9, existing approach)
@@ -500,3 +529,5 @@ After any training run, validate in QGIS before trusting metrics:
 | Huge one-sided difference in VR pair | 99% deep (or shoal) direction, tens-of-meters phantom offset | Warp re-opened raw BAG with wrong VR interpretation; fixed in `warp_grid_to_reference` (warp the loaded resampled grid, not the raw file) |
 | VR difference magnitudes inflated | Mean correction several times larger than CARIS | Same root cause as above; severity is small when clean/noisy VR structures are similar, large when they differ |
 | Pipeline difference disagrees with CARIS | Pipeline median offset tens of meters, CARIS near zero | Validate against CARIS export; near-perfect negative correlation between surfaces means a sign convention difference, not a data problem |
+| Raw hazard rate inflated by a precision change | `hazardous_error_rate` up 2-3x while MAE improves | Sign count over-reports; use the TVU-breach rate (dangerous error exceeding TVU at depth). Sub-budget directional flips do not count |
+| S-44 coefficients used for a NOAA survey | TVU budget slightly too generous, esp. in deep water | Use HSSD OCS Quality Metric coefficients (General 1 b=0.01, General 2/3 b=0.02); the metric comes from Project Instructions, not depth |

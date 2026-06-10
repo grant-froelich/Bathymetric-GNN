@@ -127,6 +127,13 @@ def parse_args():
     # Hardware arguments
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable bf16 mixed-precision training (autocast on the forward "
+             "pass and loss). Speeds up the GAT matmuls on CUDA; no effect on "
+             "CPU. Off by default.",
+    )
     
     # Misc
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -337,6 +344,7 @@ def main():
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         output_dir=args.output_dir,
+        use_amp=args.amp,
     )
     
     # Train

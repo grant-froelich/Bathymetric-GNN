@@ -23,6 +23,58 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# Maximum-allowable TVU coefficients for TVU = sqrt(a^2 + (b * depth)^2) at 95%
+# confidence. Lookup is case-insensitive and ignores spaces/underscores, so
+# "general 1", "General_1", and "general1" all resolve to the same entry.
+#
+# Two label sets are provided:
+#   - IHO S-44 Edition 6 (2020) order labels.
+#   - NOAA HSSD 2026 OCS Quality Metric labels (Table 5.8.1). NOAA rounds the
+#     depth coefficient, so General 1 uses b=0.01 (not S-44 1a's 0.013) and
+#     General 2/3 uses b=0.02 (not S-44 Order 2's 0.023). Use the HSSD labels for
+#     NOAA surveys. The metric a survey is held to is set in its Project
+#     Instructions, not derived from depth.
+# Orders 1a/1b (and General 2/3) share the same TVU; they differ in feature
+# detection, not vertical uncertainty.
+IHO_TVU_COEFFICIENTS = {
+    # IHO S-44 Edition 6
+    "exclusive":   (0.15, 0.0075),
+    "special":     (0.25, 0.0075),
+    "1a":          (0.5,  0.013),
+    "1b":          (0.5,  0.013),
+    "2":           (1.0,  0.023),
+    # NOAA HSSD 2026 OCS Quality Metric (Table 5.8.1)
+    "exceptional": (0.15, 0.0075),
+    "critical":    (0.25, 0.0075),
+    "general1":    (0.5,  0.01),
+    "general2":    (1.0,  0.02),
+    "general3":    (1.0,  0.02),
+    "general4":    (2.0,  0.05),
+}
+
+
+def _resolve_tvu(iho_order, tvu_a, tvu_b):
+    """Resolve TVU coefficients from explicit a/b or an IHO order label.
+    
+    Explicit tvu_a and tvu_b take precedence over iho_order. Returns
+    (a, b, label), or (None, None, "") when nothing usable was supplied,
+    in which case the TVU breach metric is skipped.
+    """
+    if tvu_a is not None and tvu_b is not None:
+        label = str(iho_order) if iho_order else "custom"
+        return float(tvu_a), float(tvu_b), label
+    if iho_order is not None:
+        key = str(iho_order).strip().lower().replace(" ", "").replace("_", "")
+        if key in IHO_TVU_COEFFICIENTS:
+            a, b = IHO_TVU_COEFFICIENTS[key]
+            return a, b, key
+        logger.warning(
+            f"Unknown IHO order '{iho_order}'; TVU breach not computed. "
+            f"Known orders: {sorted(IHO_TVU_COEFFICIENTS)}, or pass tvu_a/tvu_b."
+        )
+    return None, None, ""
+
+
 @dataclass
 class V10Metrics:
     """
@@ -66,6 +118,24 @@ class V10Metrics:
     recovery_rmse: float = 0.0  # RMS of (corrected_depth - clean_depth) across valid cells
     recovery_mean_error: float = 0.0  # signed mean of the same residual
     
+    # TVU-budget safety metrics (IHO S-44 / NOAA HSSD).
+    # A cell is a TVU breach when its error is in the dangerous direction
+    # (corrected deeper than reality) AND its magnitude exceeds the allowable
+    # TVU = sqrt(a^2 + (b*depth)^2) at that cell's depth. Unlike the raw
+    # hazardous_error_rate (a sign count at any magnitude), this counts only
+    # dangerous errors large enough to bust the survey's uncertainty budget.
+    # Populated only when TVU coefficients are supplied to compute_v10_metrics;
+    # otherwise the rates stay at -1.0, meaning "not computed".
+    tvu_order: str = ""
+    tvu_a: float = 0.0
+    tvu_b: float = 0.0
+    tvu_breach_rate: float = -1.0
+    tvu_breach_rate_shoal: float = -1.0
+    tvu_breach_rate_deep: float = -1.0
+    n_tvu_breach: int = 0
+    n_tvu_breach_shoal: int = 0
+    n_tvu_breach_deep: int = 0
+    
     def to_dict(self) -> Dict:
         return asdict(self)
     
@@ -100,6 +170,13 @@ class V10Metrics:
             f"    RMSE vs clean: {self.recovery_rmse:.3f}m",
             f"    Mean error vs clean: {self.recovery_mean_error:+.3f}m",
         ]
+        if self.tvu_breach_rate >= 0:
+            lines.extend([
+                f"  TVU breach (order {self.tvu_order}, a={self.tvu_a:g}m, b={self.tvu_b:g}):",
+                f"    Breach rate (overall):       {self.tvu_breach_rate:.2%}  ({self.n_tvu_breach:,} cells)",
+                f"    Breach rate (shoal targets): {self.tvu_breach_rate_shoal:.2%}  ({self.n_tvu_breach_shoal:,} cells)",
+                f"    Breach rate (deep targets):  {self.tvu_breach_rate_deep:.2%}  ({self.n_tvu_breach_deep:,} cells)",
+            ])
         return "\n".join(lines)
 
 
@@ -119,6 +196,9 @@ def compute_v10_metrics(
     clean_depth: Optional[np.ndarray] = None,
     survey_name: str = "",
     model_version: str = "V10",
+    iho_order: Optional[str] = None,
+    tvu_a: Optional[float] = None,
+    tvu_b: Optional[float] = None,
 ) -> V10Metrics:
     """
     Compute V10 evaluation metrics from model predictions and ground truth.
@@ -131,10 +211,19 @@ def compute_v10_metrics(
         target_correction: True corrections (noisy - clean) for every cell
         valid_mask: Boolean mask of cells to evaluate
         local_std: Optional, per-cell local depth variability (for normalized MAE)
-        noisy_depth: Optional, original noisy depth at every cell (for recovery RMSE)
+        noisy_depth: Optional, original noisy depth at every cell (for recovery RMSE
+            and, when TVU coefficients are given, the depth used to size the budget)
         clean_depth: Optional, reference clean depth at every cell (for recovery RMSE)
         survey_name: Identifier for the survey
         model_version: Identifier for the model version
+        iho_order: Optional order label selecting TVU coefficients. Accepts IHO
+            S-44 orders ("exclusive", "special", "1a", "1b", "2") or NOAA HSSD
+            OCS Quality Metrics ("exceptional", "critical", "general1",
+            "general2", "general3", "general4"); see IHO_TVU_COEFFICIENTS.
+            Ignored if tvu_a and tvu_b are given explicitly. When neither is
+            supplied, the TVU breach metric is skipped and its fields stay at -1.0.
+        tvu_a: Optional explicit TVU constant term a (meters); overrides iho_order
+        tvu_b: Optional explicit TVU depth-scaled term b; overrides iho_order
     
     Returns:
         V10Metrics dataclass
@@ -209,6 +298,35 @@ def compute_v10_metrics(
         m.recovery_rmse = float(np.sqrt(np.mean(recovery_error ** 2)))
         m.recovery_mean_error = float(np.mean(recovery_error))
     
+    # TVU-budget breach metrics (IHO S-44 / NOAA HSSD)
+    # A breach is a dangerous-direction error (hazardous) whose magnitude exceeds
+    # the allowable TVU at that cell's depth. abs_error equals the dangerous
+    # deviation magnitude on hazardous cells (where error < 0).
+    a_coeff, b_coeff, order_label = _resolve_tvu(iho_order, tvu_a, tvu_b)
+    if a_coeff is not None:
+        m.tvu_order = order_label
+        m.tvu_a = float(a_coeff)
+        m.tvu_b = float(b_coeff)
+        if noisy_depth is not None:
+            # Depth magnitude (TVU is defined on |depth|, so this is robust to
+            # whichever sign convention the depth band uses).
+            depth_v = np.abs(_to_numpy(noisy_depth).flatten()[mask])
+            tvu_allow = np.sqrt(a_coeff ** 2 + (b_coeff * depth_v) ** 2)
+            breach = hazardous & (abs_error > tvu_allow)
+            m.tvu_breach_rate = float(np.mean(breach))
+            m.n_tvu_breach = int(breach.sum())
+            if m.n_shoal_target_cells > 0:
+                m.tvu_breach_rate_shoal = float(np.mean(breach[shoal_targets]))
+                m.n_tvu_breach_shoal = int(breach[shoal_targets].sum())
+            if m.n_deep_target_cells > 0:
+                m.tvu_breach_rate_deep = float(np.mean(breach[deep_targets]))
+                m.n_tvu_breach_deep = int(breach[deep_targets].sum())
+        else:
+            logger.warning(
+                "TVU coefficients supplied but noisy_depth is None; "
+                "cannot size the budget, so TVU breach rate is not computed."
+            )
+    
     return m
 
 
@@ -243,4 +361,10 @@ def compare_metrics(*metrics: V10Metrics) -> str:
         fmt_row("Recovery RMSE (m)", [m.recovery_rmse for m in metrics]),
         fmt_row("Recovery mean error (m)", [m.recovery_mean_error for m in metrics]),
     ]
+    if any(m.tvu_breach_rate >= 0 for m in metrics):
+        lines.extend([
+            fmt_row("TVU breach (overall)", [m.tvu_breach_rate for m in metrics]),
+            fmt_row("TVU breach (shoal)", [m.tvu_breach_rate_shoal for m in metrics]),
+            fmt_row("TVU breach (deep)", [m.tvu_breach_rate_deep for m in metrics]),
+        ])
     return "\n".join(lines)

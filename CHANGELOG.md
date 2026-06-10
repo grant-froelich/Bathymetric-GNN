@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-06-09 - bf16 Mixed Precision, Graph-Cache Removal, TVU-Budget Safety Metric
+
+### Performance: bf16 Mixed-Precision Training
+Added opt-in bf16 autocast, selectable with `--amp`. Autocast wraps the forward pass and loss in both the train and validation steps; backward runs outside it. bf16 (not fp16) is used so no GradScaler is needed (it shares fp32's exponent range); master weights stay fp32.
+- ~5x speedup on the multi-location run: 5.51 -> 1.07 s/it, ~36 hours -> ~5.5 hours
+- Default path unchanged: with `--amp` absent the run is full fp32, identical to before
+- DataLoader `persistent_workers=True` and `prefetch_factor=4` when `num_workers > 0` (Windows respawns workers every epoch otherwise)
+
+### Removed: Disk Graph Cache
+The `--graph-cache-dir` path and the on-disk graph store were removed. Profiling (`nvidia-smi dmon -s u`) showed the GPU SM pegged near 100% during training, so graph construction was never the bottleneck: the DataLoader workers already hid it behind GPU compute. The cache built correctly (1286 graphs, ~16.7 GB) but produced no speedup, because the actual wall is GAT compute over the large per-tile graphs (~46K nodes / ~366K edges each), which is what bf16 addresses.
+
+### New Safety Metric: TVU-Budget Breach Rate
+Added to `metrics.py` and `scripts/evaluate_v10.py`. Counts a cell as a breach only when its dangerous-direction error (corrected deeper than truth) exceeds the allowable TVU = sqrt(a^2 + (b*depth)^2) at that cell's depth. Reported as `tvu_breach_rate`, `tvu_breach_rate_shoal`, `tvu_breach_rate_deep`, alongside the existing raw hazard rates (not replacing them).
+- Selectable via `--iho-order`: IHO S-44 (exclusive/special/1a/1b/2) or NOAA HSSD OCS Quality Metric (exceptional/critical/general1/general2/general3/general4), or explicit `--tvu-a`/`--tvu-b`
+- HSSD coefficients from HSSD 2026 Table 5.8.1; NOAA rounds the S-44 depth term (General 1 b=0.01, General 2/3 b=0.02)
+
+### bf16 vs fp32 Validation (budget-aware)
+Per-location, HSSD General 1 (shallow) and General 2 (deep, Alaska). Both breach fields are dangerous-direction rates, partitioned by the true correction's direction:
+
+| Survey | subset | raw hazard (fp32 -> bf16) | TVU breach (fp32 -> bf16) |
+|--------|--------|---------------------------|---------------------------|
+| Shallow E00269 | shoal-target | 0.00% -> 0.00% | 0.00% -> 0.00% |
+| Shallow E00269 | deep-target | 5.07% -> 31.10% | 0.07% -> 0.62% |
+| Deep E00269 | shoal-target | 7.82% -> 11.03% | 0.00% -> 0.01% |
+| Deep E00269 | deep-target | 28.96% -> 44.53% | 0.03% -> 0.12% |
+| Alaska H14116 | shoal-target | 5.08% -> 15.27% | 0.00% -> 0.00% |
+| Alaska H14116 | deep-target | 17.38% -> 48.82% | 0.05% -> 0.04% |
+
+MAE improved with bf16 at all three locations (shallow 2.41 -> 0.89, deep 27.37 -> 22.13, Alaska 19.00 -> 17.28 m). Alaska recovery RMSE was the lone worse aggregate (71.68 -> 89.01 m), driven by a few large errors that largely stay within the deep-water budget (its breach rate did not rise).
+
+### Interpretation
+The raw `hazardous_error_rate` over-reported by one to two orders of magnitude because most dangerous-direction flips are smaller than the allowed TVU at depth. The shoal-critical subset (shoal-target dangerous breach) stayed at ~0% for both precisions; bf16's only measurable safety cost is a sub-0.7% rise in deep-target dangerous breaches. bf16 is defensible for the deliverable on this evidence. See LESSONS_LEARNED Lesson 19.
+
+### Caveats
+- One paired bf16/fp32 run; the two checkpoints selected different best epochs off a noisy validation signal, so single-run variance is not fully excluded. Two or three paired runs are needed to confirm the shoal-target breach stays at zero before bf16 is made permanent on the deliverable path.
+- The General 1 / General 2 assignments are regime-based assumptions; the applicable OCS Quality Metric per survey is set in the Project Instructions.
+
+---
+
 ## 2026-06-08 - First Cross-Geography Generalization Result (Multi-Location V10)
 
 ### Training Run

@@ -1,6 +1,6 @@
 # Bathymetric GNN -- Training Performance Tracker
 
-**V1-V10 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-08**
+**V1-V10 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-09**
 
 ---
 
@@ -255,12 +255,46 @@ Per-location evaluation (each validation file evaluated separately):
 
 Caveats: small validation sets (H14116 is 18 tiles), no single-variable-difference baseline yet, normalized MAE carries a depth bias, and hazardous-error magnitude (not just rate) is not yet quantified.
 
+### bf16 Mixed Precision and TVU-Budget Safety (2026-06-09)
+
+Opt-in bf16 autocast (`--amp`) on the multi-location run. Training speed:
+
+| | fp32 | bf16 |
+|---|---|---|
+| per-iteration | 5.51 s/it | 1.07 s/it |
+| full run | ~36 h | ~5.5 h (early stop epoch 25) |
+| best val loss | 1.51 (epoch 12) | 1.15 (epoch 11) |
+
+(A disk graph cache was tried first and removed: profiling showed the GPU SM pegged near 100%, so graph construction was never the bottleneck and the cache gave no speedup. GAT compute is the wall, which bf16 addresses.)
+
+Per-location accuracy (fp32 -> bf16):
+
+| Survey | MAE (m) | Recovery RMSE (m) | cells |
+|--------|---------|-------------------|-------|
+| Shallow E00269 | 2.41 -> 0.89 | 4.12 -> 1.62 | 444,673 |
+| Deep E00269 | 27.37 -> 22.13 | 47.83 -> 43.11 | 1,383,352 |
+| Alaska H14116 | 19.00 -> 17.28 | 71.68 -> 89.01 | 248,887 |
+
+Safety, raw sign-count hazard vs TVU-budget breach (fp32 -> bf16), HSSD General 1 shallow / General 2 deep and Alaska. Both breach fields are dangerous-direction (corrected deeper than truth) rates, partitioned by the true correction's direction:
+
+| Survey | subset | raw hazard | TVU breach | breach cells (fp32 -> bf16) |
+|--------|--------|-----------|-----------|------------------------------|
+| Shallow | shoal-target | 0.00% -> 0.00% | 0.00% -> 0.00% | 0 -> 0 |
+| Shallow | deep-target | 5.07% -> 31.10% | 0.07% -> 0.62% | 146 -> 1,398 |
+| Deep | shoal-target | 7.82% -> 11.03% | 0.00% -> 0.01% | 12 -> 70 |
+| Deep | deep-target | 28.96% -> 44.53% | 0.03% -> 0.12% | 192 -> 795 |
+| Alaska | shoal-target | 5.08% -> 15.27% | 0.00% -> 0.00% | 0 -> 4 |
+| Alaska | deep-target | 17.38% -> 48.82% | 0.05% -> 0.04% | 64 -> 46 |
+
+Read: the raw hazard rate over-reports by one to two orders of magnitude because most dangerous-direction flips are smaller than the allowed TVU at depth. The shoal-critical subset stays at ~0% for both precisions; bf16's only measurable safety cost is a sub-0.7% rise in deep-target dangerous breaches. bf16 is defensible for the deliverable pending paired-run confirmation. See LESSONS_LEARNED Lesson 19.
+
 ### Next Steps
 
 1. Acquire more surveys with large-magnitude deep-water noise to address the localized failure on big corrections
 2. Add hazardous-error magnitude (not just rate) to the metrics, and check whether hazardous cells coincide with the large-correction cluster
 3. Run a clean single-variable comparison (e.g. same data with/without a given survey or feature) to make defensible causal claims
 4. Watch training time as data grows (~36 hours this run); consider whether the 128m/256m E00269 files justify their cost given they are the least-improving regime
+5. Run 2-3 paired bf16/fp32 runs to confirm the shoal-target TVU breach stays at zero before making bf16 permanent on the deliverable path; confirm the per-survey OCS Quality Metric against Project Instructions
 
 ---
 

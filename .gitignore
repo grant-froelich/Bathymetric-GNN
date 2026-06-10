@@ -1,6 +1,11 @@
 # Generated training data
 ground-truth/
 outputs/
+ground-truth-train/
+ground-truth-val/
+ground-truth-val-deep/
+ground-truth-val-shallow/
+outputs-resfeature/
 
 # Python
 __pycache__/

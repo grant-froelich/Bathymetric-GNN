@@ -75,6 +75,9 @@ def evaluate(
     tile_size: int = 256,
     overlap: int = 32,
     model_version: str = 'V10',
+    iho_order: str = None,
+    tvu_a: float = None,
+    tvu_b: float = None,
 ) -> V10Metrics:
     """Evaluate a V10 model on regression-mode ground truth files."""
     
@@ -172,6 +175,9 @@ def evaluate(
         clean_depth=clean,
         survey_name=survey_name,
         model_version=model_version,
+        iho_order=iho_order,
+        tvu_a=tvu_a,
+        tvu_b=tvu_b,
     )
     
     return metrics
@@ -186,6 +192,15 @@ def main():
     parser.add_argument('--tile-size', type=int, default=256)
     parser.add_argument('--overlap', type=int, default=32)
     parser.add_argument('--model-version', default='V10', help='Label for the model version')
+    parser.add_argument('--iho-order', default=None,
+                        help='Order label for the TVU breach metric. IHO S-44: '
+                             'exclusive, special, 1a, 1b, 2. NOAA HSSD OCS Quality '
+                             'Metric: exceptional, critical, general1, general2, '
+                             'general3, general4. Omit to skip the TVU metric.')
+    parser.add_argument('--tvu-a', type=float, default=None,
+                        help='Explicit TVU constant term a in meters (overrides --iho-order)')
+    parser.add_argument('--tvu-b', type=float, default=None,
+                        help='Explicit TVU depth-scaled term b (overrides --iho-order)')
     parser.add_argument('--output', type=Path, default=None, help='Optional path to save metrics JSON')
     
     args = parser.parse_args()
@@ -201,6 +216,9 @@ def main():
         tile_size=args.tile_size,
         overlap=args.overlap,
         model_version=args.model_version,
+        iho_order=args.iho_order,
+        tvu_a=args.tvu_a,
+        tvu_b=args.tvu_b,
     )
     
     print()
