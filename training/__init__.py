@@ -8,7 +8,6 @@ from .losses import (
     compute_correction_delta,
 )
 from .trainer import (
-    BathymetricGraphDataset,
     GroundTruthDataset,
     Trainer,
 )
@@ -23,7 +22,6 @@ __all__ = [
     "compute_class_weights",
     "compute_correction_delta",
     # Training
-    "BathymetricGraphDataset",
     "GroundTruthDataset",
     "Trainer",
 ]

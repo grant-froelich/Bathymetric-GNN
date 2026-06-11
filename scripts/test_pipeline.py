@@ -462,7 +462,7 @@ def main():
     print("✓ All pipeline components working!")
     print(f"\nYour survey yields ~{len(list(range(0, grid.shape[0], 896))) * len(list(range(0, grid.shape[1], 896)))} tiles")
     print("\nYou're ready to run training:")
-    print(f"  python scripts/train.py --clean-surveys /path/to/surveys --output-dir ./outputs")
+    print(f"  python scripts/train.py --ground-truth-dir ground-truth-train/ --output-dir ./outputs")
 
 
 if __name__ == "__main__":
