@@ -308,6 +308,10 @@ class BathymetricGNN(nn.Module):
         
         self.predict_correction = predict_correction
         self.num_classes = num_classes
+        # Stored so checkpoints can record the true dimensions instead of
+        # hardcoded defaults (see Trainer._save_checkpoint).
+        self.in_channels = in_channels
+        self.edge_dim = edge_dim
         
         # Local feature extractor
         self.feature_extractor = LocalFeatureExtractor(

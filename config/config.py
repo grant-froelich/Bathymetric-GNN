@@ -60,8 +60,7 @@ class TrainingConfig:
     epochs: int = 100
     
     # Learning rate schedule
-    scheduler: str = "cosine"                # "cosine", "step", "plateau"
-    warmup_epochs: int = 5
+    scheduler: str = "cosine"                # "cosine", "plateau", or "none"
     
     # Early stopping
     patience: int = 15

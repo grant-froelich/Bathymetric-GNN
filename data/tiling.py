@@ -291,6 +291,15 @@ class TileManager:
             # Divide by weights to get average
             valid = weight_grid > 0
             output[valid] /= weight_grid[valid]
+            
+            # Cells that were touched by a tile but only with zero blend weight
+            # (the survey's outermost ring, where the edge ramp reaches exactly
+            # zero) were initialized to 0.0 during accumulation but never
+            # received any weighted contribution. Leaving them at 0.0 would
+            # output a spurious 0-depth cell (an artificial shoal). Reset them
+            # to NaN like any other cell with no data.
+            if np.issubdtype(output.dtype, np.floating):
+                output[~valid] = np.nan
         
         return output
     
