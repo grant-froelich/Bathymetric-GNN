@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BathymetricGrid:
     """Container for bathymetric grid data with metadata."""
-    depth: np.ndarray                        # 2D depth array (positive down or negative down)
+    depth: np.ndarray                        # 2D depth array, POSITIVE DOWN after loading (see depth_convention)
     uncertainty: Optional[np.ndarray]        # 2D uncertainty array (if available)
     nodata_value: float                      # NoData value
     transform: Tuple[float, ...]             # Geotransform (origin_x, pixel_width, 0, origin_y, 0, pixel_height)
@@ -49,6 +49,8 @@ class BathymetricGrid:
     resolution: Tuple[float, float]          # (x_resolution, y_resolution) in CRS units
     bounds: Tuple[float, float, float, float]  # (min_x, min_y, max_x, max_y)
     source_path: Optional[Path]              # Original file path
+    depth_convention: str = "positive_down"  # In-memory convention after loading (always positive_down)
+    source_was_negative_down: bool = False   # True if the source stored elevation (negative down) and was negated on load
     
     @property
     def shape(self) -> Tuple[int, int]:
@@ -90,7 +92,7 @@ class BathymetricLoader:
     
     SUPPORTED_FORMATS = {'.bag', '.tif', '.tiff', '.asc', '.xyz'}
     
-    def __init__(self, vr_bag_mode: str = 'refinements'):
+    def __init__(self, vr_bag_mode: str = 'refinements', depth_convention: str = 'auto'):
         """
         Initialize the loader.
         
@@ -99,6 +101,21 @@ class BathymetricLoader:
                 - 'refinements': Read refinement grids directly (default)
                 - 'resampled': Resample to uniform grid using GDAL
                 - 'base': Read only the base/coarse grid (not recommended)
+            depth_convention: How the SOURCE file stores depth:
+                - 'auto' (default): detect from the data. If the median of valid
+                  cells is negative, the source is treated as elevation
+                  (negative down) and negated on load.
+                - 'negative_down': source stores elevation; always negate.
+                - 'positive_down': source stores depth; never negate.
+                
+                Regardless of the source, the returned BathymetricGrid is ALWAYS
+                positive-down. Every downstream component (losses, metrics,
+                shoal/deep semantics) assumes positive-down depth, so this
+                normalization is the single point where the convention is
+                enforced. GDAL reads BAG elevation as negative-down, which is
+                why auto-detection exists. (See CHANGELOG 2026-06-09: the
+                pre-fix pipeline fed negative-down data to positive-down
+                semantics, inverting every direction-sensitive component.)
         """
         if not GDAL_AVAILABLE:
             raise ImportError(
@@ -106,11 +123,58 @@ class BathymetricLoader:
                 "Install via: conda install -c conda-forge gdal"
             )
         
+        if depth_convention not in ('auto', 'positive_down', 'negative_down'):
+            raise ValueError(
+                f"Unknown depth_convention '{depth_convention}'; "
+                f"use 'auto', 'positive_down', or 'negative_down'"
+            )
+        
         self.vr_bag_mode = vr_bag_mode
+        self.depth_convention = depth_convention
         
         # Configure GDAL
         gdal.UseExceptions()
         gdal.SetConfigOption('GDAL_PAM_ENABLED', 'NO')  # Disable .aux.xml files
+    
+    def _normalize_convention(self, grid: BathymetricGrid) -> BathymetricGrid:
+        """Force the in-memory grid to positive-down depth.
+        
+        Negates only valid cells, leaving nodata sentinels untouched, so the
+        nodata value and valid-mask logic remain correct. Uncertainty is a
+        magnitude and is never negated.
+        """
+        valid = grid.valid_mask
+        n_valid = int(np.sum(valid))
+        if n_valid == 0:
+            return grid
+        
+        median_depth = float(np.median(grid.depth[valid]))
+        
+        if self.depth_convention == 'positive_down':
+            negate = False
+        elif self.depth_convention == 'negative_down':
+            negate = True
+        else:  # auto
+            negate = median_depth < 0
+        
+        if negate:
+            grid.depth[valid] = -grid.depth[valid]
+            grid.source_was_negative_down = True
+            logger.info(
+                f"Depth convention: source stores elevation (negative down, "
+                f"median {median_depth:.1f}); negated to positive-down depth on load."
+            )
+        else:
+            if median_depth < 0:
+                logger.warning(
+                    f"Depth convention forced to positive_down but median valid "
+                    f"value is {median_depth:.1f} (negative). If this source "
+                    f"stores elevation, downstream direction semantics will be "
+                    f"inverted. Check the file or use depth_convention='auto'."
+                )
+        
+        grid.depth_convention = "positive_down"
+        return grid
     
     def load(
         self, 
@@ -135,15 +199,20 @@ class BathymetricLoader:
         suffix = path.suffix.lower()
         
         if suffix == '.bag':
-            return self._load_bag(path, vr_target_resolution)
+            grid = self._load_bag(path, vr_target_resolution)
         elif suffix in {'.tif', '.tiff'}:
-            return self._load_geotiff(path)
+            grid = self._load_geotiff(path)
         elif suffix == '.asc':
-            return self._load_ascii(path)
+            grid = self._load_ascii(path)
         elif suffix == '.xyz':
-            return self._load_xyz(path)
+            grid = self._load_xyz(path)
         else:
             raise ValueError(f"Unsupported format: {suffix}")
+        
+        # Enforce positive-down depth in memory, whatever the source stored.
+        # This is the single point where the convention is normalized; all
+        # downstream code may assume positive-down.
+        return self._normalize_convention(grid)
     
     def _load_bag(
         self, 
@@ -537,6 +606,7 @@ class BathymetricWriter:
             ds.SetGeoTransform(grid.transform)
             if grid.crs:
                 ds.SetProjection(grid.crs)
+            ds.SetMetadataItem('DEPTH_CONVENTION', grid.depth_convention.upper())
             
             # Write depth band
             band_idx = 1
@@ -589,6 +659,18 @@ class BathymetricWriter:
         """
         if not H5PY_AVAILABLE:
             raise ImportError("h5py is required for BAG output")
+        
+        # LEGACY (V9 classification path): this writer modifies BAG elevation
+        # in place using classification/confidence/correction arrays produced
+        # by the V9 inference scripts. It predates the 2026-06-09 depth
+        # convention fix: BAG HDF5 stores elevation (negative down) while
+        # in-memory grids are now positive-down. Checkpoints trained before the
+        # fix are also incompatible with the new loader. Do not extend this
+        # path; the V11 regression inference writer should replace it.
+        logger.warning(
+            "BAG in-place modification is a legacy V9 path that predates the "
+            "depth-convention fix. Verify sign handling before trusting outputs."
+        )
         
         import h5py
         import shutil

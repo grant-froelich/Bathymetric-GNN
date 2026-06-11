@@ -130,7 +130,17 @@ def parse_args():
     return parser.parse_args()
 
 
+PRE_FIX_CHECKPOINT_WARNING = (
+    "WARNING: This is the legacy V9 classification inference path. Checkpoints "
+    "trained before the 2026-06-09 depth-convention fix were trained on "
+    "negative-down (elevation) data; the loader now normalizes all input to "
+    "positive-down depth, so feeding such checkpoints through this path "
+    "produces invalid results. Retrain (V11) before using inference."
+)
+
+
 def main():
+    logging.getLogger(__name__).warning(PRE_FIX_CHECKPOINT_WARNING)
     args = parse_args()
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)

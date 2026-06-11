@@ -32,18 +32,13 @@ except ImportError:
 
 try:
     from osgeo import gdal
+    gdal.UseExceptions()  # Opt in explicitly; silences the GDAL 4.0 FutureWarning
     GDAL_AVAILABLE = True
 except ImportError:
     GDAL_AVAILABLE = False
 
 from config import Config
-from data import (
-    BathymetricLoader,
-    TileManager,
-    GraphBuilder,
-    SyntheticNoiseGenerator,
-    NoiseAugmentor,
-)
+from data import GraphBuilder
 from models.gnn import BathymetricGNN
 from .losses import BathymetricGNNLoss, compute_class_weights, compute_correction_delta
 
@@ -161,6 +156,23 @@ class GroundTruthDataset(Dataset):
             # for consistency in the data structure). -1 for invalid cells.
             labels_full = np.where(valid_full, 0, -1).astype(np.int32)
         
+        # Depth convention guard. All losses and metrics assume positive-down
+        # depth. Ground truth produced before the 2026-06-09 convention fix
+        # stored GDAL elevation (negative down), which silently inverted every
+        # direction-sensitive semantic (the 3x shoal-safety weighting, the
+        # hazard metrics, the shoal/deep split). Refuse such files outright so
+        # a stale pre-fix tif can never enter a training or evaluation run.
+        if np.any(valid_full):
+            median_noisy = float(np.median(noisy_depth[valid_full]))
+            if median_noisy < 0:
+                raise ValueError(
+                    f"{path.name}: median valid depth is {median_noisy:.1f} "
+                    f"(negative). This ground truth file stores elevation "
+                    f"(negative-down) and predates the depth-convention fix. "
+                    f"Regenerate it with the current prepare_ground_truth.py "
+                    f"before training or evaluating."
+                )
+        
         logger.info(f"  Loaded {path.name} in {mode} mode")
         
         height, width = band1_data.shape
@@ -188,21 +200,27 @@ class GroundTruthDataset(Dataset):
                     'source': path.stem,
                 })
         
-        # Extract tiles
-        for row_start in range(0, height - self.tile_size + 1, stride):
-            for col_start in range(0, width - self.tile_size + 1, stride):
-                _maybe_add_tile(
-                    row_start, row_start + self.tile_size,
-                    col_start, col_start + self.tile_size,
-                )
+        # Tile start positions covering the FULL grid in each dimension.
+        # The regular stride positions cover the interior; if they end short of
+        # the edge, one final tile is anchored to the edge (start = dim -
+        # tile_size) so the right and bottom strips are always covered. The
+        # previous implementation only added a single bottom-right corner tile,
+        # leaving up to stride-1 pixels of every right and bottom edge in no
+        # tile at all (4-15% of cells at typical settings) and therefore
+        # excluded from both training and evaluation.
+        def _tile_starts(dim: int) -> List[int]:
+            if dim <= self.tile_size:
+                return [0]
+            starts = list(range(0, dim - self.tile_size + 1, stride))
+            if starts[-1] + self.tile_size < dim:
+                starts.append(dim - self.tile_size)
+            return starts
         
-        # Handle edge tile (bottom-right corner)
-        if (height % stride != 0 or width % stride != 0) and \
-           height > self.tile_size and width > self.tile_size:
-            _maybe_add_tile(
-                height - self.tile_size, height,
-                width - self.tile_size, width,
-            )
+        for row_start in _tile_starts(height):
+            row_end = min(row_start + self.tile_size, height)
+            for col_start in _tile_starts(width):
+                col_end = min(col_start + self.tile_size, width)
+                _maybe_add_tile(row_start, row_end, col_start, col_end)
     
     def __len__(self) -> int:
         return len(self.tiles)
@@ -271,136 +289,6 @@ class GroundTruthDataset(Dataset):
         return graph
 
 
-class BathymetricGraphDataset(Dataset):
-    """
-    Dataset that generates training samples from clean bathymetric data.
-    
-    For each sample:
-    1. Load a tile from a clean survey
-    2. Add synthetic noise
-    3. Build graph representation
-    4. Return (graph, labels)
-    """
-    
-    def __init__(
-        self,
-        survey_paths: List[Path],
-        tile_manager: TileManager,
-        graph_builder: GraphBuilder,
-        noise_generator: SyntheticNoiseGenerator,
-        augment: bool = True,
-        cache_tiles: bool = True,
-        vr_bag_mode: str = 'resampled',
-    ):
-        """
-        Initialize dataset.
-        
-        Args:
-            survey_paths: Paths to clean survey files
-            tile_manager: TileManager for extracting tiles
-            graph_builder: GraphBuilder for creating graphs
-            noise_generator: SyntheticNoiseGenerator for adding noise
-            augment: Whether to apply augmentation
-            cache_tiles: Whether to cache extracted tiles
-            vr_bag_mode: How to handle VR BAGs ('refinements', 'resampled', 'base')
-        """
-        self.survey_paths = survey_paths
-        self.tile_manager = tile_manager
-        self.graph_builder = graph_builder
-        self.noise_augmentor = NoiseAugmentor(noise_generator) if augment else None
-        self.noise_generator = noise_generator
-        
-        self.loader = BathymetricLoader(vr_bag_mode=vr_bag_mode)
-        
-        # Extract all tiles from all surveys
-        self.tiles = []
-        self.tile_metadata = []  # (survey_idx, tile_row, tile_col)
-        
-        logger.info(f"Loading {len(survey_paths)} surveys...")
-        
-        for survey_idx, survey_path in enumerate(survey_paths):
-            try:
-                grid = self.loader.load(survey_path)
-                
-                for tile in self.tile_manager.iterate_tiles(grid, skip_empty=True):
-                    if cache_tiles:
-                        self.tiles.append({
-                            'data': tile.data.copy(),
-                            'valid_mask': tile.valid_mask.copy(),
-                            'uncertainty': tile.uncertainty.copy() if tile.uncertainty is not None else None,
-                            'resolution': grid.resolution,
-                        })
-                    self.tile_metadata.append((survey_idx, tile.tile_row, tile.tile_col))
-                    
-            except Exception as e:
-                logger.warning(f"Failed to load survey {survey_path}: {e}")
-        
-        self.cache_tiles = cache_tiles
-        self.grids = {}  # Cache loaded grids if not caching tiles
-        
-        logger.info(f"Dataset contains {len(self.tiles)} tiles from {len(survey_paths)} surveys")
-    
-    def __len__(self) -> int:
-        return len(self.tile_metadata)
-    
-    def __getitem__(self, idx: int) -> Data:
-        """Get a single training sample."""
-        if self.cache_tiles:
-            tile_data = self.tiles[idx]
-            clean_depth = tile_data['data']
-            valid_mask = tile_data['valid_mask']
-            uncertainty = tile_data['uncertainty']
-            resolution = tile_data['resolution']
-        else:
-            # Load on demand (slower but less memory)
-            survey_idx, tile_row, tile_col = self.tile_metadata[idx]
-            # Implementation would load specific tile...
-            raise NotImplementedError("On-demand loading not yet implemented")
-        
-        # Add synthetic noise
-        if self.noise_augmentor is not None:
-            noise_result = self.noise_augmentor(clean_depth, valid_mask)
-        else:
-            noise_result = self.noise_generator.generate(clean_depth, valid_mask)
-        
-        # Build graph from noisy data
-        graph = self.graph_builder.build_graph(
-            depth=noise_result.noisy_depth,
-            valid_mask=valid_mask,
-            uncertainty=uncertainty,
-            resolution=resolution,
-        )
-        
-        # Add labels to graph
-        if graph.num_nodes > 0:
-            # Get labels for valid nodes
-            rows = graph.valid_rows.numpy()
-            cols = graph.valid_cols.numpy()
-            
-            # Classification labels (0=seafloor, 1=feature, 2=noise)
-            # For synthetic data, we only have noise vs non-noise
-            # Map to: 0=clean, 2=noise (no explicit features in synthetic data)
-            class_labels = noise_result.classification[rows, cols]
-            class_labels = np.where(class_labels == 1, 2, 0)  # Map 1->2 (noise class)
-            graph.y = torch.tensor(class_labels, dtype=torch.long)
-            
-            # Correction targets (how much the depth was changed)
-            corrections = noise_result.noisy_depth[rows, cols] - clean_depth[rows, cols]
-            graph.correction_target = torch.tensor(corrections, dtype=torch.float32)
-            
-            # Noise mask for loss computation
-            graph.noise_mask = torch.tensor(
-                noise_result.noise_mask[rows, cols],
-                dtype=torch.bool
-            )
-        else:
-            graph.y = torch.tensor([], dtype=torch.long)
-            graph.correction_target = torch.tensor([], dtype=torch.float32)
-            graph.noise_mask = torch.tensor([], dtype=torch.bool)
-        
-        return graph
-
-
 class Trainer:
     """
     Training manager for bathymetric GNN.
@@ -410,8 +298,8 @@ class Trainer:
         self,
         config: Config,
         model: BathymetricGNN,
-        train_dataset: BathymetricGraphDataset,
-        val_dataset: Optional[BathymetricGraphDataset] = None,
+        train_dataset: GroundTruthDataset,
+        val_dataset: Optional[GroundTruthDataset] = None,
         output_dir: Optional[Path] = None,
         use_amp: bool = False,
     ):
@@ -625,8 +513,9 @@ class Trainer:
         history = {
             'train_loss': [],
             'val_loss': [],
-            'train_acc': [],
-            'val_acc': [],
+            'train_metric': [],
+            'val_metric': [],
+            'metric_name': None,  # 'accuracy' (classification) or 'mae' (regression)
         }
         
         for epoch in range(self.config.training.epochs):
@@ -638,14 +527,15 @@ class Trainer:
             # Metric key differs by mode: 'accuracy' (classification) or 'mae' (regression)
             train_metric_key = 'accuracy' if 'accuracy' in train_metrics else 'mae'
             train_metric_label = 'Acc' if train_metric_key == 'accuracy' else 'MAE'
-            history['train_acc'].append(train_metrics.get(train_metric_key, 0.0))
+            history['metric_name'] = train_metric_key
+            history['train_metric'].append(train_metrics.get(train_metric_key, 0.0))
             
             # Validation epoch
             if self.val_loader is not None:
                 val_metrics = self._validate_epoch()
                 history['val_loss'].append(val_metrics['loss'])
                 val_metric_key = 'accuracy' if 'accuracy' in val_metrics else 'mae'
-                history['val_acc'].append(val_metrics.get(val_metric_key, 0.0))
+                history['val_metric'].append(val_metrics.get(val_metric_key, 0.0))
                 
                 # Learning rate scheduling
                 if self.scheduler is not None:
@@ -662,7 +552,7 @@ class Trainer:
                 else:
                     self.patience_counter += 1
                     if self.patience_counter >= self.config.training.patience:
-                        logger.info(f"Early stopping at epoch {epoch}")
+                        logger.info(f"Early stopping at epoch {epoch + 1}")
                         break
                 
                 logger.info(
@@ -732,6 +622,11 @@ class Trainer:
                 # Detect mode (PyG batches string attrs as lists, one per graph)
                 batch_mode = getattr(batch, 'mode', 'classification')
                 if isinstance(batch_mode, list):
+                    if batch_mode and any(m != batch_mode[0] for m in batch_mode):
+                        raise ValueError(
+                            f"Mixed-mode batch: {set(batch_mode)}. Classification and "
+                            f"regression ground truth files must not share a dataset."
+                        )
                     batch_mode = batch_mode[0] if batch_mode else 'classification'
                 
                 # Build targets dict
@@ -805,6 +700,11 @@ class Trainer:
                     
                     batch_mode = getattr(batch, 'mode', 'classification')
                     if isinstance(batch_mode, list):
+                        if batch_mode and any(m != batch_mode[0] for m in batch_mode):
+                            raise ValueError(
+                                f"Mixed-mode batch: {set(batch_mode)}. Classification and "
+                                f"regression ground truth files must not share a dataset."
+                            )
                         batch_mode = batch_mode[0] if batch_mode else 'classification'
                     
                     targets = {
@@ -847,8 +747,9 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': self.config,
-            'in_channels': self.model.feature_extractor.mlp[0].in_features,
-            'edge_dim': 3,  # Default
+            'in_channels': getattr(self.model, 'in_channels',
+                                    self.model.feature_extractor.mlp[0].in_features),
+            'edge_dim': getattr(self.model, 'edge_dim', 3)
         }
         
         if self.scheduler is not None:

@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 import numpy as np
 from osgeo import gdal
+gdal.UseExceptions()
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -463,6 +464,8 @@ def compute_ground_truth(
     ds.SetGeoTransform(transform)
     if crs:
         ds.SetProjection(crs)
+    # Depths in bands 2/3/4 are positive-down (enforced by BathymetricLoader).
+    ds.SetMetadataItem('DEPTH_CONVENTION', 'POSITIVE_DOWN')
     
     # Band 1: Labels (classification) or valid mask (regression)
     band = ds.GetRasterBand(1)
@@ -513,6 +516,7 @@ def compute_ground_truth(
         'clean_survey': str(clean_path),
         'noisy_survey': str(noisy_path),
         'mode': 'regression' if regression_mode else 'classification',
+        'depth_convention': 'positive_down',
         'offset_removed': remove_offset,
         'systematic_offset': float(systematic_offset),
         'grid_shape': list(clean_depth.shape),
