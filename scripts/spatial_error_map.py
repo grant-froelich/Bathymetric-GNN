@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 from osgeo import gdal
+gdal.UseExceptions()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -109,6 +110,13 @@ def main():
     valid_full = ds.GetRasterBand(1).ReadAsArray().astype(np.int32) == 1
     difference = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
     noisy_depth = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
+    _valid_probe = np.isfinite(noisy_depth) & (np.abs(noisy_depth) < 1.0e5)
+    if np.any(_valid_probe) and float(np.median(noisy_depth[_valid_probe])) < 0:
+        raise ValueError(
+            "Median valid depth is negative: this ground truth file stores "
+            "elevation (negative-down) and predates the depth-convention fix. "
+            "Regenerate it with the current prepare_ground_truth.py."
+        )
     uncertainty = None
     if ds.RasterCount >= 5:
         uncertainty = ds.GetRasterBand(5).ReadAsArray().astype(np.float32)
@@ -157,8 +165,16 @@ def main():
 
     # Tile the grid the same way GroundTruthDataset does
     n_tiles = 0
-    for row_start in range(0, H - tile_size + 1, stride):
-        for col_start in range(0, W - tile_size + 1, stride):
+    def _tile_starts(dim):
+        if dim <= tile_size:
+            return [0]
+        starts = list(range(0, dim - tile_size + 1, stride))
+        if starts[-1] + tile_size < dim:
+            starts.append(dim - tile_size)
+        return starts
+
+    for row_start in _tile_starts(H):
+        for col_start in _tile_starts(W):
             process_tile(row_start, row_start + tile_size, col_start, col_start + tile_size)
             n_tiles += 1
     # Edge tile (bottom-right)
