@@ -79,6 +79,15 @@ python scripts/train.py \
 #   "Training mode: classification" or "Training mode: regression"
 # In regression mode, progress bar shows MAE instead of accuracy.
 # If CUDA out of memory, use --batch-size 2 or smaller --tile-size
+# Add --amp for bf16 mixed precision (~5x faster on RTX cards; pair with an
+# fp32 run for safety comparisons)
+```
+
+### 3b. Verify graph construction (required once before retraining)
+
+```bash
+python scripts/verify_graph_equivalence.py --ground-truth-dir "path/to/ground_truth"
+# Must print PASS before starting a training run after graph-construction changes.
 ```
 
 ### 4. Run Inference
@@ -292,3 +301,26 @@ Before adding a survey pair to training data:
 ---
 
 *Quick Reference v3.1 | June 2026*
+
+
+## TVU breach evaluation (evaluate_v10.py)
+
+```bash
+python scripts/evaluate_v10.py \
+    --checkpoint outputs/best_model.pt \
+    --ground-truth-dir ground-truth-val/ \
+    --iho-order general2 \
+    --output eval/results.json
+```
+
+`--iho-order` accepts IHO S-44 labels (exclusive, special, 1a, 1b, 2) or NOAA
+HSSD OCS Quality Metric labels (exceptional, critical, general1, general2,
+general3, general4). Explicit `--tvu-a` / `--tvu-b` override the label. The
+applicable metric per survey comes from its Project Instructions.
+
+### Issue: "median valid depth is negative ... predates the depth-convention fix"
+
+The ground-truth file stores elevation (negative-down) and was generated before
+2026-06-09. Regenerate it with the current `prepare_ground_truth.py` (the
+loader now enforces positive-down depth). Pre-fix checkpoints likewise embody
+the inverted objective and need retraining (V11).

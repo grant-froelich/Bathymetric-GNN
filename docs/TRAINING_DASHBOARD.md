@@ -1,6 +1,17 @@
 # Bathymetric GNN -- Training Performance Tracker
 
-**V1-V10 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-09**
+**V1-V11 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-09**
+
+> **DATA CORRECTION NOTICE (2026-06-09):** a full repo scrub found the sign
+> convention inverted through every direction-sensitive component (see
+> LESSONS_LEARNED Lesson 20 and the CHANGELOG). For ALL results on this
+> dashboard up to and including V10: magnitude metrics (loss, MAE, RMSE,
+> recovery RMSE) are valid; every direction-sensitive number is inverted
+> ("hazardous" rates counted the safe direction, "shoal-target" rows are
+> deep-spike cells and vice versa), and the 3x safety weighting trained models
+> TOWARD the dangerous direction. Additionally, tiling excluded the right and
+> bottom edge strips (4-15% of cells) from all training and evaluation. V11 is
+> the first version trained after both fixes.
 
 ---
 
@@ -288,13 +299,36 @@ Safety, raw sign-count hazard vs TVU-budget breach (fp32 -> bf16), HSSD General 
 
 Read: the raw hazard rate over-reports by one to two orders of magnitude because most dangerous-direction flips are smaller than the allowed TVU at depth. The shoal-critical subset stays at ~0% for both precisions; bf16's only measurable safety cost is a sub-0.7% rise in deep-target dangerous breaches. bf16 is defensible for the deliverable pending paired-run confirmation. See LESSONS_LEARNED Lesson 19.
 
+### V11 (pending): first run with corrected direction semantics
+
+Prerequisites, in order:
+1. Regenerate all 9 ground-truth tifs with the fixed `prepare_ground_truth.py`
+   (positive-down enforced; use `--regression-mode --no-offset`). The dataset
+   now refuses pre-fix (negative-down) files.
+2. `python scripts/verify_graph_equivalence.py --ground-truth-dir ground-truth-train/`
+   must PASS (validates the vectorized graph construction against the legacy
+   implementation on real data).
+3. Paired fp32 / bf16 (`--amp`) training runs.
+
+What changes vs V10: the 3x asymmetric penalty points at the actual dangerous
+direction for the first time; tile coverage now includes the edge strips
+(more tiles, slightly different dataset size); expect recovery_mean_error to
+flip from consistently negative (dangerous bias) toward positive
+(conservative bias) if the loss works as designed - that flip is the single
+clearest success indicator for the fix.
+
+All safety evaluation (hazard rates, TVU breach, bf16 verdict) restarts from
+zero on V11; no pre-fix direction-sensitive number carries forward.
+
 ### Next Steps
 
-1. Acquire more surveys with large-magnitude deep-water noise to address the localized failure on big corrections
-2. Add hazardous-error magnitude (not just rate) to the metrics, and check whether hazardous cells coincide with the large-correction cluster
-3. Run a clean single-variable comparison (e.g. same data with/without a given survey or feature) to make defensible causal claims
-4. Watch training time as data grows (~36 hours this run); consider whether the 128m/256m E00269 files justify their cost given they are the least-improving regime
-5. Run 2-3 paired bf16/fp32 runs to confirm the shoal-target TVU breach stays at zero before making bf16 permanent on the deliverable path; confirm the per-survey OCS Quality Metric against Project Instructions
+1. Regenerate ground truth, run verify_graph_equivalence, retrain as V11 (fp32 + bf16 paired)
+2. Re-run all evals with corrected direction labels; check that recovery_mean_error flips positive (conservative bias)
+3. Redo the bf16 safety comparison (TVU breach, now measuring the actual dangerous direction); confirm per-survey OCS Quality Metric against Project Instructions
+4. Add an end-to-end direction test for the asymmetric loss (Lesson 20) to the test suite
+5. Acquire more surveys with large-magnitude deep-water noise to address the localized failure on big corrections
+6. Watch training time as data grows; consider whether the 128m/256m E00269 files justify their cost given they are the least-improving regime
+7. Build the V11 regression inference path (the only inference stack is the legacy V9 classification one)
 
 ---
 

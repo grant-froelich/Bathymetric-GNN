@@ -1,5 +1,13 @@
 # Bathymetric GNN Training Plan
 
+> **STATUS NOTE (2026-06-09):** this plan predates the move to real ground
+> truth and the V11 cleanup. The synthetic-noise training path
+> (`--clean-surveys`, `BathymetricGraphDataset`) referenced throughout has been
+> RETIRED; training now requires ground truth from `prepare_ground_truth.py`.
+> Sections about improving synthetic noise generation are kept for historical
+> context only. For current workflow see QUICK_REFERENCE.md; for current
+> status see TRAINING_DASHBOARD.md.
+
 Detailed plan for training a production-quality model for bathymetric noise detection.
 
 ## Current State

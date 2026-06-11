@@ -3,6 +3,15 @@
 This document explains the theory behind Graph Neural Networks and how this tool applies them to bathymetric data cleaning.
 
 > **Sign Convention:** This document uses the standard bathymetric convention where **depths are positive down**. A depth of 10m means 10 meters below the water surface. Larger values = deeper water.
+>
+> Since 2026-06-09 this convention is ENFORCED in code: `BathymetricLoader`
+> normalizes every source (including BAG elevation, which GDAL reads
+> negative-down) to positive-down on load, and the dataset refuses ground
+> truth whose median depth is negative. Before that date the convention was
+> assumed but not enforced, and the negative-down data silently inverted every
+> direction-sensitive semantic in this document (see LESSONS_LEARNED
+> Lesson 20). The sign math below is correct for all data produced after the
+> fix.
 
 ## The Problem
 

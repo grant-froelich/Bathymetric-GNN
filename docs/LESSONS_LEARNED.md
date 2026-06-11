@@ -2,7 +2,7 @@
 
 This document captures practical lessons from training the Bathymetric GNN on real survey data (Seward, Alaska multibeam surveys and Pacific Islands surveys). It complements the theoretical documentation in HOW_IT_WORKS.md and TRAINING_PLAN.md.
 
-*Document Version: 3.3*
+*Document Version: 4.0*
 *Updated: June 2026*
 *Based on: Seward training data, V1-V9 runs, Pacific Islands/Pacific NW/Alaska ground truth, V10 regression mode, VR warp fix, first cross-geography generalization result*
 
@@ -385,7 +385,7 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 
 **Validation Practice Worth Keeping:** When an external tool (CARIS here) can produce the same quantity, use it as ground truth to validate the pipeline. The discrepancy between pipeline output and CARIS output is what made this bug visible. A single-source pipeline with no external check would have trained on corrupted targets indefinitely. The 50/50 vs 99/1 direction split was the most diagnostic single number; a healthy noise-removal difference is close to symmetric, and a wildly asymmetric split is a red flag for a systematic processing problem rather than real noise.
 
-**Note on Sign Convention:** This investigation incidentally revealed that GDAL reads these BAG depths as negative-down while CARIS exports positive-down. This does not affect the pipeline because both surfaces are loaded through the same GDAL path and the sign cancels in the subtraction. But it is worth knowing when comparing pipeline values against CARIS values directly: a near-perfect negative correlation between two surfaces that should be identical means a sign convention difference, not a data problem.
+**Note on Sign Convention (CORRECTED 2026-06-09):** This investigation incidentally revealed that GDAL reads these BAG depths as negative-down while CARIS exports positive-down. The original version of this note claimed the difference "does not affect the pipeline because the sign cancels in the subtraction." That was true for MAGNITUDES only, and the claim concealed a critical bug: the sign does NOT cancel for direction semantics. Every direction-sensitive component (the 3x shoal-safety weighting, the hazard metrics, the shoal/deep split) assumed positive-down and was therefore inverted by the negative-down data. See Lesson 20. The diagnostic observation stands: a near-perfect negative correlation between two surfaces that should be identical means a sign convention difference, not a data problem.
 
 ---
 
@@ -406,6 +406,13 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 ---
 
 ### 19. Judge Navigation Safety on a TVU-Budget Breach Rate, Not a Sign-Count Hazard Rate
+
+> **CORRECTION (2026-06-09):** the measurements in this lesson predate the
+> sign-convention fix (Lesson 20). Every direction label in the table below is
+> inverted: "hazardous" counted the safe direction, "shoal-target" rows are
+> deep-spike cells, and vice versa. The lesson's core argument (budget-aware
+> metrics over sign counts) is unaffected and the magnitudes are real, but the
+> direction-specific conclusions must be re-measured after the V11 retrain.
 
 **Observed (June 2026):** bf16 mixed-precision training (a ~5x speedup, 5.51 -> 1.07 s/it) appeared to regress safety. On the raw `hazardous_error_rate`, the rate rose 2-3x on the deep and unseen surveys, including the shoal-target subset (Alaska shoal 5.08% -> 15.27%, deep E00269 shoal 7.82% -> 11.03%). Read literally, that blocks bf16 for a navigation-safety deliverable, even though bf16's MAE was better at all three locations.
 
@@ -431,6 +438,60 @@ The shoal-target dangerous-breach rate (the shoal-preservation number) stayed at
 **Coefficients:** Use what the survey is certified to. NOAA HSSD rounds S-44's depth term (General 1 uses b=0.01 vs S-44 1a's 0.013; General 2/3 uses b=0.02 vs S-44 Order 2's 0.023), so using S-44 values for a NOAA survey makes the budget slightly too generous, materially so in deep water. The applicable OCS Quality Metric is set in the Project Instructions, not derived from depth.
 
 **General Principle:** A sign-count safety metric over-reports because it ignores the allowed uncertainty. bf16 is defensible on this evidence (shoal-critical breaches ~0, deep-target breaches sub-0.7%), but this is one paired run; confirm with two or three paired bf16/fp32 runs that the shoal-target breach stays at zero before making bf16 permanent on the deliverable path.
+
+---
+
+### 20. Normalize Data Conventions at the Boundary; a Documented-but-Unhandled Convention Is a Time Bomb
+
+**Observed (June 2026, full repo scrub):** Ground-truth bands stored GDAL
+elevation (negative-down: -10604 to -116 m, verified during the Lesson 17
+investigation) while every loss, metric, and document assumed positive-down
+depth. Under the actual data, `error > 0` is the dangerous direction
+(corrected surface deeper than truth), so the entire direction-sensitive stack
+was inverted since regression mode began:
+
+| Component | Intended | Actually did (pre-fix) |
+|---|---|---|
+| RegressionLoss 3x weight | penalize dangerous 3x | penalized SAFE 3x |
+| ShoalSafetyLoss (V9) | weight shoal spikes 3x | weighted DEEP spikes 3x |
+| metrics hazardous rate | count dangerous errors | counted SAFE errors |
+| metrics shoal/deep split | shoal-spike cells | deep-spike cells |
+
+**The observational fingerprint:** `recovery_mean_error` was negative in every
+evaluation ever run (-0.96 to -23.8 m). Since recovery error equals -error,
+every model had settled on the lightly-penalized side of the asymmetric loss,
+which under the real convention is the deeper-than-truth side: the safety loss
+was actively creating the dangerous bias it existed to prevent. A consistently
+one-sided signed bias metric is worth interrogating against the loss's
+direction semantics.
+
+**The trap that hid it:** the convention difference WAS discovered (Lesson 17)
+and documented as harmless because "the sign cancels in the subtraction." It
+cancels in magnitudes; it inverts directions. A known convention mismatch that
+is documented but not normalized in code is worse than an unknown one, because
+the documentation note inoculates future readers against suspicion.
+
+**The fix (2026-06-09):** one convention, enforced at the boundary.
+`BathymetricLoader` normalizes every source to positive-down on load
+(auto-detected by median sign, overridable), ground truth records the
+convention in metadata, and `GroundTruthDataset` refuses files whose median
+valid depth is negative so stale pre-fix data cannot enter a run. All
+checkpoints trained pre-fix embody the inverted objective; V11 is the first
+version trained with the safety asymmetry pointing the right way.
+
+**General Principles:**
+- Normalize external-data conventions at the load boundary, once, and make
+  every downstream component entitled to assume the normalized form. Scattered
+  per-component assumptions about conventions cannot be audited.
+- Guard the assumption in code, not in prose: a cheap runtime check (median
+  sign) converts a silent inversion into an immediate, explained failure.
+- When a signed bias metric is consistently one-sided across all runs and
+  regimes, check it against the loss's direction semantics before accepting it
+  as a model property.
+- Magnitude metrics cannot detect direction inversions. Any pipeline whose
+  purpose is directional (safety asymmetry) needs at least one end-to-end
+  direction test: construct a tiny synthetic case with a known dangerous error
+  and assert the loss penalizes it more, not less.
 
 ---
 
@@ -530,4 +591,5 @@ After any training run, validate in QGIS before trusting metrics:
 | VR difference magnitudes inflated | Mean correction several times larger than CARIS | Same root cause as above; severity is small when clean/noisy VR structures are similar, large when they differ |
 | Pipeline difference disagrees with CARIS | Pipeline median offset tens of meters, CARIS near zero | Validate against CARIS export; near-perfect negative correlation between surfaces means a sign convention difference, not a data problem |
 | Raw hazard rate inflated by a precision change | `hazardous_error_rate` up 2-3x while MAE improves | Sign count over-reports; use the TVU-breach rate (dangerous error exceeding TVU at depth). Sub-budget directional flips do not count |
+| Direction semantics inverted by data convention | recovery_mean_error consistently negative across all runs; "safety" bias worsens | Normalize convention at load (positive-down), guard with a median-sign check, add an end-to-end direction test (Lesson 20) |
 | S-44 coefficients used for a NOAA survey | TVU budget slightly too generous, esp. in deep water | Use HSSD OCS Quality Metric coefficients (General 1 b=0.01, General 2/3 b=0.02); the metric comes from Project Instructions, not depth |

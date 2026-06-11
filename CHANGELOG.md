@@ -1,5 +1,91 @@
 # Changelog
 
+## 2026-06-09 - Depth Convention Fix and Full Repo Scrub (V11 Prep)
+
+### CRITICAL FIX: Inverted Sign Convention (all direction-sensitive components)
+A full repo scrub found that ground-truth bands stored GDAL elevation
+(negative-down) while every loss, metric, and doc assumed positive-down depth.
+Under the real data, `error > 0` was the dangerous direction, so since
+regression mode was introduced: the 3x "shoal safety" weighting penalized the
+SAFE direction and lightly penalized the dangerous one (observable as the
+consistently negative recovery_mean_error in every eval: each model settled on
+the deeper-than-truth side); the hazard metrics counted safe-direction errors
+as hazardous; the shoal/deep target split was swapped; V9's ShoalSafetyLoss
+weighted deep spikes instead of shoals. Magnitude metrics (MAE/RMSE/recovery
+RMSE) were unaffected. All V10-and-earlier direction-sensitive numbers
+(hazard rates, TVU breach rates, shoal/deep labels, including the bf16
+comparison tables below) are inverted and must be re-measured after retraining.
+
+Fix (option A, normalize at the boundary):
+- `BathymetricLoader` now enforces positive-down depth in memory for every
+  format. `depth_convention='auto'` (default) detects elevation sources by
+  negative median and negates valid cells on load; 'positive_down' /
+  'negative_down' force the interpretation. The grid records
+  `source_was_negative_down`.
+- `prepare_ground_truth.py` therefore now writes positive-down bands, tags the
+  tif (`DEPTH_CONVENTION=POSITIVE_DOWN`) and the stats JSON
+  (`depth_convention`).
+- `GroundTruthDataset` and `spatial_error_map.py` REFUSE files whose median
+  valid depth is negative, so stale pre-fix ground truth cannot enter a run.
+  **All 9 ground-truth tifs must be regenerated** (same commands, `--no-offset`
+  where applicable) and the model retrained: existing checkpoints embody the
+  inverted objective. The retrained model is designated **V11**.
+- Legacy V9 inference scripts now emit a prominent warning: pre-fix checkpoints
+  are incompatible with the fixed loader.
+
+### Fixed: Tile coverage gap (training AND evaluation)
+Tiling covered only interior stride positions plus a single bottom-right corner
+tile, leaving the right and bottom edge strips (up to stride-1 px) in no tile:
+4-15% of cells at typical settings, up to ~40% on unlucky grid dims, excluded
+from training and from every reported evaluation. Grids smaller than tile_size
+produced no tiles at all. Both `GroundTruthDataset` and `spatial_error_map.py`
+now anchor a final tile to each edge and handle small grids.
+
+### Fixed: Survey border ring written as depth 0.0 (V9 inference merge)
+Blend weights reach exactly 0 at tile edges; zero-total-weight cells (the
+survey's outer ring) were initialized to 0.0 and never averaged, emerging as
+spurious 0 m depths (artificial shoals). `TileMerger.finalize_output` now
+resets zero-weight float cells to NaN.
+
+### Performance: vectorized graph construction
+`_build_edges` and `_compute_edge_features` replaced per-node/per-edge Python
+loops (with dict lookups) with vectorized numpy. Edge set and features are
+identical (verified bitwise in randomized tests; edge order is offset-major,
+semantically irrelevant). Speeds up evaluation, the Huber-delta startup
+sampling, and future inference (training was already worker-hidden).
+`scripts/verify_graph_equivalence.py` (new) embeds the legacy implementation
+verbatim and must PASS on real ground truth before the V11 retrain.
+
+### Retired: synthetic-noise training path
+`--clean-surveys` and `BathymetricGraphDataset` removed (the path had crashed
+at Trainer init on a missing labels key since ground-truth stats were added).
+`--ground-truth-dir` is now required; `--vr-bag-mode` removed from train.py.
+`data/synthetic_noise.py` remains as a standalone module (used by
+test_pipeline.py).
+
+### Smaller fixes
+- Checkpoints record true `in_channels`/`edge_dim` from the model instead of a
+  hardcoded `edge_dim: 3`.
+- Mixed classification/regression batches now raise instead of being silently
+  coerced to the first graph's mode.
+- `gdal.UseExceptions()` set explicitly (silences the GDAL 4.0 FutureWarning).
+- training_history.json: `train_acc`/`val_acc` renamed `train_metric`/
+  `val_metric` plus `metric_name` ('accuracy' or 'mae').
+- Early-stopping log now 1-indexed like all other epoch logs.
+- Empty-graph feature width now matches real graphs (latent batch-collation
+  trap).
+- Unused `warmup_epochs` removed from config; scheduler comment corrected
+  (no "step" implementation exists).
+- Dead `MultiScaleGraphBuilder` removed.
+
+### Required sequence before V11 training
+1. Regenerate all 9 ground-truth tifs with the fixed pipeline (`--no-offset`).
+2. `python scripts/verify_graph_equivalence.py --ground-truth-dir ground-truth-train/` must PASS.
+3. Retrain (fp32 and bf16 paired runs); re-run all evals including the TVU
+   comparison with now-correct direction labels.
+
+---
+
 ## 2026-06-09 - bf16 Mixed Precision, Graph-Cache Removal, TVU-Budget Safety Metric
 
 ### Performance: bf16 Mixed-Precision Training
@@ -31,6 +117,12 @@ Per-location, HSSD General 1 (shallow) and General 2 (deep, Alaska). Both breach
 MAE improved with bf16 at all three locations (shallow 2.41 -> 0.89, deep 27.37 -> 22.13, Alaska 19.00 -> 17.28 m). Alaska recovery RMSE was the lone worse aggregate (71.68 -> 89.01 m), driven by a few large errors that largely stay within the deep-water budget (its breach rate did not rise).
 
 ### Interpretation
+> **CORRECTION (2026-06-09 scrub):** every direction label in this entry
+> (hazardous, shoal-target, deep-target, TVU breach) was measured under the
+> inverted sign convention described in the entry above. The magnitudes and
+> speed results stand; the direction-sensitive conclusions must be re-measured
+> after the V11 retrain.
+
 The raw `hazardous_error_rate` over-reported by one to two orders of magnitude because most dangerous-direction flips are smaller than the allowed TVU at depth. The shoal-critical subset (shoal-target dangerous breach) stayed at ~0% for both precisions; bf16's only measurable safety cost is a sub-0.7% rise in deep-target dangerous breaches. bf16 is defensible for the deliverable on this evidence. See LESSONS_LEARNED Lesson 19.
 
 ### Caveats

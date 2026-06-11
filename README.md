@@ -166,7 +166,7 @@ bathymetric-gnn/
 ├── data/
 │   ├── loaders.py                 # BAG/GeoTIFF loading via GDAL
 │   ├── graph_construction.py      # Build graphs from grids
-│   ├── synthetic_noise.py         # Generate training data
+│   ├── synthetic_noise.py         # Synthetic noise (standalone module; training path retired)
 │   ├── tiling.py                  # Tile management for large grids
 │   └── vr_bag.py                  # Native VR BAG handler
 ├── models/
@@ -187,13 +187,30 @@ bathymetric-gnn/
 
 ### Training
 
+Training requires ground truth generated from clean/noisy survey pairs
+(`prepare_ground_truth.py`); the old synthetic-noise path was retired in the
+V11 cleanup.
+
 ```bash
+# 1. Generate ground truth from clean/noisy pairs (positive-down enforced)
+python scripts/prepare_ground_truth.py \
+    --clean /path/to/clean.bag --noisy /path/to/noisy.bag \
+    --output-dir ground-truth-train/ \
+    --regression-mode --no-offset
+
+# 2. Train (add --amp for bf16 mixed precision, ~5x faster)
 python scripts/train.py \
-    --clean-surveys /path/to/clean/surveys \
+    --ground-truth-dir ground-truth-train/ \
+    --val-surveys ground-truth-val/ \
     --output-dir /path/to/model/output \
-    --epochs 100 \
-    --vr-bag-mode resampled
+    --epochs 50 --tile-size 256 --batch-size 2 --amp
 ```
+
+> **Note:** the inference scripts below are the legacy V9 classification
+> path and are incompatible with checkpoints trained after the 2026-06-09
+> depth-convention fix. A V11 regression inference path is planned; until
+> then, use `scripts/evaluate_v10.py` and `scripts/spatial_error_map.py` to
+> inspect model output on ground-truth files.
 
 ### Inference (Single Resolution or Resampled VR)
 
