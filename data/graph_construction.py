@@ -123,16 +123,11 @@ class GraphBuilder:
         
         if num_nodes == 0:
             logger.warning("No valid cells in grid")
-            return self._create_empty_graph()
+            return self._create_empty_graph(include_uncertainty=uncertainty is not None)
         
-        # Create mapping from (row, col) to node index
-        coord_to_node = {}
-        for node_idx, (r, c) in enumerate(zip(valid_rows, valid_cols)):
-            coord_to_node[(r, c)] = node_idx
-        
-        # Build edges
+        # Build edges (vectorized; no per-node Python loop)
         edge_index, edge_coords = self._build_edges(
-            valid_rows, valid_cols, coord_to_node, depth.shape
+            valid_rows, valid_cols, valid_mask, depth.shape
         )
         
         # Compute node features (also returns per-node local_std for correction normalization)
@@ -182,38 +177,79 @@ class GraphBuilder:
         self,
         valid_rows: np.ndarray,
         valid_cols: np.ndarray,
-        coord_to_node: dict,
+        valid_mask: np.ndarray,
         grid_shape: Tuple[int, int],
-    ) -> Tuple[torch.Tensor, List[Tuple]]:
-        """Build edge index tensor."""
+    ) -> Tuple[torch.Tensor, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Build edge index tensor (vectorized).
+        
+        For each neighbor offset, all candidate neighbors are evaluated at once
+        via a node-id lookup grid, replacing the previous per-node Python loop
+        and dict lookups. Edge ordering is offset-major (all edges for offset 0,
+        then offset 1, ...) rather than the old node-major ordering; GNN message
+        passing is permutation-invariant over edges, so this has no semantic
+        effect. Equivalence to the loop implementation (same edge set, same
+        per-edge features) is checked by scripts/verify_graph_equivalence.py.
+        
+        Returns:
+            (edge_index tensor [2, E],
+             edge_coords as four int arrays (src_r, src_c, tgt_r, tgt_c))
+        """
         height, width = grid_shape
+        num_nodes = len(valid_rows)
         
-        source_nodes = []
-        target_nodes = []
-        edge_coords = []  # Store (src_row, src_col, tgt_row, tgt_col) for feature computation
+        # Node-id lookup grid: -1 for invalid cells, node index for valid ones
+        node_id = np.full(grid_shape, -1, dtype=np.int64)
+        node_id[valid_rows, valid_cols] = np.arange(num_nodes, dtype=np.int64)
         
-        for node_idx, (r, c) in enumerate(zip(valid_rows, valid_cols)):
-            for dr, dc in self.neighbor_offsets:
-                nr, nc = r + dr, c + dc
-                
-                # Check bounds
-                if 0 <= nr < height and 0 <= nc < width:
-                    # Check if neighbor is valid
-                    if (nr, nc) in coord_to_node:
-                        neighbor_idx = coord_to_node[(nr, nc)]
-                        source_nodes.append(node_idx)
-                        target_nodes.append(neighbor_idx)
-                        edge_coords.append((r, c, nr, nc))
+        src_parts, tgt_parts = [], []
+        src_r_parts, src_c_parts, tgt_r_parts, tgt_c_parts = [], [], [], []
         
-        # Add self loops if requested
+        for dr, dc in self.neighbor_offsets:
+            nr = valid_rows + dr
+            nc = valid_cols + dc
+            in_bounds = (nr >= 0) & (nr < height) & (nc >= 0) & (nc < width)
+            
+            neighbor_ids = np.full(num_nodes, -1, dtype=np.int64)
+            neighbor_ids[in_bounds] = node_id[nr[in_bounds], nc[in_bounds]]
+            
+            has_edge = neighbor_ids >= 0
+            if not np.any(has_edge):
+                continue
+            
+            src_parts.append(np.nonzero(has_edge)[0].astype(np.int64))
+            tgt_parts.append(neighbor_ids[has_edge])
+            src_r_parts.append(valid_rows[has_edge])
+            src_c_parts.append(valid_cols[has_edge])
+            tgt_r_parts.append(nr[has_edge])
+            tgt_c_parts.append(nc[has_edge])
+        
+        # Self loops if requested
         if self.include_self_loops:
-            for node_idx, (r, c) in enumerate(zip(valid_rows, valid_cols)):
-                source_nodes.append(node_idx)
-                target_nodes.append(node_idx)
-                edge_coords.append((r, c, r, c))
+            all_ids = np.arange(num_nodes, dtype=np.int64)
+            src_parts.append(all_ids)
+            tgt_parts.append(all_ids)
+            src_r_parts.append(valid_rows)
+            src_c_parts.append(valid_cols)
+            tgt_r_parts.append(valid_rows)
+            tgt_c_parts.append(valid_cols)
+        
+        if src_parts:
+            source_nodes = np.concatenate(src_parts)
+            target_nodes = np.concatenate(tgt_parts)
+            edge_coords = (
+                np.concatenate(src_r_parts),
+                np.concatenate(src_c_parts),
+                np.concatenate(tgt_r_parts),
+                np.concatenate(tgt_c_parts),
+            )
+        else:
+            source_nodes = np.zeros(0, dtype=np.int64)
+            target_nodes = np.zeros(0, dtype=np.int64)
+            empty = np.zeros(0, dtype=np.int64)
+            edge_coords = (empty, empty, empty, empty)
         
         edge_index = torch.tensor(
-            [source_nodes, target_nodes],
+            np.stack([source_nodes, target_nodes], axis=0),
             dtype=torch.long
         )
         
@@ -320,47 +356,45 @@ class GraphBuilder:
     def _compute_edge_features(
         self,
         depth: np.ndarray,
-        edge_coords: List[Tuple],
+        edge_coords: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
         resolution: Tuple[float, float],
     ) -> torch.Tensor:
-        """Compute features for each edge."""
-        if len(edge_coords) == 0:
+        """Compute features for each edge (vectorized)."""
+        src_r, src_c, tgt_r, tgt_c = edge_coords
+        num_edges = len(src_r)
+        
+        if num_edges == 0:
             return torch.zeros((0, len(self.edge_features)), dtype=torch.float32)
         
-        features = []
         res_x, res_y = resolution
         
+        # Shared geometry, computed once for all edges
+        dx = (tgt_c - src_c).astype(np.float64) * res_x
+        dy = (tgt_r - src_r).astype(np.float64) * res_y
+        horizontal_dist = np.sqrt(dx ** 2 + dy ** 2)
+        dz = (depth[tgt_r, tgt_c] - depth[src_r, src_c]).astype(np.float64)
+        
+        features = []
         for feature_name in self.edge_features:
-            feat_values = []
+            if feature_name == "distance":
+                feat_values = horizontal_dist
+            elif feature_name == "depth_difference":
+                feat_values = dz
+            elif feature_name == "slope":
+                # Slope in degrees; 0 where horizontal distance is 0 (self loops)
+                feat_values = np.where(
+                    horizontal_dist > 0,
+                    np.degrees(np.arctan(np.divide(
+                        dz, horizontal_dist,
+                        out=np.zeros_like(dz),
+                        where=horizontal_dist > 0,
+                    ))),
+                    0.0,
+                )
+            else:
+                feat_values = np.zeros(num_edges, dtype=np.float64)
             
-            for src_r, src_c, tgt_r, tgt_c in edge_coords:
-                if feature_name == "distance":
-                    # Euclidean distance in real-world units
-                    dx = (tgt_c - src_c) * res_x
-                    dy = (tgt_r - src_r) * res_y
-                    value = np.sqrt(dx**2 + dy**2)
-                
-                elif feature_name == "depth_difference":
-                    value = depth[tgt_r, tgt_c] - depth[src_r, src_c]
-                
-                elif feature_name == "slope":
-                    # Slope in degrees
-                    dx = (tgt_c - src_c) * res_x
-                    dy = (tgt_r - src_r) * res_y
-                    dz = depth[tgt_r, tgt_c] - depth[src_r, src_c]
-                    horizontal_dist = np.sqrt(dx**2 + dy**2)
-                    if horizontal_dist > 0:
-                        value = np.degrees(np.arctan(dz / horizontal_dist))
-                    else:
-                        value = 0.0
-                
-                else:
-                    value = 0.0
-                
-                feat_values.append(value)
-            
-            feat_values = np.nan_to_num(feat_values, nan=0.0)
-            features.append(feat_values)
+            features.append(np.nan_to_num(feat_values, nan=0.0))
         
         feature_matrix = np.stack(features, axis=1).astype(np.float32)
         
@@ -439,10 +473,20 @@ class GraphBuilder:
         """Compute surface curvature (Laplacian)."""
         return ndimage.laplace(depth)
     
-    def _create_empty_graph(self) -> Data:
-        """Create an empty graph for invalid tiles."""
+    def _create_empty_graph(self, include_uncertainty: bool = False) -> Data:
+        """Create an empty graph for invalid tiles.
+        
+        The feature width must match what build_graph produces for non-empty
+        tiles (node_features plus an appended uncertainty channel when
+        uncertainty data is present), or batching an empty graph with real
+        ones would fail on mismatched dimensions.
+        """
+        num_features = len(self.node_features)
+        if include_uncertainty and "uncertainty" not in self.node_features:
+            num_features += 1
+        
         data = Data(
-            x=torch.zeros((0, len(self.node_features)), dtype=torch.float32),
+            x=torch.zeros((0, num_features), dtype=torch.float32),
             edge_index=torch.zeros((2, 0), dtype=torch.long),
             edge_attr=torch.zeros((0, len(self.edge_features)), dtype=torch.float32),
             pos=torch.zeros((0, 2), dtype=torch.float32),
@@ -485,105 +529,3 @@ class GraphBuilder:
             )
         
         return grid
-
-
-class MultiScaleGraphBuilder(GraphBuilder):
-    """
-    Builds multi-scale graph representations.
-    
-    Creates hierarchical graph structure with:
-    - Fine scale: All valid cells
-    - Coarse scales: Downsampled representations
-    
-    This allows the GNN to reason at multiple spatial scales.
-    """
-    
-    def __init__(
-        self,
-        scales: List[int] = [1, 2, 4],
-        **kwargs
-    ):
-        """
-        Initialize multi-scale graph builder.
-        
-        Args:
-            scales: List of scale factors (1 = original, 2 = 2x downsampled, etc.)
-            **kwargs: Arguments passed to parent GraphBuilder
-        """
-        super().__init__(**kwargs)
-        self.scales = sorted(scales)
-    
-    def build_multiscale_graph(
-        self,
-        depth: np.ndarray,
-        valid_mask: Optional[np.ndarray] = None,
-        uncertainty: Optional[np.ndarray] = None,
-        resolution: Tuple[float, float] = (1.0, 1.0),
-    ) -> Dict[int, Data]:
-        """
-        Build graphs at multiple scales.
-        
-        Args:
-            depth: 2D depth array
-            valid_mask: Boolean mask of valid cells
-            uncertainty: Optional uncertainty array
-            resolution: Grid resolution
-            
-        Returns:
-            Dict mapping scale factor to Data object
-        """
-        if valid_mask is None:
-            valid_mask = np.isfinite(depth)
-        
-        graphs = {}
-        
-        for scale in self.scales:
-            if scale == 1:
-                # Full resolution
-                scaled_depth = depth
-                scaled_mask = valid_mask
-                scaled_unc = uncertainty
-                scaled_res = resolution
-            else:
-                # Downsample
-                scaled_depth = self._downsample(depth, scale)
-                scaled_mask = self._downsample_mask(valid_mask, scale)
-                scaled_unc = self._downsample(uncertainty, scale) if uncertainty is not None else None
-                scaled_res = (resolution[0] * scale, resolution[1] * scale)
-            
-            graphs[scale] = self.build_graph(
-                scaled_depth,
-                scaled_mask,
-                scaled_unc,
-                scaled_res,
-            )
-            
-            logger.debug(f"Scale {scale}: {graphs[scale].num_nodes} nodes")
-        
-        return graphs
-    
-    def _downsample(self, arr: np.ndarray, factor: int) -> np.ndarray:
-        """Downsample array by averaging."""
-        if arr is None:
-            return None
-        
-        h, w = arr.shape
-        new_h, new_w = h // factor, w // factor
-        
-        # Crop to exact multiple of factor
-        cropped = arr[:new_h * factor, :new_w * factor]
-        
-        # Reshape and average
-        reshaped = cropped.reshape(new_h, factor, new_w, factor)
-        return np.nanmean(reshaped, axis=(1, 3))
-    
-    def _downsample_mask(self, mask: np.ndarray, factor: int) -> np.ndarray:
-        """Downsample mask (True if majority of cells are valid)."""
-        h, w = mask.shape
-        new_h, new_w = h // factor, w // factor
-        
-        cropped = mask[:new_h * factor, :new_w * factor]
-        reshaped = cropped.reshape(new_h, factor, new_w, factor)
-        
-        # Cell is valid if at least half of contributing cells are valid
-        return np.mean(reshaped, axis=(1, 3)) >= 0.5
