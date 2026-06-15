@@ -782,7 +782,7 @@ The most direct measure of operational performance: how close does the corrected
 
 Recovery RMSE is the RMS of this residual across all valid cells. It collapses everything (prediction accuracy, magnitude bias, sign errors) into a single number that's directly comparable across model versions on the same survey.
 
-Recovery mean error (signed) shows whether the model has a systematic bias: positive means the corrected surface is on average shallower than the clean reference (conservative bias, safe direction); negative means on average deeper than reference (aggressive bias, dangerous direction).
+Recovery mean error (signed) shows whether the model has a systematic bias. With `recovery_error = corrected_depth - clean_depth` (positive-down), the sign reads: **negative** means the corrected surface is on average shallower than the clean reference (conservative bias, safe direction); **positive** means on average deeper than reference (aggressive bias, dangerous direction). This is the same quantity as `-(error)`, so it agrees with the hazardous convention above (hazardous is `error < 0`, i.e. `recovery_error > 0`). V11 (the first correct-direction model) shows negative recovery mean error on all validation surfaces, i.e. a conservative bias, which is the success signal for the asymmetric loss. (Note: a negative value here is safe only under the post-fix positive-down convention; pre-fix, on negative-down data, the same sign meant the opposite. See LESSONS_LEARNED Lesson 20.)
 
 ### What V10 Does NOT Measure
 

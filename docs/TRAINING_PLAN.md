@@ -21,9 +21,9 @@ Detailed plan for training a production-quality model for bathymetric noise dete
 | VR BAG support | Complete | Native processing preserves multi-resolution structure |
 | Synthetic noise training (V1-V2) | Complete | Proof-of-concept, did not learn real noise patterns |
 | Real data training (V3-V9, classification) | Complete | Trained on Seward, Alaska VR pairs; V9 is current best classification model |
-| Regression mode (V10) | Pipeline operational | First training run successful on E00269; needs more data and longer runs |
-| Geographic diversity expansion | In Progress | E00269 (Pacific Islands) processed; 21 NCEI archive requests pending |
-| Production deployment | Pending | Awaiting validation across multiple regions |
+| Regression mode (V10-V11) | V11 trained and evaluated | Sign + edge-tile fixes applied; first correct-direction model; fp32 ships, bf16 for dev |
+| Geographic diversity expansion | In Progress | E00269 (Pacific Islands) processed; H13739/H14070/H14116 in V11; 22-survey acquisition plan across 8 regions outstanding |
+| Production deployment | Pending | Needs V11 regression inference path, qualification, and broader geographic validation |
 
 **Current classification model (V9) performance:**
 - Trained on 4 Seward VR pairs, 30 epochs, batch size 4
@@ -32,12 +32,68 @@ Detailed plan for training a production-quality model for bathymetric noise dete
 - Mean confidence 0.825 on noise predictions
 - Known issue: Seward-specific overfitting; geographic diversity needed
 
-**Current regression model (V10) status:**
-- Initial 5-epoch training run on E00269 1of6 completed successfully
-- Training loss decreased from 0.79 to 0.69
-- Pipeline validated end-to-end (dataset, loss, training loop, history)
-- Needs: more ground truth files in regression mode, longer training, proper train/val split
-- Not yet compared against V9 on common validation data
+**Current regression model (V11) status:**
+- Retrained on regenerated positive-down ground truth after the depth-convention and edge-tile fixes; first model whose shoal-safety asymmetry and safety metrics point in the correct direction
+- 6 training files (E00269 sub-files + H13739 + H14070), 3 validation surfaces (shallow, deep, Alaska H14116); fp32 best val loss 0.9302 at epoch 19
+- Sign fix validated: conservative (shallower-than-truth) mean bias, hazardous rate under 50% on all three surfaces
+- fp32 vs bf16 resolved: fp32 wins MAE everywhere and the shoal-target breach at the deep sites (bf16 13.5x worse at deep); fp32 for the qualified release, bf16 (`--amp`) for experimentation only
+- Remaining weakness: isolated large-magnitude deep-water corrections dominate deep/Alaska error (data scarcity, addressed by the acquisition plan)
+- Outstanding: V11 regression inference path, end-to-end direction test in the suite, more paired runs to confirm the bf16/fp32 tail gap
+
+## Operational Retraining Strategy (in discussion, 2026-06-15)
+
+With bf16 available for experimentation, training wall-clock time is no longer the
+binding constraint on how often the model is retrained. For a navigation-safety model
+the real constraints are ground-truth throughput, qualification cost, and
+provenance/reproducibility, and those should set the cadence rather than the GPU clock
+or the calendar. Ships collect data around the US year-round (hundreds of datasets a
+year), which raises the question of when and on what data to retrain.
+
+Two intuitive options were considered and rejected as stated:
+
+- **Retrain on every collected survey, on the full corpus.** Raw collected data is not
+  training data until someone produces a trustworthy clean/noisy pair with a corrected
+  datum, so cadence is capped by human-gated ground-truth generation, not by collection.
+  Per-survey retraining would also mean hundreds of qualification cycles a year and a
+  provenance trail that cannot be reconstructed (which model version cleaned which
+  survey), in exchange for near-zero model change per survey once the corpus is large.
+- **Wait until year-end and retrain on a hand-picked subset of the "best" data.** This
+  fixes provenance but adds staleness (a survey collected early gets cleaned by a model
+  that has not seen new data for months, which matters if noise characteristics drift as
+  sonars/vessels/regions are added) and a subtler bias: if "best" means cleanest and
+  easiest to pair, it starves the model of the messy, ambiguous surveys where
+  shoal-versus-noise discrimination is hardest, which is the exact case that hurts. "Best"
+  must mean best ground-truth quality and best geographic coverage, never easiest signal,
+  and must keep the hard cases.
+
+**Current direction:** decouple the two axes.
+- Bank ground truth continuously as surveys arrive, curating for quality and geographic
+  diversity along the way (not in a year-end scramble). Deliberate coverage is the direct
+  fix for the Seward-era over-prediction, since ships cluster and a naturally-accumulated
+  corpus rebuilds that bias.
+- Retrain on a fixed cadence set by how often a model can actually be qualified, likely
+  quarterly (monthly only if qualification can absorb it), not per-survey and not annual.
+- Train each candidate on the full QC-passing corpus rather than a deliberately shrunk
+  subset; bf16 makes full-corpus training cheap, and the only good reason to drop a pair
+  is bad ground truth, not redundancy.
+- Keep the deployed model fixed between releases with full provenance, and run it on
+  incoming surveys while tracking its over-prediction and shoal-breach rate against
+  spot-checked truth, so a new region or sonar that degrades performance triggers an
+  off-cycle retrain instead of waiting for the calendar.
+- Precision: bf16 for all experimentation; fp32 for the qualified release, decided on the
+  shoal-breach tail (per V11). Training the release in fp32 costs nothing per survey
+  processed, since inference precision is a separate choice.
+
+**Open questions that set the actual cadence** (to be resolved with operational input,
+not from ML alone):
+- Ground-truth generation throughput. Likely the binding limit; caps how often a retrain
+  is even worth running.
+- Qualification cost per model. If this is the expensive step, the cadence shifts toward
+  fewer, larger releases.
+- How fast noise characteristics drift. Fixes how much staleness is tolerable between
+  releases.
+- Charting/QC standards on reproducibility and documented processing, which may constrain
+  this harder than any ML consideration.
 
 ## Two Training Modes
 

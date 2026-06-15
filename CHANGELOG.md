@@ -1,5 +1,88 @@
 # Changelog
 
+## 2026-06-15 - V11 Trained and Evaluated: Sign Fix Validated, fp32 vs bf16 Resolved
+
+V11 is the first model trained after the depth-convention fix and the tile-coverage
+fix (see the two 2026-06-09 entries). Both the fp32 and bf16 paired runs completed on
+the regenerated positive-down ground truth, and the full evaluation was re-run with
+correct direction semantics. This supersedes every direction-sensitive number in the
+2026-06-09 bf16 entry below, all of which were measured under the inverted sign
+convention.
+
+### Training
+- Regenerated ground truth, all positive-down (`--regression-mode --no-offset`): 6
+  training files (E00269 4m/8m/128m/256m sub-files + H13739 VR + H14070 VR), 1,310
+  tiles; 3 validation files, 282 tiles.
+- GAT, 4 layers, 64 hidden channels, 182,533 parameters. Correction Huber delta 6.566
+  (sampled from normalized corrections at startup).
+- fp32: best val loss 0.9302 at epoch 19, early stop at epoch 34, ~56 h wall clock.
+- bf16 (`--amp`): paired run on the same data and split.
+
+### The sign fix is validated
+The 2026-06-09 dashboard predicted `recovery_mean_error` would flip positive as the
+success indicator for the sign fix. That prediction had the sign backwards. Under the
+post-fix positive-down convention that `metrics.py` implements, `recovery_error =
+corrected - clean = -(error)`, so a **negative** `recovery_mean_error` means the
+corrected surface sits shallower than truth on average, which is the conservative
+(safe) direction. V11 fp32 `recovery_mean_error` is negative at all three validation
+surfaces (shallow -0.585, deep -6.615, Alaska -0.179 m) and the overall hazardous rate
+is under 50% everywhere (28-36%), so most cells err to the safe side. The asymmetric
+3x penalty is now pushing the model the right way. The indicator manifests as
+`recovery_mean_error` staying negative, not flipping positive, because the
+load-boundary negation also flipped the sign-to-meaning mapping (pre-fix negative meant
+dangerous; post-fix negative means safe). A still-inverted model would instead show
+positive `recovery_mean_error` and a hazardous rate above 50%.
+
+### fp32 vs bf16 (corrected signs, the authoritative comparison)
+Three held-out validation surfaces, HSSD General 1 (shallow) and General 2 (deep,
+Alaska). Both breach fields are dangerous-direction (corrected deeper than truth)
+rates, partitioned by the true correction's direction.
+
+| Surface (order) | MAE m, fp32 -> bf16 | shoal-target breach cells, fp32 -> bf16 | deep-target breach cells, fp32 -> bf16 |
+|---|---|---|---|
+| Shallow (general1) | 0.88 -> 1.22 | 0 -> 0 | 315 -> 93 |
+| Deep (general2) | 11.86 -> 13.54 | 114 -> 1,539 | 4,880 -> 5,703 |
+| Alaska H14116 (general2) | 10.22 -> 11.74 | 515 -> 924 | 1,734 -> 2,243 |
+
+fp32 wins MAE at all three. fp32 wins or ties the shoal-target dangerous breach at all
+three: tied at shallow (neither produces one), 13.5x lower at deep, 1.8x lower at
+Alaska. The only place bf16 looks better is shallow deep-target and overall breach
+(315 -> 93), but shallow has zero shoal-direction danger for either precision and
+bf16's shallow MAE is worse, so it does not move the verdict. Both precisions carry a
+conservative mean bias (recovery_mean_error negative everywhere); bf16's is slightly
+more conservative on average yet has a markedly fatter dangerous tail, which is the
+coarse-mantissa signature.
+
+### Two 2026-06-09 conclusions are overturned (both were sign-inversion artifacts)
+- "MAE improved with bf16 at all three locations." Does not reproduce on the
+  regenerated ground truth: fp32 has lower MAE everywhere. The earlier fp32 MAE was
+  inflated by the offset/convention issues that motivated the regeneration (earlier
+  fp32 shallow MAE 2.41 vs V11 fp32 0.88).
+- "Shoal-target breach stayed at ~0% for both precisions; bf16 is defensible for the
+  deliverable." Wrong. With correct signs the shoal-target breach is not zero, and
+  bf16 raises it 13.5x at deep. bf16 is NOT defensible on the deliverable path.
+
+### Decision: bf16 for experimentation, fp32 for the release
+- bf16 (`--amp`) is the development/experimentation default. The ~5x speedup is pure
+  throughput when iterating on architecture, features, thresholds, and data mixes
+  judged on aggregate metrics (MAE, loss), where the coarse mantissa does not matter.
+- The qualified, shipped model is trained in fp32. The go/no-go is the shoal-target
+  breach number, not MAE, and bf16 fails it. Training precision is decoupled from
+  inference precision, so training the release model in fp32 costs nothing per survey
+  processed later.
+- Mechanism: bf16's coarse mantissa rounds away the fine directional gradient the
+  asymmetric 3x shoal loss places on near-zero corrections, eroding exactly the
+  discipline that protects shoals. The 13.5x shoal-breach jump at deep is the
+  fingerprint.
+
+### Caveat
+Still one paired run. The bar for ever promoting bf16 to the deployed path was
+shoal-breach parity across a few paired runs, not MAE parity; this run does not clear
+it. The stakes asymmetry plus the consistency across both deep sites makes fp32 the
+release choice now. See LESSONS_LEARNED Lessons 19, 20, and 21.
+
+---
+
 ## 2026-06-09 - Depth Convention Fix and Full Repo Scrub (V11 Prep)
 
 ### CRITICAL FIX: Inverted Sign Convention (all direction-sensitive components)
@@ -124,6 +207,12 @@ MAE improved with bf16 at all three locations (shallow 2.41 -> 0.89, deep 27.37 
 > after the V11 retrain.
 
 The raw `hazardous_error_rate` over-reported by one to two orders of magnitude because most dangerous-direction flips are smaller than the allowed TVU at depth. The shoal-critical subset (shoal-target dangerous breach) stayed at ~0% for both precisions; bf16's only measurable safety cost is a sub-0.7% rise in deep-target dangerous breaches. bf16 is defensible for the deliverable on this evidence. See LESSONS_LEARNED Lesson 19.
+
+> **SUPERSEDED (2026-06-15):** the "shoal breach ~0 for both, bf16 defensible"
+> conclusion was an artifact of the inverted sign convention. Under the corrected
+> V11 measurement (top of this changelog), the shoal-target breach is not zero and
+> bf16 raises it 13.5x at deep; bf16's apparent MAE advantage also did not reproduce.
+> The current verdict is fp32 for the release, bf16 for experimentation only.
 
 ### Caveats
 - One paired bf16/fp32 run; the two checkpoints selected different best epochs off a noisy validation signal, so single-run variance is not fully excluded. Two or three paired runs are needed to confirm the shoal-target breach stays at zero before bf16 is made permanent on the deliverable path.

@@ -1,6 +1,6 @@
 # Bathymetric GNN -- Training Performance Tracker
 
-**V1-V11 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-09**
+**V1-V11 | Seward + Pacific Islands + Pacific NW + Alaska | VR/SR BAG Noise Detection | Updated 2026-06-15**
 
 > **DATA CORRECTION NOTICE (2026-06-09):** a full repo scrub found the sign
 > convention inverted through every direction-sensitive component (see
@@ -29,8 +29,11 @@
 | V8 | Dynamic Huber delta | = V7 | = V7 | = V7 | = V7 | No change |
 | **V9** | **local_std correction norm** | **~72%** | **34.8%** | **0.825** | **12,823** | :star: Best classification corrections |
 | **V10** | **Regression mode** | N/A (MAE 0.83 std-dev) | N/A | N/A | per cell | :test_tube: Initial run successful (5 epochs, 1 survey) |
+| **V11** | **Sign fix + edge-tile fix; regression** | N/A (MAE 0.88-11.86 m by regime) | N/A | N/A | per cell | :star: First correct-direction model; fp32 ships, bf16 for dev |
 
 V10 uses regression instead of classification. Metrics are not directly comparable to V1-V9: the model predicts a continuous correction at every cell rather than a class label. MAE replaces accuracy as the primary metric.
+
+V11 is V10's architecture retrained after the depth-convention fix (Lesson 20) and the edge-tile coverage fix, so it is the first version whose 3x shoal-safety asymmetry points at the actual dangerous direction. Its safety numbers (hazard, TVU breach, shoal/deep split) are the first that can be read literally; all V1-V10 direction-sensitive numbers are inverted.
 
 ---
 
@@ -299,36 +302,70 @@ Safety, raw sign-count hazard vs TVU-budget breach (fp32 -> bf16), HSSD General 
 
 Read: the raw hazard rate over-reports by one to two orders of magnitude because most dangerous-direction flips are smaller than the allowed TVU at depth. The shoal-critical subset stays at ~0% for both precisions; bf16's only measurable safety cost is a sub-0.7% rise in deep-target dangerous breaches. bf16 is defensible for the deliverable pending paired-run confirmation. See LESSONS_LEARNED Lesson 19.
 
-### V11 (pending): first run with corrected direction semantics
+> **SUPERSEDED by V11 (2026-06-15).** Every direction label in the two tables
+> above was measured under the inverted sign convention, and this run also used
+> the pre-fix ground truth. The corrected V11 comparison (next section) reverses
+> both headline conclusions: bf16 does not win MAE, and the shoal-target breach is
+> not ~0. The speed numbers (5.51 -> 1.07 s/it) and the graph-cache finding stand.
 
-Prerequisites, in order:
-1. Regenerate all 9 ground-truth tifs with the fixed `prepare_ground_truth.py`
-   (positive-down enforced; use `--regression-mode --no-offset`). The dataset
-   now refuses pre-fix (negative-down) files.
-2. `python scripts/verify_graph_equivalence.py --ground-truth-dir ground-truth-train/`
-   must PASS (validates the vectorized graph construction against the legacy
-   implementation on real data).
-3. Paired fp32 / bf16 (`--amp`) training runs.
+### V11 (2026-06-15): first run with corrected direction semantics
 
-What changes vs V10: the 3x asymmetric penalty points at the actual dangerous
-direction for the first time; tile coverage now includes the edge strips
-(more tiles, slightly different dataset size); expect recovery_mean_error to
-flip from consistently negative (dangerous bias) toward positive
-(conservative bias) if the loss works as designed - that flip is the single
-clearest success indicator for the fix.
+V11 retrains the V10 architecture on regenerated positive-down ground truth, after
+both the depth-convention fix (Lesson 20) and the edge-tile coverage fix. Prerequisites
+(ground-truth regeneration with `--regression-mode --no-offset`, then
+`verify_graph_equivalence.py`) were completed before training. Paired fp32 and bf16
+(`--amp`) runs on identical data and split. fp32: 1,310 training tiles / 282 validation
+tiles, 182,533 parameters, Huber delta 6.566, best val loss 0.9302 at epoch 19, early
+stop at epoch 34.
 
-All safety evaluation (hazard rates, TVU breach, bf16 verdict) restarts from
-zero on V11; no pre-fix direction-sensitive number carries forward.
+**The sign fix worked.** The pre-fix prediction below expected `recovery_mean_error` to
+flip positive as the success signal; that had the sign backwards. Under the post-fix
+positive-down convention, `recovery_error = corrected - clean = -(error)`, so a
+*negative* `recovery_mean_error` is the corrected surface sitting shallower than truth
+on average, i.e. the conservative (safe) side. V11 fp32 shows negative
+`recovery_mean_error` at all three surfaces and a hazardous rate under 50% everywhere,
+so the asymmetric penalty now biases the model safe. A still-inverted model would have
+shown positive `recovery_mean_error` and a hazardous rate above 50%.
+
+Safety evaluation, fp32 vs bf16, on three held-out validation surfaces (HSSD General 1
+shallow, General 2 deep/Alaska). Breach fields are dangerous-direction (corrected
+deeper than truth) rates, partitioned by the true correction's direction:
+
+| Surface (order) | cells | MAE m (fp32 -> bf16) | recovery mean err m (fp32 -> bf16) | hazard rate (fp32 -> bf16) | shoal breach cells (fp32 -> bf16) | deep breach cells (fp32 -> bf16) |
+|---|---|---|---|---|---|---|
+| Shallow (general1) | 468,665 | 0.88 -> 1.22 | -0.585 -> -1.021 | 35.6% -> 26.9% | 0 -> 0 | 315 -> 93 |
+| Deep (general2) | 1,461,000 | 11.86 -> 13.54 | -6.615 -> -7.034 | 27.7% -> 29.8% | 114 -> 1,539 | 4,880 -> 5,703 |
+| Alaska H14116 (general2) | 248,887 | 10.22 -> 11.74 | -0.179 -> -1.080 | 32.8% -> 37.5% | 515 -> 924 | 1,734 -> 2,243 |
+
+Read: fp32 wins MAE at all three. The decisive safety number is the shoal-target
+dangerous breach, and fp32 wins or ties it at all three: tied at shallow, 13.5x lower
+at deep (114 vs 1,539), 1.8x lower at Alaska (515 vs 924). Both precisions carry a
+conservative mean bias; bf16's mean is slightly more conservative but its dangerous
+tail is markedly fatter, which is the coarse-mantissa signature. The only metric
+favoring bf16 is shallow deep-target/overall breach (315 -> 93), where there is no
+shoal-direction danger for either precision and bf16's MAE is worse, so it does not
+change the verdict.
+
+**Decision:** fp32 for the qualified release (the go/no-go is the shoal-breach number,
+which bf16 fails), bf16 (`--amp`) for experimentation (the ~5x speedup is free
+throughput on aggregate-metric iteration). Mechanism: bf16 rounds away the fine
+directional gradient the 3x shoal loss puts on near-zero corrections. Caveat: one
+paired run; the bar for promoting bf16 to the deployed path is shoal-breach parity
+across a few paired runs, not met here. See LESSONS_LEARNED Lessons 19 and 21.
+
+Remaining weakness, unchanged from V10: isolated large-magnitude deep-water corrections
+dominate the deep and Alaska MAE/RMSE (the >10m bucket carries the error). This is a
+data-scarcity problem in large deep-water noise examples, addressed by the geographic
+acquisition plan, not a direction problem.
 
 ### Next Steps
 
-1. Regenerate ground truth, run verify_graph_equivalence, retrain as V11 (fp32 + bf16 paired)
-2. Re-run all evals with corrected direction labels; check that recovery_mean_error flips positive (conservative bias)
-3. Redo the bf16 safety comparison (TVU breach, now measuring the actual dangerous direction); confirm per-survey OCS Quality Metric against Project Instructions
-4. Add an end-to-end direction test for the asymmetric loss (Lesson 20) to the test suite
-5. Acquire more surveys with large-magnitude deep-water noise to address the localized failure on big corrections
-6. Watch training time as data grows; consider whether the 128m/256m E00269 files justify their cost given they are the least-improving regime
-7. Build the V11 regression inference path (the only inference stack is the legacy V9 classification one)
+1. Add an end-to-end direction test for the asymmetric loss (Lesson 20) to the test suite, so a future inversion fails immediately instead of silently.
+2. Run two or three more paired fp32/bf16 runs to confirm the shoal-target breach gap is stable (and to harden the bf16-for-dev / fp32-for-release split) rather than single-run variance.
+3. Acquire and integrate the geographically diverse surveys (the 22-survey plan) with attention to large-magnitude deep-water noise; this is the primary lever for both the deep-water weakness and the Seward-era over-prediction.
+4. Build the V11 regression inference path (the only inference stack is the legacy V9 classification one).
+5. Confirm the per-survey OCS Quality Metric (General 1/2) against the Project Instructions rather than assuming it from regime.
+6. Watch training time as data grows; bf16 is the experimentation default. Reconsider whether the 128m/256m E00269 files justify their cost given they are the least-improving regime.
 
 ---
 

@@ -1,6 +1,6 @@
 # Bathymetric GNN - Quick Reference Guide
 
-*Updated: May 2026 (V10 regression mode added; V9 classification mode still supported)*
+*Updated: June 2026 (V11 = sign fix + edge-tile fix retrain; V10 regression mode; V9 classification mode still supported)*
 
 ## Commands Cheat Sheet
 
@@ -79,8 +79,11 @@ python scripts/train.py \
 #   "Training mode: classification" or "Training mode: regression"
 # In regression mode, progress bar shows MAE instead of accuracy.
 # If CUDA out of memory, use --batch-size 2 or smaller --tile-size
-# Add --amp for bf16 mixed precision (~5x faster on RTX cards; pair with an
-# fp32 run for safety comparisons)
+# Add --amp for bf16 mixed precision (~5x faster on RTX cards).
+#   Use bf16 for EXPERIMENTATION (architecture/feature/data iteration on MAE/loss).
+#   Train the SHIPPED model in fp32 (omit --amp): V11 showed bf16 raises the
+#   shoal-target TVU breach up to 13.5x. The safety go/no-go is the shoal-breach
+#   number, not MAE, and bf16 fails it. See CHANGELOG 2026-06-15, LESSONS Lesson 21.
 ```
 
 ### 3b. Verify graph construction (required once before retraining)
@@ -323,4 +326,5 @@ applicable metric per survey comes from its Project Instructions.
 The ground-truth file stores elevation (negative-down) and was generated before
 2026-06-09. Regenerate it with the current `prepare_ground_truth.py` (the
 loader now enforces positive-down depth). Pre-fix checkpoints likewise embody
-the inverted objective and need retraining (V11).
+the inverted objective; V11 is the first model retrained with the fix, so use a
+V11 (or later) checkpoint for any direction-sensitive evaluation.

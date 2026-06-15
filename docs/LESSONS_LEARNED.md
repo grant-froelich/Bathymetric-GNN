@@ -4,7 +4,7 @@ This document captures practical lessons from training the Bathymetric GNN on re
 
 *Document Version: 4.0*
 *Updated: June 2026*
-*Based on: Seward training data, V1-V9 runs, Pacific Islands/Pacific NW/Alaska ground truth, V10 regression mode, VR warp fix, first cross-geography generalization result*
+*Based on: Seward training data, V1-V9 runs, Pacific Islands/Pacific NW/Alaska ground truth, V10 regression mode, VR warp fix, first cross-geography generalization result, depth-convention fix, V11 retrain and fp32/bf16 comparison*
 
 ---
 
@@ -407,12 +407,13 @@ See HOW_IT_WORKS.md for a fuller explanation of Huber loss, the delta parameter,
 
 ### 19. Judge Navigation Safety on a TVU-Budget Breach Rate, Not a Sign-Count Hazard Rate
 
-> **CORRECTION (2026-06-09):** the measurements in this lesson predate the
-> sign-convention fix (Lesson 20). Every direction label in the table below is
-> inverted: "hazardous" counted the safe direction, "shoal-target" rows are
-> deep-spike cells, and vice versa. The lesson's core argument (budget-aware
-> metrics over sign counts) is unaffected and the magnitudes are real, but the
-> direction-specific conclusions must be re-measured after the V11 retrain.
+> **CORRECTION (2026-06-09), RESOLVED (2026-06-15):** the measurements in this
+> lesson predate the sign-convention fix (Lesson 20). Every direction label in the
+> table below is inverted: "hazardous" counted the safe direction, "shoal-target"
+> rows are deep-spike cells, and vice versa. The lesson's core argument (budget-aware
+> metrics over sign counts) is unaffected and the magnitudes are real, but its bf16
+> verdict was wrong. The corrected V11 re-measurement (end of this lesson) reverses
+> it: bf16 is NOT defensible on the deliverable path.
 
 **Observed (June 2026):** bf16 mixed-precision training (a ~5x speedup, 5.51 -> 1.07 s/it) appeared to regress safety. On the raw `hazardous_error_rate`, the rate rose 2-3x on the deep and unseen surveys, including the shoal-target subset (Alaska shoal 5.08% -> 15.27%, deep E00269 shoal 7.82% -> 11.03%). Read literally, that blocks bf16 for a navigation-safety deliverable, even though bf16's MAE was better at all three locations.
 
@@ -437,7 +438,19 @@ The shoal-target dangerous-breach rate (the shoal-preservation number) stayed at
 
 **Coefficients:** Use what the survey is certified to. NOAA HSSD rounds S-44's depth term (General 1 uses b=0.01 vs S-44 1a's 0.013; General 2/3 uses b=0.02 vs S-44 Order 2's 0.023), so using S-44 values for a NOAA survey makes the budget slightly too generous, materially so in deep water. The applicable OCS Quality Metric is set in the Project Instructions, not derived from depth.
 
-**General Principle:** A sign-count safety metric over-reports because it ignores the allowed uncertainty. bf16 is defensible on this evidence (shoal-critical breaches ~0, deep-target breaches sub-0.7%), but this is one paired run; confirm with two or three paired bf16/fp32 runs that the shoal-target breach stays at zero before making bf16 permanent on the deliverable path.
+**General Principle:** A sign-count safety metric over-reports because it ignores the allowed uncertainty. The budget-aware framing is the right one and it carries forward to V11 unchanged.
+
+**Corrected re-measurement (V11, 2026-06-15):** repeating this comparison on the
+fixed pipeline (positive-down ground truth, correct direction labels) overturns the bf16
+verdict. The shoal-target dangerous breach is no longer ~0: it is 0 / 114 / 515 cells in
+fp32 at shallow / deep / Alaska, and bf16 raises it to 0 / 1,539 / 924 (13.5x worse at
+deep, 1.8x at Alaska). bf16 also no longer wins MAE; fp32 is lower at all three. The
+earlier "bf16 improved MAE everywhere and shoal breach stayed at zero" reading was an
+artifact of the inverted signs and the pre-fix ground truth. Verdict now: fp32 for the
+qualified release (the shoal-breach number is the go/no-go and bf16 fails it), bf16 for
+experimentation only. This is one paired run; the bar for ever moving bf16 onto the
+deployed path is shoal-breach parity across a few paired runs. See Lesson 21 for why
+reduced precision hits the safety tail specifically.
 
 ---
 
@@ -479,6 +492,18 @@ valid depth is negative so stale pre-fix data cannot enter a run. All
 checkpoints trained pre-fix embody the inverted objective; V11 is the first
 version trained with the safety asymmetry pointing the right way.
 
+**Confirmed (V11, 2026-06-15):** the retrain validates the fix. V11
+`recovery_mean_error` is negative at all three validation surfaces (-0.18 to
+-6.61 m) and the hazardous rate is under 50% everywhere, meaning the corrected
+surface now sits shallower than truth on average: the model errs to the safe
+side. Note the sign subtlety that the pre-fix dashboard prediction got wrong. It
+expected `recovery_mean_error` to flip *positive* as the success signal, but the
+load-boundary negation flipped the sign-to-meaning mapping too: pre-fix (negative-
+down) a negative value meant dangerous, post-fix (positive-down) a negative value
+means safe. So success shows as the value staying negative, not flipping. A
+still-broken model would show positive `recovery_mean_error` and a hazardous rate
+above 50%.
+
 **General Principles:**
 - Normalize external-data conventions at the load boundary, once, and make
   every downstream component entitled to assume the normalized form. Scattered
@@ -492,6 +517,48 @@ version trained with the safety asymmetry pointing the right way.
   purpose is directional (safety asymmetry) needs at least one end-to-end
   direction test: construct a tiny synthetic case with a known dangerous error
   and assert the loss penalizes it more, not less.
+
+---
+
+### 21. Reduced Precision Erodes an Asymmetric Safety Loss at the Tail, Not the Mean
+
+**Observed (V11, 2026-06-15):** bf16 and fp32 were trained as a paired run on
+identical data and split, then evaluated with correct direction semantics. bf16
+is the more conservative model *on average* (its `recovery_mean_error` is more
+negative at all three surfaces, so it sits further to the safe side in the mean),
+yet it produces far more dangerous-direction shoal-target breaches: 0 / 1,539 /
+924 cells vs fp32's 0 / 114 / 515 at shallow / deep / Alaska (13.5x worse at deep).
+A model can be safer in the mean and more dangerous in the tail at the same time.
+
+**Why this happens:** the safety mechanism here is the 3x asymmetric penalty on the
+dangerous direction, and it does its work at near-zero corrections, where most cells
+live and where the safe-vs-dangerous decision is a small signed quantity. bf16's
+8-bit mantissa (~2-3 significant decimal digits) cannot represent that fine signed
+gradient precisely, so it rounds it away. The penalty still shifts the bulk
+distribution to the safe side (hence the more-conservative mean), but the rounding
+widens both tails, and the dangerous tail is the one that breaches the TVU budget.
+Precision loss does not bias the model dangerous; it blunts the instrument that
+keeps the dangerous tail thin.
+
+**Why the mean misleads here:** `recovery_mean_error` answers "which side is the
+model on, on average," which is the wrong question for navigation safety. A shoal
+hazard is a tail event: one cell left dangerously shallow-removed is a charted
+depth that is wrong in the direction that grounds vessels, regardless of how
+conservative the surrounding 10,000 cells are. Always gate the safety decision on
+the breach tail (shoal-target TVU breach), and treat a conservative mean as
+necessary but not sufficient.
+
+**General Principles:**
+- For any loss whose value comes from an asymmetry applied to small signed
+  quantities, suspect that low-precision arithmetic will degrade the asymmetry
+  before it degrades the aggregate fit. Verify the safety tail under the deployment
+  precision, not just the loss curve or MAE.
+- Separate the mean-bias metric from the tail metric in evaluation and decide on the
+  tail. A single conservative-looking summary statistic can hide a worse tail.
+- Decouple training precision from the qualification metric. Use the fast precision
+  (bf16) for experimentation where aggregate metrics drive the decision; train the
+  shipped model in the precision that wins the tail metric, since inference precision
+  is a separate choice and training the release in fp32 costs nothing per survey.
 
 ---
 

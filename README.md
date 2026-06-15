@@ -76,6 +76,8 @@ As of V10, the model supports two training approaches:
 
 Both modes use the same model architecture. The choice is made when preparing ground truth (`--regression-mode` flag) and detected automatically by the training script.
 
+The current model is **V11**, a regression-mode model retrained after the 2026-06-09 depth-convention and edge-tile fixes; it is the first version whose shoal-safety asymmetry and safety metrics point in the correct direction. Train the shipped model in fp32; use bf16 (`--amp`) for experimentation only. See `CHANGELOG.md` and `docs/TRAINING_DASHBOARD.md`.
+
 ### How ENC Features Help
 
 ENC feature extraction (`scripts/extract_s57_features.py`) serves two purposes:
@@ -198,7 +200,9 @@ python scripts/prepare_ground_truth.py \
     --output-dir ground-truth-train/ \
     --regression-mode --no-offset
 
-# 2. Train (add --amp for bf16 mixed precision, ~5x faster)
+# 2. Train. Add --amp for bf16 mixed precision (~5x faster) when EXPERIMENTING;
+#    omit --amp (full fp32) for the model you intend to qualify and ship, since
+#    bf16 degrades the shoal-target safety tail (see CHANGELOG 2026-06-15).
 python scripts/train.py \
     --ground-truth-dir ground-truth-train/ \
     --val-surveys ground-truth-val/ \
