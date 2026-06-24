@@ -1,5 +1,94 @@
 # Changelog
 
+## 2026-06-24 - Native VR Regression Inference, Tiled-with-Context Path, and the V12 Delta Experiment (rejected)
+
+Work on getting V11 fp32 to run on native VR refinements and validating it against
+the clean reference. The headline outcomes: a tiled-with-context inference path that
+fixes a per-refinement isolation problem, a confirmation that the residual
+conservative bias is a grid-resolution artifact (not a training defect), a review-mask
+addition that catches spikes the model fails to remove, and a tried-and-rejected
+attempt to fix extreme-spike under-correction by widening the Huber delta (V12).
+V11 fp32 remains the production model.
+
+### New scripts
+- `scripts/inference_regression_tiled.py` - native VR regression inference that
+  assembles the true varres refinement values onto a continuous grid, tiles it the
+  way training tiles (256 / overlap 32) so each cell has spatial context, runs the
+  model per tile, merges with `TileManager`, then reads each refinement's correction
+  back off the merged grid and writes it to the VR BAG. Assembly and map-back share
+  one placement (mirrors `SidecarBuilder.add_refinement_results`), so the per-cell
+  round-trip is self-consistent. `--grid-resolution` sets the assembly step (see the
+  resolution finding below). Supersedes the earlier per-refinement
+  `scripts/inference_regression.py`, which processed each refinement in isolation.
+- `scripts/validate_inference.py` - reads a cleaned BAG, warps it and the clean
+  reference onto the dirty grid, and reports a faithful copy of the evaluator's
+  recovery/breach metrics. Torch-free (inlines the metric and the IHO TVU
+  coefficients), so it runs even when the torch DLLs fail to load.
+- `scripts/difference_surfaces.py` - differences a cleaned BAG against clean (and
+  optionally dirty), writes a difference GeoTIFF, and prints the residual bucketed by
+  how much noise each cell had. Torch-free. The bucket breakdown separates a broad
+  conservative bias (nonzero mean on already-clean cells) from imperfect spike
+  removal (residual concentrated in the high-noise buckets).
+
+### Per-refinement isolation inflated breaches; context fixes it
+Processing each refinement as its own small graph starves the model of the spatial
+context it trained on (256-tiles of a continuous grid). On H14116, switching from
+isolated per-refinement inference to tiled-with-context cut shoal-target TVU breaches
+about 6x (1,767 -> 302 at 32.7 m) and roughly halved total breaches. Tiled-with-context
+is the correct inference architecture. See LESSONS Lesson 22.
+
+### The residual conservative bias is a resolution artifact, not a training defect
+The model's ground truth for H14116 was built at 64 m (the clean BAG's resampled
+step). Assembling inference at the resampled-view step (32.7 m) drove a ~3 m
+conservative over-shoaling bias; assembling at the matching 64 m collapsed it
+(`recovery_mean_error` -3.38 -> -0.53 m). `local_std`, which scales the denormalized
+correction, is resolution-dependent, so the assembly step must match the training
+step. This points away from a mandatory refinements-mode retrain for H14116. Note the
+loader's `--vr-bag-mode refinements` does NOT return varres data (it returns the
+~650 m supergrid); true varres is only reachable through the h5py `VRBagHandler`,
+which is what the inference path uses.
+
+### Metrics have a resolution confound and reached their useful limit
+All `validate_inference.py` numbers are measured at 32.7 m and are comparable across
+inference runs (apples-to-apples) but NOT to the documented 64 m eval. Breach counts
+are themselves resolution-sensitive (64 m more than doubled them vs 33 m), and at
+H14116's ~3,400 m depth these are large deep-water corrections crossing the ~68 m TVU
+budget, not shoal-zone errors. The deliverable (difference surfaces) is the reliable
+judge, not further metric runs.
+
+### Review-mask flier flag (closes a safety blind spot)
+The review mask flagged dangerous corrections the model makes but not dangerous spikes
+it fails to remove, so an under-corrected deep flier passed QC silently.
+`inference_regression_tiled.py` now scans the cleaned surface for cells left grossly
+deeper than their neighborhood (default >4 local std and >10 m, knobs `--flier-k`,
+`--flier-min`, `--flier-window`) and folds them into the review flag. On H14116 this
+flags ~230-258 isolated deep survivors.
+
+### V12: widening the Huber delta does NOT fix extreme-spike under-correction
+The difference tool showed the model removes small and moderate noise well but barely
+touches the largest excursions: on H14116 the >100 m noise bucket (2,991 cells, 0.3%)
+came back at +372 m mean residual, still ~deep, and visual review confirmed these are
+scattered isolated noise spikes in flat seafloor, not real features. The mechanism is
+the loss tail: past Huber delta the gradient saturates at delta x weight, so large
+corrections get no more learning signal than moderate ones, and being rare they are
+diluted in the mean. The correction-norm cap (50 std) is NOT the cause: an isolated
+spike inflates its own 5x5 `local_std`, so its normalized target is only ~5 std,
+under the cap.
+
+`regression_delta_scale` (config `TrainingConfig.regression_delta_scale`, default 1.0;
+CLI `--regression-delta-scale`) multiplies the auto-computed regression Huber delta to
+widen the quadratic regime. V12 retrained at scale 3.0 (delta 6.566 -> ~19.7). Result:
+the >100 m bucket improved only ~15% (+372 -> +314 m) while the broad bias nearly
+doubled (clean-cell residual -1.0 -> -1.81 m), MAE rose (10.56 -> 12.51 m), and shoal
+breaches rose ~60% (2,617 -> 4,229). Validation never beat V11; early stop at epoch 23,
+best epoch 8. The delta was already 6.566 (95th pct), wide enough that the ~5-std
+spikes were near the quadratic edge, so widening it mostly amplified sensitivity to
+large errors everywhere. Conclusion: the spike survival is a training-data coverage
+problem (only two VR surveys in training, H13739 and H14070; H14116 held out), not a
+loss-shape problem. **Reverted to scale 1.0; V11 fp32 stays production.** The knob is
+retained as a documented, tried-and-rejected lever. See LESSONS Lesson 23.
+
+
 ## 2026-06-15 - V11 Trained and Evaluated: Sign Fix Validated, fp32 vs bf16 Resolved
 
 V11 is the first model trained after the depth-convention fix and the tile-coverage

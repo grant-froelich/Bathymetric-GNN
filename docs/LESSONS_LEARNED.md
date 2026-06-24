@@ -516,7 +516,10 @@ above 50%.
 - Magnitude metrics cannot detect direction inversions. Any pipeline whose
   purpose is directional (safety asymmetry) needs at least one end-to-end
   direction test: construct a tiny synthetic case with a known dangerous error
-  and assert the loss penalizes it more, not less.
+  and assert the loss penalizes it more, not less. (Implemented 2026-06-15:
+  `scripts/test_direction.py`, which also asserts the metrics flag the dangerous
+  direction as hazardous, that a TVU breach requires direction AND over-budget
+  magnitude, and that recovery_mean_error is negative when the model errs safe.)
 
 ---
 
@@ -562,9 +565,73 @@ necessary but not sufficient.
 
 ---
 
-## Recommended Training Workflow
+### 22. Native VR Inference Must Match Training's Gridding: Context and Resolution
 
-### Classification Mode (V9, existing approach)
+The model trains on 256-cell tiles of a continuous grid. Two ways native VR inference
+can diverge from that, and both bias the result:
+
+- **Isolation.** Processing each VR refinement as its own small graph starves the
+  model of spatial context. `local_std` (which scales the denormalized correction) and
+  the neighbor aggregation both assume the broader context of a continuous tile. On
+  H14116, isolated per-refinement inference produced ~6x the shoal-target TVU breaches
+  of the tiled-with-context path (1,767 vs 302 at 32.7 m). Fix: assemble the true
+  varres values onto a continuous grid, tile it like training, predict, merge, then map
+  corrections back to the refinements. `inference_regression_tiled.py` does this;
+  assembly and map-back share one placement so the per-cell round-trip is
+  self-consistent.
+
+- **Resolution.** The assembly step must match the step the ground truth was built at.
+  H14116's ground truth was 64 m (the clean BAG's resampled step). Assembling inference
+  at 32.7 m drove a ~3 m conservative over-shoaling bias; assembling at 64 m collapsed
+  it (`recovery_mean_error` -3.38 -> -0.53 m). Because `local_std` is resolution-
+  dependent, a resolution mismatch systematically biases the correction magnitude. Use
+  `--grid-resolution` to match the training step.
+
+Two related traps. The loader's `--vr-bag-mode refinements` does NOT return varres
+data; it returns the coarse (~650 m) supergrid. True varres is only reachable through
+the h5py `VRBagHandler`. And metrics measured at one resolution are comparable across
+inference runs but not to an eval run at a different resolution; breach counts in
+particular are resolution-sensitive. Judge the deliverable with difference surfaces,
+not cross-resolution metric comparisons. (Torch-free `validate_inference.py` and
+`difference_surfaces.py` exist for this and run even when the torch DLLs fail to load.)
+
+### 23. The Largest Excursions Are Under-Corrected, and That Is a Data Problem, Not a Loss Problem
+
+The model removes small and moderate noise well but barely touches the largest
+isolated spikes. On H14116 the >100 m noise bucket (2,991 cells, 0.3%) came back at
++372 m mean residual after cleaning, still nearly as deep as the dirty input, and these
+are scattered isolated noise spikes in flat seafloor (confirmed visually), not real
+features.
+
+Why, mechanically: the asymmetric loss is Huber-based, and past the delta the gradient
+saturates at `delta x weight`, a constant. A 5-std error and a 50-std error get the
+same gradient, so the optimizer has no extra push to fully close a large correction,
+and because such cells are rare they are further diluted in the loss mean. Note what is
+NOT the cause: the correction-norm cap (50 std) does not bite, because an isolated
+spike inflates its own 5x5 `local_std`, so a 372 m spike normalizes to only ~5 std,
+well under the cap. The denormalization can represent the full correction; the model
+just is not driven to emit it.
+
+Widening the delta does not fix it. V12 retrained with `regression_delta_scale 3.0`
+(delta 6.566 -> ~19.7). The >100 m bucket improved only ~15% (+372 -> +314 m) while the
+broad conservative bias nearly doubled (clean-cell residual -1.0 -> -1.81 m), MAE rose
+~2 m, and shoal-target breaches rose ~60%. Validation never beat V11. The delta was
+already 6.566 (95th percentile of normalized corrections), wide enough that the ~5-std
+spikes were near the quadratic edge, so widening it mostly amplified sensitivity to
+large errors everywhere without teaching the spikes.
+
+The real cause is coverage: training had only two VR surveys (H13739, H14070) with
+H14116 held out, so the model never saw enough of these extreme isolated fliers to
+learn them. No loss reshaping conjures a correction the data never demonstrates. The
+durable fix is geographic and noise diversity in training data. The interim mitigation
+is detection, not correction: the review mask now flags cells the model left grossly
+deeper than their neighborhood (`--flier-k`, `--flier-min`, `--flier-window`), so
+un-removed deep spikes are surfaced for manual edit instead of passing QC silently.
+This is defensible at H14116's ~3,400 m depth, where a too-deep reading is not a real
+grounding risk; on a shallow survey the same gap would matter more, making the
+training-data fix more urgent.
+
+
 
 ```bash
 # Use class weighting (automatic in updated trainer.py)
